@@ -52,6 +52,8 @@ export interface StepContext {
   /** occurredAt the produced event will carry (ISO). */
   now: string;
   services: StageServices;
+  /** Read-only view of every projected payment (e.g. for provider health). Do not mutate. */
+  view: { states: ReadonlyMap<string, PaymentState> };
 }
 
 export interface Step {

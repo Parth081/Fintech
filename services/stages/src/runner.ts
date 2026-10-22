@@ -90,7 +90,7 @@ export async function startStage(name: PipelineStage, options: StageOptions): Pr
     if (!state || !state.history.some((h) => h.eventId === trigger.eventId)) return null; // trigger itself was invalid
     const now = new Date().toISOString();
     const t0 = performance.now();
-    const outcome = await step.produce(trigger, state, { now, services });
+    const outcome = await step.produce(trigger, state, { now, services, view: { states: projection.states } });
     if (!outcome) return null;
     const latencyMs = Math.round((performance.now() - t0) * 1000) / 1000;
     const event = buildEvent(name, trigger, outcome, now, latencyMs);
