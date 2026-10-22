@@ -199,4 +199,57 @@ describe('LocalBrokerBus + broker', () => {
       /cannot reach broker/,
     );
   });
+
+  // ---- M2: head() and idempotent append
+  it('head() reports the number of durable events and covers everything acked before it', async () => {
+    await start();
+    const bus = await connect('head');
+    expect(await bus.head()).toBe(0);
+    const evs = events(7);
+    await Promise.all(evs.map((e) => bus.publish(e)));
+    expect(await bus.head()).toBe(7);
+    // A second client sees the same head.
+    expect(await (await connect('head-2')).head()).toBe(7);
+  });
+
+  it('head() waits for a reconnect when the broker is briefly down', async () => {
+    const b = await start();
+    const port = b.port;
+    const bus = await connect('head-reconnect', { maxReconnectDelayMs: 50 });
+    await bus.publish(events(1)[0]!);
+    await broker!.close();
+    const pending = bus.head();
+    await new Promise((r) => setTimeout(r, 100));
+    await start(port);
+    expect(await pending).toBe(1);
+  });
+
+  it('publishing the same eventId again (sequentially or concurrently, from any client) appends once', async () => {
+    await start();
+    const a = await connect('dup-a');
+    const b = await connect('dup-b');
+    const [e1, e2] = events(2);
+    const first = await a.publish(e1!);
+    expect((await b.publish(e1!)).offset).toBe(first.offset);
+    // Concurrent duplicates while the first append is still in flight.
+    const results = await Promise.all([a.publish(e2!), b.publish(e2!), a.publish(e2!), b.publish(e2!)]);
+    expect(new Set(results.map((r) => r.offset)).size).toBe(1);
+    expect(await a.head()).toBe(2);
+    const health = (await (await fetch(`http://127.0.0.1:${broker!.port}/health`)).json()) as { events: number };
+    expect(health.events).toBe(2);
+  });
+
+  it('catches up a large log in batches, in order, with no gaps', async () => {
+    await start();
+    const pub = await connect('bulk-pub');
+    const evs = events(3000, 'bulk');
+    await Promise.all(evs.map((e) => pub.publish(e)));
+    const sub = await connect('bulk-sub', { window: 64 });
+    const seen: number[] = [];
+    await sub.subscribe({ group: 'bulk', from: 'earliest', ephemeral: true }, (_e, m) => {
+      seen.push(m.offset);
+    });
+    await waitFor(() => seen.length === evs.length, 10_000);
+    expect(seen).toEqual(evs.map((_, i) => i));
+  });
 });

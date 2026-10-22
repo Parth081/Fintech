@@ -40,6 +40,8 @@ export interface AdminLike {
     topics: { topic: string; numPartitions?: number; replicationFactor?: number }[];
     waitForLeaders?: boolean;
   }): Promise<boolean>;
+  /** kafkajs: per partition, `offset`/`high` = high watermark (next offset to be written). */
+  fetchTopicOffsets?(topic: string): Promise<{ partition: number; offset: string; high?: string; low?: string }[]>;
 }
 export interface KafkaLike {
   producer(config?: Record<string, unknown>): ProducerLike;
@@ -55,13 +57,56 @@ export interface KafkaBusOptions {
   groupJoinTimeoutMs?: number;
   /** Create the topic (1 partition) on start. Default true. */
   ensureTopic?: boolean;
+  /**
+   * How many recently published / delivered eventIds are remembered for de-duplication (publish side per
+   * bus, delivery side per subscription). Default 1,000,000 (~10k payments x 12 events fit many times over).
+   */
+  dedupeWindow?: number;
   logger?: Pick<Console, 'warn' | 'error'>;
 }
 
+/**
+ * Idempotency on Kafka (see docs/adr/0006). Kafka has no "append unless this key exists", so the
+ * guarantee is layered:
+ *  1. idempotent producer (acks=all, max 1 in flight): broker-side retries of one send never duplicate;
+ *  2. publish() is idempotent per bus instance: the same eventId published again (sequentially or
+ *     concurrently) returns the first offset without sending;
+ *  3. every subscription drops a delivery whose eventId it has already handed to its handler, so a
+ *     duplicate that still reaches the log (a process killed after its send reached Kafka, then the
+ *     restarted process re-publishing before it caught up) is never processed twice;
+ *  4. stages catch up to head() before acting and the state machine ignores known eventIds.
+ * What remains possible is a duplicate *record* in the topic in that crash window; the local broker,
+ * which deduplicates at append time, has no such window.
+ */
 export class KafkaBus implements EventBus {
-  /** M2 PLACEHOLDER: implemented by the scale/reliability agent. Callers fall back when this throws. */
+  private admin: AdminLike | null = null;
+  private adminReady: Promise<AdminLike> | null = null;
+  private published: BoundedMap<string, Promise<DeliveryMeta>>;
+
+  /** High watermark of the single partition = number of records in the topic. */
   async head(): Promise<number> {
-    throw new Error('head() not implemented yet');
+    if (this.closed) throw new Error('bus closed');
+    await this.start();
+    const admin = await this.getAdmin();
+    if (!admin.fetchTopicOffsets) throw new Error('kafka admin client cannot fetch topic offsets');
+    const parts = await admin.fetchTopicOffsets(this.topic);
+    const p0 = parts.find((p) => p.partition === 0) ?? parts[0];
+    if (!p0) throw new Error(`kafka: topic ${this.topic} has no partitions`);
+    return Number(p0.high ?? p0.offset);
+  }
+
+  private getAdmin(): Promise<AdminLike> {
+    this.adminReady ??= (async () => {
+      if (!this.kafka.admin) throw new Error('kafka client has no admin()');
+      const admin = this.kafka.admin();
+      await admin.connect();
+      this.admin = admin;
+      return admin;
+    })().catch((err) => {
+      this.adminReady = null;
+      throw err;
+    });
+    return this.adminReady;
   }
 
   private readonly producer: ProducerLike;
@@ -77,8 +122,10 @@ export class KafkaBus implements EventBus {
       maxRetryDelayMs: options.maxRetryDelayMs ?? 1000,
       groupJoinTimeoutMs: options.groupJoinTimeoutMs ?? 15_000,
       ensureTopic: options.ensureTopic ?? true,
+      dedupeWindow: options.dedupeWindow ?? 1_000_000,
       logger: options.logger ?? console,
     };
+    this.published = new BoundedMap(this.opts.dedupeWindow);
     // Idempotent + one in-flight request keeps publish order = log order.
     this.producer = kafka.producer({ idempotent: true, maxInFlightRequests: 1, allowAutoTopicCreation: false });
   }
@@ -110,8 +157,20 @@ export class KafkaBus implements EventBus {
     return this.started;
   }
 
-  async publish(event: AnyEvent): Promise<DeliveryMeta> {
-    if (this.closed) throw new Error('bus closed');
+  publish(event: AnyEvent): Promise<DeliveryMeta> {
+    if (this.closed) return Promise.reject(new Error('bus closed'));
+    const known = this.published.get(event.eventId);
+    if (known) return known;
+    const p = this.send(event);
+    this.published.set(event.eventId, p);
+    // A failed send may be retried by the caller: forget it so the retry really sends.
+    p.catch(() => {
+      if (this.published.get(event.eventId) === p) this.published.delete(event.eventId);
+    });
+    return p;
+  }
+
+  private async send(event: AnyEvent): Promise<DeliveryMeta> {
     await this.start();
     const result = await this.producer.send({
       topic: this.topic,
@@ -130,7 +189,7 @@ export class KafkaBus implements EventBus {
     const from = options.from ?? 'earliest';
     const groupId = options.ephemeral ? `${options.group}.ephemeral.${randomUUID()}` : options.group;
     const consumer = this.kafka.consumer({ groupId });
-    const sub = new KafkaSub(consumer, this.topic, options, handler, this.opts);
+    const sub = new KafkaSub(consumer, this.topic, options, handler, this.opts, new BoundedSet(this.opts.dedupeWindow));
     await consumer.connect();
     const joined = waitForGroupJoin(consumer, this.opts.groupJoinTimeoutMs);
     // A group with a committed offset resumes from it; fromBeginning only applies when there is none.
@@ -158,6 +217,45 @@ export class KafkaBus implements EventBus {
       await this.started.catch(() => {});
       await this.producer.disconnect();
     }
+    await this.adminReady?.catch(() => null);
+    await this.admin?.disconnect().catch(() => {});
+    this.admin = null;
+  }
+}
+
+/** Insertion-ordered map that forgets its oldest entries beyond `capacity`. */
+export class BoundedMap<K, V> {
+  private readonly map = new Map<K, V>();
+  constructor(private readonly capacity: number) {}
+  get(k: K): V | undefined {
+    return this.map.get(k);
+  }
+  has(k: K): boolean {
+    return this.map.has(k);
+  }
+  set(k: K, v: V): void {
+    this.map.set(k, v);
+    while (this.map.size > this.capacity) {
+      const oldest = this.map.keys().next();
+      if (oldest.done) break;
+      this.map.delete(oldest.value);
+    }
+  }
+  delete(k: K): void {
+    this.map.delete(k);
+  }
+}
+
+class BoundedSet<K> {
+  private readonly map: BoundedMap<K, true>;
+  constructor(capacity: number) {
+    this.map = new BoundedMap(capacity);
+  }
+  has(k: K): boolean {
+    return this.map.has(k);
+  }
+  add(k: K): void {
+    this.map.set(k, true);
   }
 }
 
@@ -184,6 +282,7 @@ class KafkaSub {
     private readonly options: SubscribeOptions,
     private readonly handler: EventHandler,
     private readonly opts: { maxRetryDelayMs: number; logger: Pick<Console, 'warn' | 'error'> },
+    private readonly seen: BoundedSet<string>,
   ) {}
 
   /** kafkajs calls this sequentially per partition (one partition => strictly sequential). */
@@ -196,6 +295,12 @@ class KafkaSub {
       event = text ? (JSON.parse(text) as AnyEvent) : null;
     } catch {
       event = null;
+    }
+    if (event && this.seen.has(event.eventId)) {
+      // Duplicate record of an event this subscription already handled (see the KafkaBus doc comment).
+      event = null;
+    } else if (!event) {
+      this.opts.logger.warn(`[bus] skipping unparseable message at ${topic}/${partition}@${message.offset}`);
     }
     if (event) {
       let attempt = 0;
@@ -214,8 +319,7 @@ class KafkaSub {
           await this.sleep(Math.min(this.opts.maxRetryDelayMs, 20 * 2 ** (attempt - 1)));
         }
       }
-    } else {
-      this.opts.logger.warn(`[bus] skipping unparseable message at ${topic}/${partition}@${message.offset}`);
+      this.seen.add(event.eventId);
     }
     if (!this.options.ephemeral) {
       // Kafka's committed offset is the *next* offset to read.

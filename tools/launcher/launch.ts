@@ -7,8 +7,13 @@ import { fileURLToPath } from 'node:url';
 import { busyPortsMessage, findBusyPorts } from './ports';
 import { isRunning, killTree, spawnShell, spawnTs, waitForExit } from './process';
 
-export const STAGES = ['screening', 'risk', 'fx', 'routing', 'settlement', 'ledger', 'reconciliation'] as const;
+/** Stage processes (services/stages). Since M2 the ledger is its own service (services/ledger), not a stage. */
+export const STAGES = ['screening', 'risk', 'fx', 'routing', 'settlement', 'reconciliation'] as const;
 export type Stage = (typeof STAGES)[number];
+
+/** Every process the launcher manages, in start order. Names accepted by restart()/kill(). */
+export const SERVICE_NAMES = ['broker', 'payment-api', ...STAGES, 'ledger', 'gateway'] as const;
+export type ServiceName = (typeof SERVICE_NAMES)[number];
 
 export const DEFAULT_ROOT_DIR = path.resolve(fileURLToPath(new URL('../../', import.meta.url)));
 
@@ -16,13 +21,20 @@ export interface LaunchOptions {
   /** Repo root (default: two levels above this file). */
   rootDir?: string;
   host?: string;
-  ports?: { broker?: number; paymentApi?: number; gateway?: number };
+  /** Ports; `ledger` defaults to gateway + 1 (7073 with the default gateway port). */
+  ports?: { broker?: number; paymentApi?: number; gateway?: number; ledger?: number };
   /** Event-log directory; relative paths resolve against rootDir. */
   dataDir?: string;
   /** Delete dataDir before starting. */
   reset?: boolean;
   stageDelayMs?: number;
   settlementDelayMs?: number;
+  /** Postgres URL for the ledger; empty/undefined = embedded PGlite under dataDir/ledger (env DATABASE_URL). */
+  databaseUrl?: string;
+  /** Simulation seed for markets and providers (env SIM_SEED). */
+  simSeed?: string;
+  /** Provider failure scale, 0 disables failures (env PROVIDER_FAILURE_SCALE). */
+  providerFailureScale?: number;
   /** Extra environment for every child (wins over the computed values). */
   env?: Record<string, string>;
   /** Suppress child log lines (errors and timeouts are still reported). */
@@ -38,7 +50,18 @@ export interface LaunchOptions {
 }
 
 export interface LaunchedSystem {
-  urls: { gateway: string; paymentApi: string; broker: string };
+  urls: { gateway: string; paymentApi: string; broker: string; ledger: string };
+  /** Names of the processes this launch manages (broker omitted with BUS=kafka). */
+  services: readonly ServiceName[];
+  /**
+   * Kill one service (whole process tree, no graceful shutdown: a crash, for chaos tests). The rest of
+   * the system keeps running and the exit is not treated as a failure. No-op if it is not running.
+   */
+  kill(name: ServiceName): Promise<void>;
+  /** Kill (if running) and start one service again; resolves once it is ready (health URL / ready line). */
+  restart(name: ServiceName): Promise<void>;
+  /** True while the service's process is alive. */
+  isRunning(name: ServiceName): boolean;
   stop(): Promise<void>;
 }
 
@@ -92,6 +115,8 @@ interface Running {
   tail: string[];
   sawReadyLine: boolean;
   readyWaiters: (() => void)[];
+  /** Killed on purpose via kill()/restart(): its exit is not a crash. */
+  intentional: boolean;
 }
 
 const TAIL_LINES = 25;
@@ -131,6 +156,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
   const brokerPort = options.ports?.broker ?? 7070;
   const paymentApiPort = options.ports?.paymentApi ?? 7071;
   const gatewayPort = options.ports?.gateway ?? 7072;
+  const ledgerPort = options.ports?.ledger ?? gatewayPort + 1;
   const dataDir = path.resolve(rootDir, options.dataDir ?? '.data');
   const timeoutMs = options.startupTimeoutMs ?? 30_000;
   const quiet = options.quiet ?? false;
@@ -142,6 +168,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     broker: `ws://${probeHost}:${brokerPort}`,
     paymentApi: `http://${probeHost}:${paymentApiPort}`,
     gateway: `http://${probeHost}:${gatewayPort}`,
+    ledger: `http://${probeHost}:${ledgerPort}`,
   };
 
   // 1. Ports first: fail fast with a helpful message instead of a cryptic EADDRINUSE later.
@@ -149,7 +176,11 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     ...(bus === 'kafka' ? [] : [{ name: 'broker', port: brokerPort }]),
     { name: 'payment-api', port: paymentApiPort },
     { name: 'gateway', port: gatewayPort },
+    { name: 'ledger', port: ledgerPort },
   ];
+  if (new Set(wanted.map((w) => w.port)).size !== wanted.length) {
+    throw new StartupError(`Ports must be different: ${wanted.map((w) => `${w.name} ${w.port}`).join(', ')}`);
+  }
   const busy = await findBusyPorts(wanted, probeHost);
   if (busy.length > 0) throw new StartupError(busyPortsMessage(busy, probeHost));
 
@@ -168,11 +199,16 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     BROKER_PORT: String(brokerPort),
     PAYMENT_API_PORT: String(paymentApiPort),
     GATEWAY_PORT: String(gatewayPort),
+    LEDGER_PORT: String(ledgerPort),
     BUS: bus,
     BROKER_URL: urls.broker,
     PAYMENT_API_URL: urls.paymentApi,
     GATEWAY_URL: urls.gateway,
+    LEDGER_URL: urls.ledger,
     DATA_DIR: dataDir,
+    DATABASE_URL: options.databaseUrl ?? process.env.DATABASE_URL ?? '',
+    SIM_SEED: options.simSeed ?? process.env.SIM_SEED ?? 'control-tower',
+    PROVIDER_FAILURE_SCALE: String(options.providerFailureScale ?? process.env.PROVIDER_FAILURE_SCALE ?? 1),
     WEB_DIST: webDist,
     STAGE_DELAY_MS: String(options.stageDelayMs ?? process.env.STAGE_DELAY_MS ?? 400),
     SETTLEMENT_DELAY_MS: String(options.settlementDelayMs ?? process.env.SETTLEMENT_DELAY_MS ?? 900),
@@ -180,6 +216,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
   };
 
   const running: Running[] = [];
+  const specs = new Map<ServiceName, ServiceSpec>();
   let stopping = false;
   let stopPromise: Promise<void> | undefined;
 
@@ -190,8 +227,9 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
         // Stop in reverse dependency order (gateway, then api + stages, then broker) so consumers do
         // not log broker-disconnect noise. Each tier is killed in parallel; killTree waits for exit.
         const tier = (r: Running): number => (r.spec.name === 'gateway' ? 0 : r.spec.name === 'broker' ? 2 : 1);
+        await Promise.all(restarting);
         for (const t of [0, 1, 2]) {
-          await Promise.all(running.filter((r) => tier(r) === t).map((r) => killTree(r.child)));
+          await Promise.all(running.filter((r) => tier(r) === t && !(r.intentional && !isRunning(r.child))).map((r) => killTree(r.child)));
         }
       })();
     }
@@ -209,7 +247,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
   let startupCrash: Running | undefined;
   const crashWaiters: (() => void)[] = [];
   const onExit = (r: Running, code: number | null, signal: NodeJS.Signals | null): void => {
-    if (stopping) return;
+    if (stopping || r.intentional) return;
     if (!started) {
       startupCrash ??= r;
       for (const w of crashWaiters.splice(0)) w();
@@ -230,7 +268,8 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
   };
 
   const start = (spec: ServiceSpec): Running => {
-    const r: Running = { spec, child: undefined as unknown as ChildProcess, tail: [], sawReadyLine: false, readyWaiters: [] };
+    specs.set(spec.name as ServiceName, spec);
+    const r: Running = { spec, child: undefined as unknown as ChildProcess, tail: [], sawReadyLine: false, readyWaiters: [], intentional: false };
     r.child = spawnTs({
       rootDir,
       script: spec.script,
@@ -271,7 +310,8 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
         };
         r.readyWaiters.push(done);
         crashWaiters.push(done);
-        if (startupCrash) done();
+        r.child.once('exit', done);
+        if (startupCrash || !isRunning(r.child)) done();
       });
       if (r.sawReadyLine) return;
     }
@@ -322,7 +362,9 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     const stages = STAGES.map((s) =>
       start({ name: s, script: 'services/stages/src/index.ts', args: ['--stage', s], readyLine: /\bready\b/i }),
     );
-    await Promise.all([api, ...stages].map(waitReady));
+    // The ledger service (M2) replaces the old ledger stage: consumes settlements, posts journals.
+    const ledger = start({ name: 'ledger', script: 'services/ledger/src/index.ts', healthUrl: `${urls.ledger}/health` });
+    await Promise.all([api, ...stages, ledger].map(waitReady));
 
     // 6. Gateway (serves the UI).
     const gateway = start({ name: 'gateway', script: 'services/gateway/src/index.ts', healthUrl: `${urls.gateway}/health` });
@@ -333,7 +375,49 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     throw e;
   }
 
-  return { urls, stop };
+  const current = (name: ServiceName): Running | undefined => {
+    for (let i = running.length - 1; i >= 0; i--) if (running[i]!.spec.name === name) return running[i];
+    return undefined;
+  };
+  const restarting = new Set<Promise<void>>();
+
+  const kill = async (name: ServiceName): Promise<void> => {
+    if (stopping) return;
+    const r = current(name);
+    if (!r) throw new Error(`unknown service "${name}" (have: ${[...specs.keys()].join(', ')})`);
+    if (!isRunning(r.child)) return;
+    r.intentional = true;
+    await killTree(r.child);
+  };
+
+  const restart = (name: ServiceName): Promise<void> => {
+    const spec = specs.get(name);
+    if (!spec) return Promise.reject(new Error(`unknown service "${name}" (have: ${[...specs.keys()].join(', ')})`));
+    const p = (async () => {
+      await kill(name);
+      if (stopping) return;
+      const old = current(name);
+      if (old) running.splice(running.indexOf(old), 1);
+      const r = start(spec);
+      if (!quiet) say(`restarting ${name}`);
+      await waitReady(r);
+    })();
+    restarting.add(p);
+    void p.finally(() => restarting.delete(p)).catch(() => {});
+    return p;
+  };
+
+  return {
+    urls,
+    services: [...specs.keys()],
+    kill,
+    restart,
+    isRunning: (name) => {
+      const r = current(name);
+      return r !== undefined && isRunning(r.child);
+    },
+    stop,
+  };
 }
 
 export function banner(gatewayUrl: string): string {

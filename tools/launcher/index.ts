@@ -39,7 +39,7 @@ async function main(): Promise<void> {
   try {
     system = await launch({
       host: args.host,
-      ports: { broker: args.brokerPort, paymentApi: args.paymentApiPort, gateway: args.gatewayPort },
+      ports: { broker: args.brokerPort, paymentApi: args.paymentApiPort, gateway: args.gatewayPort, ledger: args.ledgerPort },
       dataDir: args.dataDir,
       reset: args.reset,
       stageDelayMs: args.stageDelayMs,

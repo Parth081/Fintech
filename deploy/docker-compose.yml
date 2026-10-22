@@ -1,8 +1,14 @@
 # Global Fintech Control Tower - container setup (simulation, synthetic data only).
 #
-# Default (built-in local broker, same as `npm start`):
-#   docker compose -f deploy/docker-compose.yml up --build
+# Default (built-in local broker, same as `npm start`; ledger on Postgres 17):
+#   docker compose -f deploy/docker-compose.yml up -d --build --wait
 #   open http://127.0.0.1:7072
+#   npm run verify:m2 -- --url http://127.0.0.1:7072 --count 500     # optional: prove it
+#   docker compose -f deploy/docker-compose.yml down -v               # stop + delete volumes
+#
+# Ports published on 127.0.0.1 only: broker 7070, payment-api 7071, gateway 7072, ledger 7073.
+# Unlike `npm start` (embedded PGlite under DATA_DIR/ledger), the ledger here uses the `postgres`
+# service through DATABASE_URL (ADR 0005).
 #
 # Redpanda / Kafka profile:
 #   BUS=kafka docker compose -f deploy/docker-compose.yml --profile redpanda up --build
@@ -26,14 +32,18 @@ x-service: &service
     BROKER_PORT: "7070"
     PAYMENT_API_PORT: "7071"
     GATEWAY_PORT: "7072"
+    LEDGER_PORT: "7073"
     BUS: ${BUS:-local}
     BROKER_URL: ws://broker:7070
     KAFKA_BROKERS: redpanda:9092
     PAYMENT_API_URL: http://payment-api:7071
     GATEWAY_URL: http://gateway:7072
+    LEDGER_URL: http://ledger:7073
     DATA_DIR: /data
     STAGE_DELAY_MS: ${STAGE_DELAY_MS:-400}
     SETTLEMENT_DELAY_MS: ${SETTLEMENT_DELAY_MS:-900}
+    SIM_SEED: ${SIM_SEED:-control-tower}
+    PROVIDER_FAILURE_SCALE: ${PROVIDER_FAILURE_SCALE:-1}
 
 # Stages and the payment API start once the broker answers /health. `required: false` lets the
 # redpanda dependency be ignored when the redpanda profile is not active.
@@ -54,6 +64,8 @@ services:
     command: ["services/broker/src/index.ts"]
     volumes:
       - broker-data:/data
+    ports:
+      - "127.0.0.1:7070:7070"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7070/health"]
       interval: 5s
@@ -65,6 +77,8 @@ services:
     <<: *service
     command: ["services/payment-api/src/index.ts"]
     depends_on: *after-bus
+    ports:
+      - "127.0.0.1:7071:7071"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7071/health"]
       interval: 5s
@@ -87,18 +101,71 @@ services:
   settlement:
     <<: *stage
     command: ["services/stages/src/index.ts", "--stage", "settlement"]
-  ledger:
-    <<: *stage
-    command: ["services/stages/src/index.ts", "--stage", "ledger"]
   reconciliation:
     <<: *stage
     command: ["services/stages/src/index.ts", "--stage", "reconciliation"]
+
+  # Double-entry ledger service (M2): replaces the M1 ledger stage. Postgres via DATABASE_URL.
+  ledger:
+    <<: *service
+    command: ["services/ledger/src/index.ts"]
+    environment:
+      HOST: 0.0.0.0
+      BROKER_PORT: "7070"
+      PAYMENT_API_PORT: "7071"
+      GATEWAY_PORT: "7072"
+      LEDGER_PORT: "7073"
+      BUS: ${BUS:-local}
+      BROKER_URL: ws://broker:7070
+      KAFKA_BROKERS: redpanda:9092
+      LEDGER_URL: http://ledger:7073
+      DATA_DIR: /data
+      DATABASE_URL: postgres://ct:ct-local-only@postgres:5432/ledger
+      STAGE_DELAY_MS: ${STAGE_DELAY_MS:-400}
+      SETTLEMENT_DELAY_MS: ${SETTLEMENT_DELAY_MS:-900}
+      SIM_SEED: ${SIM_SEED:-control-tower}
+      PROVIDER_FAILURE_SCALE: ${PROVIDER_FAILURE_SCALE:-1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+        required: false
+    ports:
+      - "127.0.0.1:7073:7073"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7073/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+
+  # Ledger database. Synthetic data only; the password is a local-only placeholder.
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ct
+      POSTGRES_PASSWORD: ct-local-only
+      POSTGRES_DB: ledger
+    volumes:
+      - ledger-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ct -d ledger"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
 
   gateway:
     <<: *service
     command: ["services/gateway/src/index.ts"]
     depends_on:
       payment-api:
+        condition: service_healthy
+      ledger:
         condition: service_healthy
     ports:
       - "127.0.0.1:7072:7072"
@@ -134,3 +201,4 @@ services:
 volumes:
   broker-data:
   redpanda-data:
+  ledger-pg:

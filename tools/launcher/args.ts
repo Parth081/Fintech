@@ -11,6 +11,7 @@ export interface LauncherArgs {
   brokerPort: number;
   paymentApiPort: number;
   gatewayPort: number;
+  ledgerPort: number;
   dataDir: string;
   stageDelayMs: number;
   settlementDelayMs: number;
@@ -19,7 +20,7 @@ export interface LauncherArgs {
 
 export const LAUNCHER_USAGE = `Usage: npm start [-- options]
 
-Starts the whole Control Tower on this machine (broker, payment-api, 7 stages, gateway + UI).
+Starts the whole Control Tower on this machine (broker, payment-api, 6 stages, ledger, gateway + UI).
 
 Options:
   --reset                    Delete the data directory (event log) before starting
@@ -29,6 +30,7 @@ Options:
   --broker-port <n>          (env BROKER_PORT, default 7070)
   --api-port <n>             (env PAYMENT_API_PORT, default 7071)
   --gateway-port <n>         (env GATEWAY_PORT, default 7072)
+  --ledger-port <n>          (env LEDGER_PORT, default 7073)
   --data-dir <dir>           (env DATA_DIR, default .data)
   --stage-delay <ms>         (env STAGE_DELAY_MS, default 400)
   --settlement-delay <ms>    (env SETTLEMENT_DELAY_MS, default 900)
@@ -60,6 +62,7 @@ export function parseLauncherArgs(argv: readonly string[], defaults = serviceCon
     brokerPort: defaults.brokerPort,
     paymentApiPort: defaults.paymentApiPort,
     gatewayPort: defaults.gatewayPort,
+    ledgerPort: defaults.ledgerPort,
     dataDir: defaults.dataDir,
     stageDelayMs: defaults.stageDelayMs,
     settlementDelayMs: defaults.settlementDelayMs,
@@ -108,6 +111,9 @@ export function parseLauncherArgs(argv: readonly string[], defaults = serviceCon
       case '--gateway-port':
         args.gatewayPort = toPort(flag, next());
         break;
+      case '--ledger-port':
+        args.ledgerPort = toPort(flag, next());
+        break;
       case '--stage-delay':
         args.stageDelayMs = toInt(flag, next());
         break;
@@ -121,9 +127,9 @@ export function parseLauncherArgs(argv: readonly string[], defaults = serviceCon
         throw new Error(`Unknown option "${raw}". Run "npm start -- --help" for usage.`);
     }
   }
-  const ports = [args.brokerPort, args.paymentApiPort, args.gatewayPort];
+  const ports = [args.brokerPort, args.paymentApiPort, args.gatewayPort, args.ledgerPort];
   if (new Set(ports).size !== ports.length) {
-    throw new Error(`Ports must be different (broker ${ports[0]}, payment-api ${ports[1]}, gateway ${ports[2]})`);
+    throw new Error(`Ports must be different (broker ${ports[0]}, payment-api ${ports[1]}, gateway ${ports[2]}, ledger ${ports[3]})`);
   }
   return args;
 }

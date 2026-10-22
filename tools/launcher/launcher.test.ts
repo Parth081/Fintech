@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { parseLauncherArgs } from './args';
-import { assertSafeToDelete, banner, prefixLine, stripOwnTag } from './launch';
+import { assertSafeToDelete, banner, prefixLine, SERVICE_NAMES, STAGES, stripOwnTag } from './launch';
 import { busyPortsMessage, findBusyPorts, isPortFree } from './ports';
 
 const defaults = {
@@ -11,6 +11,7 @@ const defaults = {
   brokerPort: 7070,
   paymentApiPort: 7071,
   gatewayPort: 7072,
+  ledgerPort: 7073,
   dataDir: '.data',
   stageDelayMs: 400,
   settlementDelayMs: 900,
@@ -24,13 +25,13 @@ describe('parseLauncherArgs', () => {
 
   it('parses flags in both --flag value and --flag=value form', () => {
     const a = parseLauncherArgs(
-      ['--reset', '--no-build', '--quiet', '--broker-port', '8070', '--api-port=8071', '--gateway-port', '8072',
+      ['--reset', '--no-build', '--quiet', '--broker-port', '8070', '--api-port=8071', '--gateway-port', '8072', '--ledger-port=8073',
         '--data-dir', 'tmp/data', '--stage-delay', '0', '--settlement-delay=0', '--host', '0.0.0.0', '--timeout', '5000'],
       defaults,
     );
     expect(a).toEqual({
       help: false, reset: true, buildWeb: false, quiet: true, host: '0.0.0.0', brokerPort: 8070, paymentApiPort: 8071,
-      gatewayPort: 8072, dataDir: 'tmp/data', stageDelayMs: 0, settlementDelayMs: 0, startupTimeoutMs: 5000,
+      gatewayPort: 8072, ledgerPort: 8073, dataDir: 'tmp/data', stageDelayMs: 0, settlementDelayMs: 0, startupTimeoutMs: 5000,
     });
     expect(parseLauncherArgs(['-h'], defaults).help).toBe(true);
   });
@@ -41,6 +42,7 @@ describe('parseLauncherArgs', () => {
     expect(() => parseLauncherArgs(['--broker-port'], defaults)).toThrow(/needs a value/);
     expect(() => parseLauncherArgs(['--stage-delay', 'abc'], defaults)).toThrow();
     expect(() => parseLauncherArgs(['--gateway-port', '7070'], defaults)).toThrow(/different/);
+    expect(() => parseLauncherArgs(['--ledger-port', '7072'], defaults)).toThrow(/different/);
   });
 });
 
@@ -85,5 +87,12 @@ describe('stripOwnTag', () => {
   it('drops a duplicate service tag only', () => {
     expect(stripOwnTag('fx', '[fx] ready (bus=local)')).toBe('ready (bus=local)');
     expect(stripOwnTag('fx', '[bus:stage-fx] reconnecting')).toBe('[bus:stage-fx] reconnecting');
+  });
+});
+
+describe('service list (M2)', () => {
+  it('runs the ledger as its own service, not as a stage process', () => {
+    expect(STAGES).not.toContain('ledger');
+    expect(SERVICE_NAMES).toEqual(['broker', 'payment-api', 'screening', 'risk', 'fx', 'routing', 'settlement', 'reconciliation', 'ledger', 'gateway']);
   });
 });

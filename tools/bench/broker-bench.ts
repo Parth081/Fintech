@@ -126,19 +126,24 @@ async function main(): Promise<void> {
     // ---- publish
     const buses: EventBus[] = await Promise.all(Array.from({ length: publishers }, (_, i) => LocalBrokerBus.connect(url, `bench-pub-${i}`, { logger: quiet })));
     let next = 0;
+    const offsets: number[] = [];
     const t0 = performance.now();
     await Promise.all(
       buses.map(async (bus) => {
         if (pipelined) {
           const inflight = new Set<Promise<unknown>>();
           while (next < events.length) {
-            const p: Promise<unknown> = bus.publish(events[next++]!).then(() => inflight.delete(p));
+            const i = next++;
+            const p: Promise<unknown> = bus.publish(events[i]!).then((m) => { offsets[i] = m.offset; inflight.delete(p); });
             inflight.add(p);
             if (inflight.size >= 64) await Promise.race(inflight);
           }
           await Promise.all(inflight);
         } else {
-          while (next < events.length) await bus.publish(events[next++]!);
+          while (next < events.length) {
+            const i = next++;
+            offsets[i] = (await bus.publish(events[i]!)).offset;
+          }
         }
       }),
     );
@@ -150,7 +155,7 @@ async function main(): Promise<void> {
     const dupT0 = performance.now();
     const dupOffsets = await Promise.all(events.slice(0, 1000).map((e) => buses[0]!.publish(e)));
     const health = (await (await fetch(`http://127.0.0.1:${port}/health`)).json()) as { events: number };
-    const dupOk = dupOffsets.every((m, i) => m.offset === i) && health.events === events.length;
+    const dupOk = dupOffsets.every((m, i) => m.offset === offsets[i]) && health.events === events.length;
     console.log(`idempotent re-publish of 1000 events: ${dupOk ? 'no new appends, original offsets returned' : `APPENDED DUPLICATES (log now ${health.events})`} (${(performance.now() - dupT0).toFixed(0)} ms)`);
     results.idempotentAppend = dupOk ? 'ok' : 'FAILED';
     await Promise.all(buses.map((b) => b.close()));

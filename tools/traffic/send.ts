@@ -1,6 +1,6 @@
 // Argument parsing and HTTP sending for `npm run traffic`. Kept separate from index.ts so it is testable.
 import { serviceConfig } from '@ct/contracts';
-import type { GeneratedPayment } from './generator';
+import { parseScenarioMix, type GeneratedPayment, type ScenarioMix } from './generator';
 
 export interface TrafficArgs {
   help: boolean;
@@ -9,21 +9,31 @@ export interface TrafficArgs {
   /** Payments per second; 0 = as fast as possible. */
   rate: number;
   scenario?: string;
+  /** Scenario mix drawn per payment, e.g. { 'provider-reject': 0.02 }. */
+  mix?: ScenarioMix;
   url: string;
   start: number;
+  /** Max requests in flight. */
+  concurrency: number;
+  /** Print progress lines instead of one line per payment. Default: on above 200 payments. */
+  quiet?: boolean;
 }
 
 export const TRAFFIC_USAGE = `Usage: npm run traffic -- [options]
 
 Posts seeded synthetic payments to the Payment API (POST /payments). Re-running the same seed is
-idempotent: each payment's Idempotency-Key is derived from seed + index (+ scenario).
+idempotent: each payment's Idempotency-Key is derived from seed + index (+ scenario). Traffic v2: a
+seeded population of fictional customers per corridor, weighted corridor mix, log-normal amounts.
 
 Options:
   --count <n>        Number of payments (default 10)
   --seed <n>         PRNG seed (default 42)
   --rate <n>         Payments per second, 0 = no pacing (default 2)
-  --scenario <name>  Scenario tag passed to the pipeline, e.g. force-hold
+  --scenario <name>  Scenario for every payment: force-hold, provider-reject, recon-break
+  --mix <spec>       Scenario mix per payment, e.g. provider-reject=0.02,recon-break=1%
   --start <n>        First index (default 0)
+  --concurrency <n>  Max requests in flight (default 8); with --rate this bounds bursts
+  --quiet            Progress every second instead of one line per payment (default above 200)
   --url <url>        Payment API base URL (env PAYMENT_API_URL, default http://127.0.0.1:7071)
   -h, --help         Show this help
 `;
@@ -38,7 +48,7 @@ function num(flag: string, v: string | undefined, { integer = true } = {}): numb
 }
 
 export function parseTrafficArgs(argv: readonly string[], defaultUrl = serviceConfig().paymentApiUrl): TrafficArgs {
-  const args: TrafficArgs = { help: false, count: 10, seed: 42, rate: 2, url: defaultUrl, start: 0 };
+  const args: TrafficArgs = { help: false, count: 10, seed: 42, rate: 2, url: defaultUrl, start: 0, concurrency: 8 };
   for (let i = 0; i < argv.length; i++) {
     const raw = argv[i]!;
     const eq = raw.indexOf('=');
@@ -61,6 +71,20 @@ export function parseTrafficArgs(argv: readonly string[], defaultUrl = serviceCo
         break;
       case '--start':
         args.start = num(flag, next());
+        break;
+      case '--concurrency': {
+        args.concurrency = num(flag, next());
+        if (args.concurrency < 1) throw new Error('--concurrency must be at least 1');
+        break;
+      }
+      case '--mix': {
+        const v = next();
+        if (!v) throw new Error('--mix needs a value');
+        args.mix = parseScenarioMix(v);
+        break;
+      }
+      case '--quiet':
+        args.quiet = true;
         break;
       case '--scenario': {
         const v = next();

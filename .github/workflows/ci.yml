@@ -29,6 +29,27 @@ jobs:
       - run: npm run build:web
       - run: npm run test:e2e
 
+  verify-m2:
+    name: M2 money-core verification (verify:m2, quick)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # Launches the whole system on temp ports (PGlite ledger, 0 delays), sends 500 payments with
+      # the default scenario mix, then checks balances, journals, duplicates, state machine, stuck payments.
+      - run: npm run verify:m2 -- --count 500 --report-dir verify-report
+      - run: npm run verify:m2 -- --count 300 --chaos --chaos-interval 2000 --seed 7 --report-dir verify-report
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verify-m2-report
+          path: verify-report/
+
   compose:
     name: Validate docker compose file
     runs-on: ubuntu-latest

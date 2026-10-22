@@ -38,6 +38,10 @@ class FakeKafka implements KafkaLike {
         this.createdTopics.push(...topics);
         return true;
       },
+      fetchTopicOffsets: async (topic: string) => {
+        expect(topic).toBe(PAYMENTS_TOPIC);
+        return [{ partition: 0, offset: String(this.log.length), high: String(this.log.length), low: '0' }];
+      },
     };
   }
 
@@ -194,5 +198,45 @@ describe('KafkaBus (fake kafkajs client)', () => {
     expect(Date.now() - t0).toBeLessThan(1000);
     expect(kafka.commits).toEqual([]);
     await bus.close();
+  });
+
+  it('head() returns the partition high watermark', async () => {
+    const kafka = new FakeKafka();
+    const bus = new KafkaBus(kafka, { logger: quiet });
+    expect(await bus.head()).toBe(0);
+    for (const e of happyPath('pay-6').slice(0, 4)) await bus.publish(e);
+    expect(await bus.head()).toBe(4);
+    await bus.close();
+  });
+
+  it('publish is idempotent per bus (sequential and concurrent duplicates send once)', async () => {
+    const kafka = new FakeKafka();
+    const bus = new KafkaBus(kafka, { logger: quiet });
+    const [a, b] = happyPath('pay-7');
+    const first = await bus.publish(a!);
+    expect((await bus.publish(a!)).offset).toBe(first.offset);
+    const both = await Promise.all([bus.publish(b!), bus.publish(b!), bus.publish(b!)]);
+    expect(new Set(both.map((m) => m.offset)).size).toBe(1);
+    expect(kafka.log).toHaveLength(2);
+    await bus.close();
+  });
+
+  it('a duplicate record that reached the topic is not delivered twice, but is still committed past', async () => {
+    const kafka = new FakeKafka();
+    const writer1 = new KafkaBus(kafka, { logger: quiet });
+    const writer2 = new KafkaBus(kafka, { logger: quiet }); // e.g. a restarted stage process
+    const [a, b] = happyPath('pay-8');
+    await writer1.publish(a!);
+    await writer2.publish(a!); // different process: lands in the topic again
+    await writer2.publish(b!);
+    expect(kafka.log).toHaveLength(3);
+    const reader = new KafkaBus(kafka, { logger: quiet });
+    const seen: string[] = [];
+    await reader.subscribe({ group: 'g' }, (e) => {
+      seen.push(e.eventId);
+    });
+    await waitFor(() => kafka.committed.get('g') === 3);
+    expect(seen).toEqual([a!.eventId, b!.eventId]);
+    await Promise.all([writer1.close(), writer2.close(), reader.close()]);
   });
 });
