@@ -171,7 +171,7 @@ describe('throughput meter', () => {
     expect(r.series).toHaveLength(60);
     expect(r.series.at(-1)).toBe(1);
     now = T0 + 45_000;
-    expect(m.read().eventsLastMinute).toBe(15 - 1); // seconds T0-14..T0 still inside (T0-15s fell out)
+    expect(m.read().eventsLastMinute).toBe(15); // seconds T0-14..T0 still inside (T0-15s fell out)
     now = T0 + 200_000;
     expect(m.read().eventsLastMinute).toBe(0);
   });

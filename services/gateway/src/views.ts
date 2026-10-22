@@ -4,7 +4,7 @@
 // to partial data instead of a 500.
 import { CORRIDORS, PROVIDERS, type PaymentState, type StatementEntry } from '@ct/contracts';
 import * as market from '@ct/market';
-import * as iso from '@ct/iso20022';
+import { buildCamt053 } from '@ct/iso20022';
 import type { ProviderProfile, ProviderHealth } from '@ct/market';
 import type { FxCorridorRates, ProviderView, StatementGroup } from './api-types';
 import type { Projection } from './projection';
@@ -40,17 +40,7 @@ export const defaultMarket: MarketPort = {
   catalog: market.PROVIDER_CATALOG,
 };
 
-export const defaultIso: IsoPort = {
-  buildCamt053(input) {
-    // Resolved at call time: @ct/iso20022 is being built in parallel and may not export it yet.
-    const fn = (iso as Record<string, unknown>).buildCamt053;
-    if (typeof fn !== 'function') throw new Error('buildCamt053 not available in @ct/iso20022');
-    const out = (fn as (i: Camt053Input) => unknown)(input);
-    if (typeof out === 'string') return out;
-    if (out && typeof out === 'object' && typeof (out as { xml?: unknown }).xml === 'string') return (out as { xml: string }).xml;
-    throw new Error('buildCamt053 returned no XML');
-  },
-};
+export const defaultIso: IsoPort = { buildCamt053 };
 
 const errMsg = (err: unknown) => (err instanceof Error ? err.message : String(err));
 

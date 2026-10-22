@@ -84,6 +84,8 @@ export function keyFacts(state: PaymentState): Fact[] {
   }
   const stop = f['payment.held'] ?? f['payment.rejected'];
   if (stop) out.push({ label: state.status === 'rejected' ? 'Rejected' : 'Held', value: `${stop.reason} (at ${stop.atStage})` });
+  const fail = f['payment.failed'];
+  if (fail) out.push({ label: 'Failed', value: `${fail.reason} (at ${fail.atStage}${fail.attempts ? `, ${fail.attempts} attempts` : ''})` });
   return out;
 }
 
@@ -120,3 +122,60 @@ export function formatInput(value: unknown): string {
   }
   return String(value);
 }
+
+export interface QuoteView {
+  quoteId: string;
+  mid: string | null;
+  rate: string;
+  spreadBps: number;
+  /** (mid - rate) / mid in bps, when the mid is known: the spread actually applied. */
+  effectiveSpreadBps: number | null;
+  source: string;
+  target: string;
+  rateTimestamp: string | null;
+  expiresAt: string;
+  /** Quote validity from the market tick (or quote event) to expiry. */
+  validForMs: number | null;
+}
+
+export function quoteView(state: PaymentState, quotedAt?: string): QuoteView | null {
+  const q = state.facts['payment.quoted'];
+  if (!q) return null;
+  const mid = q.midRate ?? null;
+  const m = mid === null ? NaN : Number(mid);
+  const r = Number(q.rate);
+  const from = q.rateTimestamp ?? quotedAt;
+  const valid = from ? Date.parse(q.expiresAt) - Date.parse(from) : NaN;
+  return {
+    quoteId: q.quoteId,
+    mid,
+    rate: q.rate,
+    spreadBps: q.spreadBps,
+    effectiveSpreadBps: Number.isFinite(m) && m > 0 && Number.isFinite(r) ? Math.round(((m - r) / m) * 10_000 * 10) / 10 : null,
+    source: formatMoney(q.sourceAmount),
+    target: formatMoney(q.targetAmount),
+    rateTimestamp: q.rateTimestamp ?? null,
+    expiresAt: q.expiresAt,
+    validForMs: Number.isFinite(valid) ? valid : null,
+  };
+}
+
+export interface ReconView {
+  matched: boolean;
+  statementRef: string;
+  journalId: string | null;
+  breaks: string[];
+}
+
+export function reconView(state: PaymentState): ReconView | null {
+  const r = state.facts['payment.reconciled'];
+  if (!r) return null;
+  return { matched: r.matched, statementRef: r.statementRef, journalId: r.journalId ?? null, breaks: r.breaks ?? [] };
+}
+
+/** Sample scenarios the payment API forwards to the stages (POST /api/payments/sample {scenario}). */
+export const SCENARIOS = {
+  hold: 'force-hold',
+  providerReject: 'provider-reject',
+  reconBreak: 'recon-break',
+} as const;

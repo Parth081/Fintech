@@ -16,7 +16,7 @@ import { progressDots, progressFraction } from './progress';
 import { applyMessage, applyMessages, applyPoll, initialFeed, MAX_ROWS, upsert } from './feed';
 import { formatInput, keyFacts, ledgerCheck, ledgerRows, timelineRows } from './detail';
 import { backoffMs, parseFrame } from './api';
-import type { EventMessage, PaymentSummary, Stats } from './types';
+import type { PaymentSummary, Stats, UpdateMessage } from './types';
 
 function stateOf(events: AnyEvent[]): PaymentState {
   let s: PaymentState | undefined;
@@ -26,13 +26,20 @@ function stateOf(events: AnyEvent[]): PaymentState {
 
 const stats = (over: Partial<Stats> = {}): Stats => ({
   total: 1,
-  byStatus: { initiated: 1, screened: 0, scored: 0, quoted: 0, routed: 0, sent: 0, settled: 0, reconciled: 0, held: 0, rejected: 0 },
+  byStatus: { initiated: 1, screened: 0, scored: 0, quoted: 0, routed: 0, sent: 0, settled: 0, reconciled: 0, retrying: 0, held: 0, rejected: 0, failed: 0 },
   reconciled: 0,
   inFlight: 1,
   held: 0,
   rejected: 0,
+  retrying: 0,
+  failed: 0,
+  retriesTotal: 0,
+  reconBreaks: 0,
+  reconMatched: 0,
   avgEndToEndMs: null,
   rejectedEvents: 0,
+  events: 1,
+  throughput: { windowSec: 60, paymentsPerMin: 0, completedPerMin: 0, eventsPerSec: 0, eventsLastMinute: 0, series: [] },
   ...over,
 });
 
@@ -96,10 +103,13 @@ describe('progress', () => {
 
 describe('feed reducer', () => {
   const events = happyPath('pay-1');
-  const msg = (n: number): EventMessage => ({
-    kind: 'event',
-    event: events[n]!,
-    payment: summarize(stateOf(events.slice(0, n + 1))),
+  const msg = (n: number): UpdateMessage => ({
+    kind: 'update',
+    events: [{ eventId: events[n]!.eventId, type: events[n]!.type, paymentId: 'pay-1', occurredAt: events[n]!.occurredAt }],
+    eventCount: 1,
+    droppedEvents: 0,
+    counts: { [events[n]!.type]: 1 },
+    payments: [summarize(stateOf(events.slice(0, n + 1)))],
     stats: stats(),
   });
 
@@ -193,7 +203,7 @@ describe('detail helpers', () => {
 describe('api helpers', () => {
   it('parses single and batched frames', () => {
     expect(parseFrame('{"kind":"snapshot","payments":[],"stats":{}}')).toHaveLength(1);
-    expect(parseFrame('[{"kind":"event"},{"kind":"event"},{"kind":"other"}]')).toHaveLength(2);
+    expect(parseFrame('[{"kind":"update","payments":[],"counts":{},"stats":{}},{"kind":"stats","stats":{}},{"kind":"other"},{"kind":"update"}]')).toHaveLength(2);
     expect(parseFrame('not json')).toEqual([]);
   });
   it('backs off exponentially with a cap', () => {

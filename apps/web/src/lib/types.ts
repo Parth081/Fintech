@@ -2,11 +2,20 @@
 export type {
   PaymentSummary,
   Stats,
+  Throughput,
   PaymentDetail,
   ServerMessage,
   ServerFrame,
   SnapshotMessage,
-  EventMessage,
+  UpdateMessage,
+  StatsMessage,
+  EventBrief,
+  IsoMessage,
+  FxCorridorRates,
+  QuoteStats,
+  ProviderView,
+  ProviderFailure,
+  StatementRef,
 } from '../../../../services/gateway/src/api-types';
 
 export type ConnectionStatus = 'connecting' | 'live' | 'reconnecting' | 'polling' | 'offline';

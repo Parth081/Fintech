@@ -43,7 +43,7 @@ export function useLiveFeed(): { feed: FeedState; connection: ConnectionStatus }
       if (!polling || disposed) return;
       pollAbort = new AbortController();
       try {
-        const [payments, stats] = await Promise.all([fetchPayments(50, pollAbort.signal), fetchStats(pollAbort.signal)]);
+        const [payments, stats] = await Promise.all([fetchPayments(100, pollAbort.signal), fetchStats(pollAbort.signal)]);
         if (!polling || disposed) return;
         dispatch({ type: 'poll', payments, stats });
         setConnection('polling');

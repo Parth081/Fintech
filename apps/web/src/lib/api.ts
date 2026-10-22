@@ -1,5 +1,16 @@
 // Same-origin HTTP helpers (served by the gateway, or proxied by the vite dev server).
-import type { PaymentDetail, PaymentSummary, ServerMessage, Stats } from './types';
+import type { AccountBalance, JournalView, TrialBalance } from '@ct/contracts/browser';
+import type {
+  FxCorridorRates,
+  IsoMessage,
+  PaymentDetail,
+  PaymentSummary,
+  ProviderView,
+  ServerMessage,
+  StatementRef,
+  Stats,
+  Throughput,
+} from './types';
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number) {
@@ -27,6 +38,55 @@ async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
 
 export const fetchPayments = (limit = 50, signal?: AbortSignal) =>
   getJson<PaymentSummary[]>(`/api/payments?limit=${limit}`, signal);
+
+export interface PaymentQuery {
+  status?: string;
+  corridor?: string;
+  provider?: string;
+  offset?: number;
+  limit?: number;
+}
+
+/** Query string for GET /api/payments (empty values left out). */
+export function paymentQueryString(q: PaymentQuery): string {
+  const params = new URLSearchParams();
+  params.set('limit', String(q.limit ?? 50));
+  if (q.offset) params.set('offset', String(q.offset));
+  if (q.status) params.set('status', q.status);
+  if (q.corridor) params.set('corridor', q.corridor);
+  if (q.provider) params.set('provider', q.provider);
+  return params.toString();
+}
+
+/** Filtered page; total comes from the X-Total-Count header. */
+export async function fetchPaymentsPage(q: PaymentQuery, signal?: AbortSignal): Promise<{ items: PaymentSummary[]; total: number }> {
+  const res = await fetch(`/api/payments?${paymentQueryString(q)}`, { signal, headers: { accept: 'application/json' } });
+  if (!res.ok) throw new ApiError(await readError(res), res.status);
+  const items = (await res.json()) as PaymentSummary[];
+  const total = Number(res.headers.get('x-total-count') ?? items.length);
+  return { items, total: Number.isFinite(total) ? total : items.length };
+}
+
+export const fetchMessages = (id: string, signal?: AbortSignal) =>
+  getJson<IsoMessage[]>(`/api/payments/${encodeURIComponent(id)}/messages`, signal);
+export const fetchThroughput = (signal?: AbortSignal) => getJson<Throughput>('/api/throughput', signal);
+export const fetchFxRates = (signal?: AbortSignal) => getJson<FxCorridorRates[]>('/api/fx/rates', signal);
+export const fetchProviders = (signal?: AbortSignal) => getJson<ProviderView[]>('/api/providers', signal);
+export const fetchStatements = (signal?: AbortSignal) => getJson<StatementRef[]>('/api/statements', signal);
+export const fetchTrialBalance = (signal?: AbortSignal) => getJson<TrialBalance>('/api/ledger/trial-balance', signal);
+export const fetchAccounts = (signal?: AbortSignal) => getJson<AccountBalance[]>('/api/ledger/accounts', signal);
+export const fetchAccount = (accountId: string, signal?: AbortSignal) =>
+  getJson<AccountBalance>(`/api/ledger/accounts/${encodeURIComponent(accountId)}`, signal);
+export const fetchJournals = (paymentId: string, signal?: AbortSignal) =>
+  getJson<JournalView[]>(`/api/ledger/journals?paymentId=${encodeURIComponent(paymentId)}`, signal);
+
+/** camt.053 XML for one provider statement. */
+export async function fetchStatementXml(providerId: string, date: string, currency?: string, signal?: AbortSignal): Promise<string> {
+  const q = currency ? `?currency=${encodeURIComponent(currency)}` : '';
+  const res = await fetch(`/api/statements/${encodeURIComponent(providerId)}/${encodeURIComponent(date)}${q}`, { signal });
+  if (!res.ok) throw new ApiError(await readError(res), res.status);
+  return res.text();
+}
 export const fetchStats = (signal?: AbortSignal) => getJson<Stats>('/api/stats', signal);
 export const fetchDetail = (id: string, signal?: AbortSignal) =>
   getJson<PaymentDetail>(`/api/payments/${encodeURIComponent(id)}`, signal);
@@ -48,6 +108,16 @@ export async function sendSample(body: Record<string, unknown> = {}): Promise<st
   return typeof data.paymentId === 'string' ? data.paymentId : '';
 }
 
+function isMessage(m: unknown): boolean {
+  if (typeof m !== 'object' || m === null) return false;
+  const o = m as Record<string, unknown>;
+  const hasStats = typeof o.stats === 'object' && o.stats !== null;
+  if (o.kind === 'snapshot') return Array.isArray(o.payments) && hasStats;
+  if (o.kind === 'update') return Array.isArray(o.payments) && typeof o.counts === 'object' && o.counts !== null && hasStats;
+  if (o.kind === 'stats') return hasStats;
+  return false;
+}
+
 /** Parse one WS frame (a message or an array of messages). Invalid frames yield []. */
 export function parseFrame(data: string): ServerMessage[] {
   try {
@@ -55,7 +125,7 @@ export function parseFrame(data: string): ServerMessage[] {
     const list = Array.isArray(parsed) ? parsed : [parsed];
     return list.filter(
       (m): m is ServerMessage =>
-        typeof m === 'object' && m !== null && ((m as { kind?: unknown }).kind === 'snapshot' || (m as { kind?: unknown }).kind === 'event'),
+        isMessage(m),
     );
   } catch {
     return [];
