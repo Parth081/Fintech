@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { CORRIDORS, isBalanced, project, PROVIDERS, type AnyEvent, type PaymentState } from '@ct/contracts';
+import { CORRIDORS, isBalanced, project, type AnyEvent, type PaymentState } from '@ct/contracts';
+import { createInMemoryLedger } from '@ct/ledger';
+import { providerProfile, quote, scheduleFee } from '@ct/market';
 import type { EventBus } from '@ct/event-bus';
 import { InMemoryBus } from '@ct/event-bus';
 import { startPaymentApi, type PaymentApiHandle } from '@ct/payment-api';
-import { startAllStages, startStage, type StageHandle } from './runner';
+import { startAllStages, startStage, type StageHandle, type StageOptions } from './runner';
 import { STAGE_NAMES, type PipelineStage } from './steps';
 
 const HAPPY = [
@@ -22,12 +24,20 @@ let bus: InMemoryBus;
 let api: PaymentApiHandle | undefined;
 let stages: StageHandle[] = [];
 let base = '';
+let ledger: Awaited<ReturnType<typeof createInMemoryLedger>> | undefined;
+const SIM = { seed: 'test', providerFailureScale: 0 }; // failures and retries are covered in settlement/routing tests
 
-async function setup(opts: { settlementDelayMs?: number; withStages?: boolean } = {}) {
+/** Stage options with the injected ledger and a failure-free simulation, so sequences are exact. */
+const opts = (bus_: EventBus, settlementDelayMs = 0): StageOptions => ({
+  bus: bus_, stageDelayMs: 0, settlementDelayMs, catchUpQuietMs: 10, services: { ledger, sim: SIM },
+});
+
+async function setup(settle: { settlementDelayMs?: number; withStages?: boolean } = {}) {
   bus = new InMemoryBus();
+  ledger = await createInMemoryLedger();
   api = await startPaymentApi({ bus, port: 0, catchUpQuietMs: 10 });
   base = `http://127.0.0.1:${api.port}`;
-  if (opts.withStages !== false) stages.push(await startAllStages({ bus, stageDelayMs: 0, settlementDelayMs: opts.settlementDelayMs ?? 0, catchUpQuietMs: 10 }));
+  if (settle.withStages !== false) stages.push(await startAllStages(opts(bus, settle.settlementDelayMs ?? 0)));
 }
 
 async function stopStages() {
@@ -40,6 +50,8 @@ afterEach(async () => {
   await api?.close();
   api = undefined;
   await bus?.close();
+  await ledger?.close();
+  ledger = undefined;
 });
 
 async function send(body: unknown = {}, path = '/payments/sample'): Promise<string> {
@@ -80,7 +92,7 @@ describe('pipeline (API -> reconciled)', () => {
       const e = events[i]!;
       expect(e.causationId).toBe(events[i - 1]!.eventId);
       expect(e.correlationId).toBe(id);
-      expect(e.trace).toMatchObject({ stage: e.producer, ruleVersion: 'stub-v1' });
+      expect(e.trace).toMatchObject({ stage: e.producer, ruleVersion: expect.stringMatching(/^[a-z0-9-]+-v\d+$/) });
       expect(e.trace!.reasonCodes.length).toBeGreaterThan(0);
       expect(e.trace!.latencyMs).toBeGreaterThanOrEqual(0);
       expect(typeof e.trace!.decision).toBe('string');
@@ -103,11 +115,10 @@ describe('pipeline (API -> reconciled)', () => {
   });
 
   it.each([
-    // corridor, amountMinor, expected rate, expected target minor (hand computed: floor(amount * mid * 0.9965))
-    ['US-IN', 125_000, '82.958625', 10_369_828],
-    ['DE-BR', 50_000, '5.889315', 294_465],
-    ['GB-PH', 100_000, '72.1466', 7_214_660],
-  ])('quotes, routes and posts a balanced ledger for %s', async (corridorId, amountMinor, rate, targetMinor) => {
+    ['US-IN', 125_000],
+    ['DE-BR', 50_000],
+    ['GB-PH', 100_000],
+  ])('quotes, routes and posts a balanced ledger for %s', async (corridorId, amountMinor) => {
     await setup();
     const c = CORRIDORS.find((x) => x.id === corridorId)!;
     const id = await send(
@@ -121,27 +132,43 @@ describe('pipeline (API -> reconciled)', () => {
       '/payments',
     );
     const state = await waitForStatus(id, 'reconciled');
+    const source = { amountMinor, currency: c.sourceCurrency };
+
+    // FX: priced from the market at the scored trigger's time (deterministic for the seed)
+    const scoredAt = Date.parse(eventsOf(id).find((e) => e.type === 'payment.scored')!.occurredAt);
+    const expected = quote({ corridorId: c.id, sourceAmount: source, atMs: scoredAt, seed: SIM.seed });
     const quoted = state.facts['payment.quoted']!;
-    expect(quoted).toMatchObject({ rate, spreadBps: 35, sourceAmount: { amountMinor, currency: c.sourceCurrency }, targetAmount: { amountMinor: targetMinor, currency: c.targetCurrency } });
-    const quotedEvent = eventsOf(id).find((e) => e.type === 'payment.quoted')!;
-    expect(Date.parse(quoted.expiresAt) - Date.parse(quotedEvent.occurredAt)).toBe(30_000);
+    expect(quoted).toMatchObject({
+      rate: expected.rate, midRate: expected.midRate, spreadBps: expected.spreadBps,
+      sourceAmount: source, targetAmount: expected.targetAmount, expiresAt: expected.expiresAt,
+    });
+    expect(quoted.targetAmount.currency).toBe(c.targetCurrency);
 
+    // Routing: the best-scoring eligible provider, with every provider explained and its catalogue fee
     const routed = state.facts['payment.routed']!;
-    const eligible = PROVIDERS.filter((p) => p.corridors.includes(c.id));
-    expect(routed.providerId).toBe(eligible[0]!.id);
-    expect(routed.alternatives.map((a) => a.providerId)).toEqual(eligible.slice(1).map((p) => p.id));
-    expect(routed.estimatedFee.currency).toBe(c.sourceCurrency);
-    expect(routed.estimatedFee.amountMinor).toBe(Math.max(100, Math.round((amountMinor * 15) / 10_000)));
+    expect(routed.scoring).toHaveLength(3);
+    const eligible = routed.scoring!.filter((p) => p.eligible);
+    const best = Math.max(...eligible.map((p) => p.score));
+    expect(eligible.find((p) => p.providerId === routed.providerId)?.score).toBe(best);
+    const fee = scheduleFee(source, providerProfile(routed.providerId)!.fees[c.id]!);
+    expect(routed.estimatedFee).toEqual(fee);
+    expect(routed.attempt).toBe(1);
 
+    // Ledger: one balanced 5-line journal; customer pays amount + fee
+    const target = quoted.targetAmount;
     const entries = state.facts['ledger.posted']!.entries;
     expect(isBalanced(entries)).toBe(true);
-    expect(entries).toEqual([
-      { account: 'customer:ACC-SRC-1', direction: 'debit', amount: { amountMinor, currency: c.sourceCurrency } },
-      { account: `fx-position:${c.sourceCurrency}`, direction: 'credit', amount: { amountMinor, currency: c.sourceCurrency } },
-      { account: `fx-position:${c.targetCurrency}`, direction: 'debit', amount: { amountMinor: targetMinor, currency: c.targetCurrency } },
-      { account: `provider:${routed.providerId}:payable`, direction: 'credit', amount: { amountMinor: targetMinor, currency: c.targetCurrency } },
-    ]);
-    expect(state.facts['payment.reconciled']).toMatchObject({ matched: true, statementRef: expect.stringMatching(/^camt\.053-/) });
+    expect(entries).toHaveLength(5);
+    expect(entries).toEqual(expect.arrayContaining([
+      { account: `customer:ACC-SRC-1:${c.sourceCurrency}`, direction: 'debit', amount: { amountMinor: amountMinor + fee.amountMinor, currency: c.sourceCurrency } },
+      { account: `fx-position:${c.sourceCurrency}`, direction: 'credit', amount: source },
+      { account: `fee-revenue:${c.sourceCurrency}`, direction: 'credit', amount: fee },
+      { account: `fx-position:${c.targetCurrency}`, direction: 'debit', amount: target },
+      { account: `provider:${routed.providerId}:payable:${c.targetCurrency}`, direction: 'credit', amount: target },
+    ]));
+    expect(await ledger!.journals({ paymentId: id })).toHaveLength(1);
+    expect((await ledger!.invariants()).ok).toBe(true);
+    expect(state.facts['payment.reconciled']).toMatchObject({ matched: true, breaks: [], statementRef: expect.stringMatching(/^STMT-[A-Z]+-\d{8}$/) });
     expect(state.facts['payment.sent']).toMatchObject({ messageType: 'pacs.008' });
     expect(state.facts['payment.settled']).toMatchObject({ statusMessage: 'pacs.002' });
   });
@@ -161,12 +188,12 @@ describe('pipeline (API -> reconciled)', () => {
 
     // bring back only the first two stages, then stop again
     for (const name of ['screening', 'risk'] as PipelineStage[]) {
-      stages.push(await startStage(name, { bus, stageDelayMs: 0, settlementDelayMs: 0, catchUpQuietMs: 10 }));
+      stages.push(await startStage(name, opts(bus)));
     }
     for (const id of more) await waitForStatus(id, 'scored');
     await stopStages();
 
-    stages.push(await startAllStages({ bus, stageDelayMs: 0, settlementDelayMs: 0, catchUpQuietMs: 10 }));
+    stages.push(await startAllStages(opts(bus)));
     for (const id of [...ids, ...more]) {
       await waitForStatus(id, 'reconciled');
       expect(eventsOf(id).map((e) => e.type)).toEqual(HAPPY);
@@ -191,7 +218,7 @@ describe('pipeline (API -> reconciled)', () => {
       subscribe: (o, h) => bus.subscribe(o.ephemeral ? o : { ...o, group: `${o.group}-lost-offsets` }, h),
       close: async () => {},
     };
-    stages.push(await startAllStages({ bus: amnesiac, stageDelayMs: 0, settlementDelayMs: 0, catchUpQuietMs: 10 }));
+    stages.push(await startAllStages(opts(amnesiac)));
     await new Promise((r) => setTimeout(r, 50));
     await bus.drain();
 

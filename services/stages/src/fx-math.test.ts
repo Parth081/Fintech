@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { applySpread, bpsFee, convert, formatDecimal, parseDecimal } from './fx-math';
+import { applySpread, bpsFee, convert, divRound, formatDecimal, formatFixed, parseDecimal, rescale, scheduleFee } from './fx-math';
 
 describe('fx math (exact decimals)', () => {
   it('parses and formats decimals', () => {
@@ -32,5 +32,28 @@ describe('fx math (exact decimals)', () => {
   it('computes basis-point fees with a minimum', () => {
     expect(bpsFee({ amountMinor: 125_000, currency: 'USD' }, 15, 100)).toEqual({ amountMinor: 188, currency: 'USD' }); // 187.5 -> 188
     expect(bpsFee({ amountMinor: 50_000, currency: 'EUR' }, 15, 100)).toEqual({ amountMinor: 100, currency: 'EUR' }); // 75 -> min 100
+  });
+
+  it('rounds half-up when asked (FX engine)', () => {
+    // 1,250.00 EUR * 5.886932 = 7,358.665 BRL -> floor 735,866 / half-up 735,867
+    expect(convert({ amountMinor: 125_000, currency: 'EUR' }, parseDecimal('5.886932'), 'BRL')).toEqual({ amountMinor: 735_866, currency: 'BRL' });
+    expect(convert({ amountMinor: 125_000, currency: 'EUR' }, parseDecimal('5.886932'), 'BRL', 'half-up')).toEqual({ amountMinor: 735_867, currency: 'BRL' });
+    expect(convert({ amountMinor: 125_000, currency: 'EUR' }, parseDecimal('5.886931'), 'BRL', 'half-up')).toEqual({ amountMinor: 735_866, currency: 'BRL' }); // .38750 -> down
+    expect(divRound(15n, 10n, 'half-up')).toBe(2n);
+    expect(divRound(14n, 10n, 'half-up')).toBe(1n);
+    expect(divRound(19n, 10n, 'floor')).toBe(1n);
+  });
+
+  it('rescales and formats with a fixed number of decimals', () => {
+    expect(rescale(applySpread('83.639339', 37), 6)).toEqual({ units: 83_329_873n, scale: 6 }); // 83.32987345...
+    expect(formatFixed(parseDecimal('83.25'), 6)).toBe('83.250000');
+    expect(formatFixed({ units: 12_345_675n, scale: 7 }, 6)).toBe('1.234568');
+    expect(formatFixed(parseDecimal('0.5'), 0)).toBe('1');
+  });
+
+  it('applies a provider fee schedule (fixed + bps, half-up)', () => {
+    expect(scheduleFee({ amountMinor: 125_000, currency: 'USD' }, { fixedMinor: 150, bps: 20 })).toEqual({ amountMinor: 400, currency: 'USD' });
+    expect(scheduleFee({ amountMinor: 5_000, currency: 'GBP' }, { fixedMinor: 80, bps: 10 })).toEqual({ amountMinor: 85, currency: 'GBP' });
+    expect(scheduleFee({ amountMinor: 1_250, currency: 'USD' }, { fixedMinor: 90, bps: 12 })).toEqual({ amountMinor: 92, currency: 'USD' }); // 1.5 -> 2
   });
 });

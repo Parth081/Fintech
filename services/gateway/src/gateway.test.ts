@@ -9,7 +9,7 @@ import { InMemoryBus } from '@ct/event-bus';
 import { newId, type AnyEvent } from '@ct/contracts';
 import { happyPath, makeEvent, sampleInitiatedPayload } from '@ct/contracts/testing';
 import { startGateway, type GatewayHandle } from './server';
-import type { PaymentDetail, PaymentSummary, ServerMessage, Stats } from './api-types';
+import type { PaymentDetail, PaymentSummary, ServerMessage, Stats, UpdateMessage } from './api-types';
 
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
@@ -65,7 +65,7 @@ describe('projection over the bus', () => {
     await publishAll(bus, [...a, ...b]);
 
     const health = await getJson<{ ok: boolean; payments: number; events: number }>(`${base}/health`);
-    expect(health.body).toEqual({ ok: true, payments: 2, events: 14 });
+    expect(health.body).toMatchObject({ ok: true, payments: 2, events: 14, replayed: true });
 
     const list = await getJson<PaymentSummary[]>(`${base}/api/payments?limit=50`);
     expect(list.body.map((p) => p.paymentId)).toEqual(['pay-b', 'pay-a']);
@@ -159,8 +159,9 @@ describe('websocket', () => {
     });
     const live = happyPath('pay-new');
     await publishAll(bus, live);
+    const updates = () => messages.filter((m): m is UpdateMessage => m.kind === 'update');
     const deadline = Date.now() + 3000;
-    while (messages.filter((m) => m.kind === 'event').length < live.length && Date.now() < deadline) {
+    while (updates().flatMap((m) => m.events).length < live.length && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 10));
     }
     const first = messages[0];
@@ -169,11 +170,10 @@ describe('websocket', () => {
       expect(first.payments.map((p) => p.paymentId)).toEqual(['pay-old']);
       expect(first.stats.reconciled).toBe(1);
     }
-    const evs = messages.filter((m) => m.kind === 'event');
-    expect(evs.map((m) => m.event.type)).toEqual(live.map((e) => e.type));
-    const last = evs.at(-1)!;
-    expect(last.payment.paymentId).toBe('pay-new');
-    expect(last.payment.status).toBe('reconciled');
+    expect(updates().flatMap((m) => m.events).map((e) => e.type)).toEqual(live.map((e) => e.type));
+    const last = updates().at(-1)!;
+    expect(last.payments.at(-1)?.paymentId).toBe('pay-new');
+    expect(last.payments.at(-1)?.status).toBe('reconciled');
     expect(last.stats.reconciled).toBe(2);
   });
 

@@ -5,7 +5,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { exitWithSupervisor, serviceConfig } from '@ct/contracts';
 import { createBus } from '@ct/event-bus';
-import { startAllStages, startStage, type StageHandle } from './runner';
+import { startStage, type StageHandle } from './runner';
 import { isStageName, STAGE_NAMES } from './steps';
 
 export { startStage, startAllStages, buildEvent, type StageOptions, type StageHandle } from './runner';
@@ -16,8 +16,14 @@ async function main(argv: string[]): Promise<void> {
   const all = argv.includes('--all');
   const idx = argv.indexOf('--stage');
   const stage = idx >= 0 ? argv[idx + 1] : undefined;
+  // The ledger stage needs a database, so it runs inside the ledger service (services/ledger), not here.
+  const runnable = STAGE_NAMES.filter((n) => n !== 'ledger');
+  if (stage === 'ledger') {
+    console.error('the ledger stage runs inside the ledger service: tsx services/ledger/src/index.ts');
+    process.exit(2);
+  }
   if (!all && (!stage || !isStageName(stage))) {
-    console.error(`usage: stages --stage <${STAGE_NAMES.join('|')}> | --all`);
+    console.error(`usage: stages --stage <${runnable.join('|')}> | --all (all except ledger)`);
     process.exit(2);
   }
   const config = serviceConfig();
@@ -27,9 +33,13 @@ async function main(argv: string[]): Promise<void> {
     bus,
     stageDelayMs: config.stageDelayMs,
     settlementDelayMs: config.settlementDelayMs,
+    services: { sim: { seed: config.simSeed, providerFailureScale: config.providerFailureScale } },
     log: (line: string) => console.log(line),
   };
-  const handle: StageHandle = all ? await startAllStages(options) : await startStage(stage as never, options);
+  const handles: StageHandle[] = all
+    ? await Promise.all(runnable.map((n) => startStage(n, options)))
+    : [await startStage(stage as never, options)];
+  const handle: StageHandle = { stop: async () => { await Promise.all(handles.map((h) => h.stop())); } };
   console.log(`[${label}] ready (bus=${config.bus}, stageDelayMs=${config.stageDelayMs}, settlementDelayMs=${config.settlementDelayMs})`);
 
   // Keep the process alive even if the bus holds no open handles (e.g. BUS=memory).

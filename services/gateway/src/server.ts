@@ -5,27 +5,56 @@ import { stat } from 'node:fs/promises';
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
-import type { AnyEvent } from '@ct/contracts';
+import type { AnyEvent, EventType, PaymentStatus } from '@ct/contracts';
 import type { EventBus } from '@ct/event-bus';
-import { Projection } from './projection';
-import type { EventMessage, Health, ServerMessage, SnapshotMessage } from './api-types';
+import { ALL_STATUSES, Projection, type PaymentFilter } from './projection';
+import { camt053For, defaultIso, defaultMarket, fxRates, providerViews, type IsoPort, type MarketPort } from './views';
+import type {
+  EventBrief,
+  Health,
+  PaymentSummary,
+  ProviderView,
+  ServerMessage,
+  SnapshotMessage,
+  StatsMessage,
+  UpdateMessage,
+} from './api-types';
 
 export interface GatewayOptions {
   bus: EventBus;
   host?: string;
   port?: number;
   paymentApiUrl: string;
+  /** Ledger service base URL (GET /api/ledger/* is proxied to {ledgerUrl}/ledger/*). Default http://127.0.0.1:7073. */
+  ledgerUrl?: string;
   /** Directory with the built web UI. Default: apps/web/dist (or env WEB_DIST). */
   webDist?: string;
   /** WS batching window. Default 50 ms. */
   flushIntervalMs?: number;
   /** WS heartbeat interval. Default 15 s. */
   heartbeatMs?: number;
+  /** Periodic stats push (throughput decays while idle). Default 2 s; 0 disables. */
+  statsIntervalMs?: number;
+  /** Max payment summaries per WS frame; the rest follow in the next frame. Default 500. */
+  maxPaymentsPerFrame?: number;
+  /** Max event briefs per WS frame (oldest dropped first). Default 1000. */
+  maxEventsPerFrame?: number;
+  /** Seed for the simulated market (SIM_SEED). */
+  simSeed?: string;
+  /** Injected for tests; default @ct/market and @ct/iso20022. */
+  market?: MarketPort;
+  iso?: IsoPort;
+  /** Clock (tests). */
+  now?: () => number;
+  /** Log replay progress to the console. Default true unless running under vitest. */
+  log?: boolean;
 }
 
 export interface GatewayHandle {
   port: number;
   projection: Projection;
+  /** Resolves when the startup replay reached the log head seen at start. */
+  replayed: Promise<{ events: number; ms: number }>;
   close(): Promise<void>;
 }
 
@@ -83,18 +112,47 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
+function parseIntParam(v: string | null, fallback: number, min: number, max: number): number {
+  const n = Number.parseInt(v ?? '', 10);
+  return Number.isFinite(n) ? Math.min(Math.max(n, min), max) : fallback;
+}
+
+function decodeSegment(raw: string): string | null {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+}
+
+const isVitest = () => typeof process !== 'undefined' && process.env.VITEST !== undefined;
+
 export async function startGateway(options: GatewayOptions): Promise<GatewayHandle> {
   const { bus, paymentApiUrl } = options;
   const host = options.host ?? '127.0.0.1';
   const webDist = resolve(options.webDist ?? process.env.WEB_DIST ?? DEFAULT_WEB_DIST);
+  const ledgerUrl = (options.ledgerUrl ?? 'http://127.0.0.1:7073').replace(/\/$/, '');
   const flushIntervalMs = options.flushIntervalMs ?? 50;
   const heartbeatMs = options.heartbeatMs ?? 15_000;
-  const projection = new Projection();
+  const statsIntervalMs = options.statsIntervalMs ?? 2000;
+  const maxPaymentsPerFrame = options.maxPaymentsPerFrame ?? 500;
+  const maxEventsPerFrame = options.maxEventsPerFrame ?? 1000;
+  const marketPort = options.market ?? defaultMarket;
+  const isoPort = options.iso ?? defaultIso;
+  const simSeed = options.simSeed ?? 'control-tower';
+  const now = options.now ?? Date.now;
+  const log = options.log ?? !isVitest();
+  const projection = new Projection({ now });
 
-  // ---- WebSocket fan-out with batching -------------------------------------------------
+  // ---- WebSocket fan-out: coalesced per payment, capped per frame ----------------------
   const wss = new WebSocketServer({ noServer: true });
   const alive = new WeakMap<WebSocket, boolean>();
-  let pending: AnyEvent[] = [];
+  /** Latest summary per changed payment, in order of first change since the last flush. */
+  const pendingPayments = new Map<string, PaymentSummary>();
+  let pendingEvents: EventBrief[] = [];
+  let pendingDropped = 0;
+  let pendingCount = 0;
+  let pendingCounts: Partial<Record<EventType, number>> = {};
   let flushTimer: NodeJS.Timeout | null = null;
 
   const broadcast = (frame: string, exclude?: WebSocket) => {
@@ -110,36 +168,84 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
     }
   };
 
+  const listeners = (exclude?: WebSocket) => {
+    let n = 0;
+    for (const c of wss.clients) if (c !== exclude && c.readyState === WebSocket.OPEN) n++;
+    return n;
+  };
+
+  const clearPending = () => {
+    pendingPayments.clear();
+    pendingEvents = [];
+    pendingDropped = 0;
+    pendingCount = 0;
+    pendingCounts = {};
+  };
+
   const flush = (exclude?: WebSocket) => {
     if (flushTimer) clearTimeout(flushTimer);
     flushTimer = null;
-    if (pending.length === 0) return;
-    const batch = pending;
-    pending = [];
-    if (wss.clients.size === 0 || (exclude && wss.clients.size === 1)) return;
-    const stats = projection.stats();
-    const messages: EventMessage[] = [];
-    // Summaries reflect the latest state; the event itself says what just happened.
-    for (const event of batch) {
-      const payment = projection.summary(event.paymentId);
-      if (payment) messages.push({ kind: 'event', event, payment, stats });
+    if (pendingPayments.size === 0 && pendingCount === 0) return;
+    if (listeners(exclude) === 0) {
+      clearPending();
+      return;
     }
-    if (messages.length === 1) broadcast(JSON.stringify(messages[0]), exclude);
-    else if (messages.length > 1) broadcast(JSON.stringify(messages), exclude);
+    const payments: PaymentSummary[] = [];
+    for (const [id, s] of pendingPayments) {
+      if (payments.length >= maxPaymentsPerFrame) break;
+      payments.push(s);
+      pendingPayments.delete(id);
+    }
+    let events = pendingEvents;
+    let dropped = pendingDropped;
+    if (events.length > maxEventsPerFrame) {
+      dropped += events.length - maxEventsPerFrame;
+      events = events.slice(events.length - maxEventsPerFrame);
+    }
+    const msg: UpdateMessage = {
+      kind: 'update',
+      payments,
+      events,
+      eventCount: pendingCount,
+      droppedEvents: dropped,
+      counts: pendingCounts,
+      stats: projection.stats(),
+    };
+    pendingEvents = [];
+    pendingDropped = 0;
+    pendingCount = 0;
+    pendingCounts = {};
+    broadcast(JSON.stringify(msg), exclude);
+    // More changed payments than fit in one frame: send them next window.
+    if (pendingPayments.size > 0) scheduleFlush();
   };
 
   const scheduleFlush = () => {
     if (!flushTimer) flushTimer = setTimeout(() => flush(), flushIntervalMs);
   };
 
-  const snapshot = (): SnapshotMessage => ({ kind: 'snapshot', payments: projection.summaries(50), stats: projection.stats() });
+  const enqueue = (event: AnyEvent, summary: PaymentSummary) => {
+    pendingPayments.set(event.paymentId, summary);
+    pendingEvents.push({ eventId: event.eventId, type: event.type, paymentId: event.paymentId, occurredAt: event.occurredAt });
+    if (pendingEvents.length > maxEventsPerFrame * 2) {
+      const cut = pendingEvents.length - maxEventsPerFrame;
+      pendingEvents = pendingEvents.slice(cut);
+      pendingDropped += cut;
+    }
+    pendingCount += 1;
+    pendingCounts[event.type] = (pendingCounts[event.type] ?? 0) + 1;
+    scheduleFlush();
+  };
+
+  const SNAPSHOT_ROWS = 100;
+  const snapshot = (): SnapshotMessage => ({ kind: 'snapshot', payments: projection.summaries(SNAPSHOT_ROWS), stats: projection.stats() });
 
   wss.on('connection', (socket) => {
     alive.set(socket, true);
     socket.on('pong', () => alive.set(socket, true));
     socket.on('error', () => socket.terminate());
     // Clients only listen; ignore anything they send.
-    // Deliver queued events to existing clients first: the snapshot already contains them.
+    // Deliver queued changes to existing clients first: the snapshot already contains them.
     flush(socket);
     const msg: ServerMessage = snapshot();
     socket.send(JSON.stringify(msg));
@@ -161,16 +267,44 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
   }, heartbeatMs);
   heartbeat.unref();
 
-  // ---- Bus subscription ---------------------------------------------------------------
-  const subscription = await bus.subscribe({ group: 'gateway', from: 'earliest', ephemeral: true }, (event) => {
-    // Never throw: a throwing handler would be retried forever.
-    const result = projection.apply(event);
-    if (result.kind === 'applied') {
-      pending.push(event);
-      scheduleFlush();
-    } else if (result.kind === 'rejected') {
-      console.warn(`[gateway] rejected event ${String(event?.eventId)} (${String(event?.type)}): ${result.error}`);
+  const statsTimer =
+    statsIntervalMs > 0
+      ? setInterval(() => {
+          if (listeners() === 0) return;
+          const msg: StatsMessage = { kind: 'stats', stats: projection.stats() };
+          broadcast(JSON.stringify(msg));
+        }, statsIntervalMs)
+      : null;
+  statsTimer?.unref();
+
+  // ---- Bus subscription + replay timing -----------------------------------------------
+  const replayStart = performance.now();
+  const headAtStart = await bus.head().catch(() => 0);
+  let replayDone: { events: number; ms: number } | null = null;
+  let resolveReplay!: (v: { events: number; ms: number }) => void;
+  const replayed = new Promise<{ events: number; ms: number }>((r) => (resolveReplay = r));
+  const finishReplay = () => {
+    if (replayDone) return;
+    replayDone = { events: headAtStart, ms: Math.round(performance.now() - replayStart) };
+    if (log && headAtStart > 0) {
+      console.log(`[gateway] replayed ${headAtStart} events (${projection.paymentCount} payments) in ${replayDone.ms} ms`);
     }
+    resolveReplay(replayDone);
+  };
+  if (headAtStart === 0) finishReplay();
+
+  const subscription = await bus.subscribe({ group: 'gateway', from: 'earliest', ephemeral: true }, (event, meta) => {
+    // Never throw: a throwing handler would be retried forever.
+    try {
+      const result = projection.apply(event);
+      if (result.kind === 'applied') enqueue(result.event, result.summary);
+      else if (result.kind === 'rejected' && log) {
+        console.warn(`[gateway] rejected event ${String(event?.eventId)} (${String(event?.type)}): ${result.error}`);
+      }
+    } catch (err) {
+      console.error('[gateway] projection failed', err);
+    }
+    if (!replayDone && meta.offset + 1 >= headAtStart) finishReplay();
   });
 
   // ---- HTTP ---------------------------------------------------------------------------
@@ -203,6 +337,34 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
     } catch (err) {
       sendJson(res, 502, { error: 'payment API unavailable', detail: (err as Error).message });
     }
+  };
+
+  /** GET /api/ledger/<rest> -> {ledgerUrl}/ledger/<rest>; /api/ledger/health -> {ledgerUrl}/health. */
+  const proxyLedger = async (res: ServerResponse, path: string, search: string) => {
+    const rest = path.slice('/api/ledger'.length);
+    const target = rest === '/health' ? '/health' : `/ledger${rest}`;
+    try {
+      const upstream = await fetch(`${ledgerUrl}${target}${search}`, {
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(5000),
+      });
+      const text = await upstream.text();
+      res.writeHead(upstream.status, {
+        'content-type': upstream.headers.get('content-type') ?? 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+      });
+      res.end(text);
+    } catch (err) {
+      sendJson(res, 502, { error: 'ledger unavailable', detail: (err as Error).message });
+    }
+  };
+
+  let providersCache: { at: number; body: ProviderView[] } | null = null;
+  const providers = (): ProviderView[] => {
+    const t = now();
+    if (providersCache && t - providersCache.at < 1000) return providersCache.body;
+    providersCache = { at: t, body: providerViews(projection, marketPort) };
+    return providersCache.body;
   };
 
   const serveStatic = async (req: IncomingMessage, res: ServerResponse, pathname: string) => {
@@ -267,38 +429,95 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
     createReadStream(file).on('error', () => res.destroy()).pipe(res);
   };
 
+  const handleApi = async (req: IncomingMessage, res: ServerResponse, url: URL, method: string) => {
+    const path = url.pathname;
+    if (method === 'GET') {
+      if (path === '/api/payments') {
+        const q = url.searchParams;
+        const limit = parseIntParam(q.get('limit'), 50, 1, 1000);
+        const offset = parseIntParam(q.get('offset'), 0, 0, Number.MAX_SAFE_INTEGER);
+        const filter: PaymentFilter = {};
+        const status = q.get('status');
+        if (status) filter.status = status.split(',').filter((s): s is PaymentStatus => (ALL_STATUSES as readonly string[]).includes(s));
+        if (status && filter.status?.length === 0) filter.status = ['__none__' as PaymentStatus];
+        const corridor = q.get('corridor');
+        if (corridor) filter.corridor = corridor;
+        const provider = q.get('provider');
+        if (provider) filter.provider = provider;
+        const page = projection.page(filter, offset, limit);
+        res.setHeader('x-total-count', String(page.total));
+        res.setHeader('access-control-expose-headers', 'x-total-count');
+        return sendJson(res, 200, page.items);
+      }
+      if (path === '/api/stats') return sendJson(res, 200, projection.stats());
+      if (path === '/api/rejected') return sendJson(res, 200, projection.rejected());
+      if (path === '/api/throughput') return sendJson(res, 200, projection.throughput.read());
+      if (path === '/api/fx/rates') return sendJson(res, 200, fxRates(projection, marketPort, simSeed, now()));
+      if (path === '/api/providers') return sendJson(res, 200, providers());
+      if (path === '/api/statements') return sendJson(res, 200, projection.statementRefs());
+      if (path === '/api/ledger' || path.startsWith('/api/ledger/')) return proxyLedger(res, path, url.search);
+
+      const st = /^\/api\/statements\/([^/]+)\/([^/]+)$/.exec(path);
+      if (st) {
+        const providerId = decodeSegment(st[1]!);
+        const date = decodeSegment(st[2]!);
+        if (providerId === null || date === null) return sendJson(res, 400, { error: 'bad path' });
+        const groups = projection.statementGroups(providerId, date);
+        const currency = url.searchParams.get('currency');
+        const group = currency ? groups.find((g) => g.currency === currency) : groups[0];
+        if (!group) return sendJson(res, 404, { error: 'statement not found', providerId, date, currency });
+        let xml: string;
+        try {
+          xml = camt053For(group, isoPort);
+        } catch (err) {
+          return sendJson(res, 503, { error: 'camt.053 builder unavailable', detail: (err as Error).message });
+        }
+        res.writeHead(200, {
+          'content-type': 'application/xml; charset=utf-8',
+          'cache-control': 'no-store',
+          'x-statement-id': group.statementId,
+          'x-statement-currencies': groups.map((g) => g.currency).join(','),
+        });
+        res.end(xml);
+        return;
+      }
+
+      const msgs = /^\/api\/payments\/([^/]+)\/messages$/.exec(path);
+      if (msgs) {
+        const id = decodeSegment(msgs[1]!);
+        if (id === null) return sendJson(res, 400, { error: 'bad payment id' });
+        const list = projection.messages(id);
+        return list ? sendJson(res, 200, list) : sendJson(res, 404, { error: 'payment not found', paymentId: id });
+      }
+      const m = /^\/api\/payments\/([^/]+)$/.exec(path);
+      if (m) {
+        const id = decodeSegment(m[1]!);
+        if (id === null) return sendJson(res, 400, { error: 'bad payment id' });
+        const detail = projection.detail(id);
+        return detail ? sendJson(res, 200, detail) : sendJson(res, 404, { error: 'payment not found', paymentId: id });
+      }
+    }
+    if (method === 'POST' && path === '/api/payments') return proxy(req, res, '/payments');
+    if (method === 'POST' && path === '/api/payments/sample') return proxy(req, res, '/payments/sample');
+    return sendJson(res, method === 'GET' || method === 'POST' ? 404 : 405, { error: 'not found' });
+  };
+
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? '/', 'http://gateway.local');
     const path = url.pathname;
     const method = req.method ?? 'GET';
 
     if (path === '/health' && method === 'GET') {
-      const body: Health = { ok: true, payments: projection.paymentCount, events: projection.totalEvents };
+      const body: Health = {
+        ok: true,
+        payments: projection.paymentCount,
+        events: projection.totalEvents,
+        replayed: replayDone !== null,
+        replayMs: replayDone?.ms ?? null,
+      };
       return sendJson(res, 200, body);
     }
-    if (path.startsWith('/api/') || path === '/api') {
-      if (method === 'GET' && path === '/api/payments') {
-        const raw = Number.parseInt(url.searchParams.get('limit') ?? '50', 10);
-        const limit = Number.isFinite(raw) ? Math.min(Math.max(raw, 1), 1000) : 50;
-        return sendJson(res, 200, projection.summaries(limit));
-      }
-      if (method === 'GET' && path === '/api/stats') return sendJson(res, 200, projection.stats());
-      if (method === 'GET' && path === '/api/rejected') return sendJson(res, 200, projection.rejected());
-      if (method === 'POST' && path === '/api/payments') return proxy(req, res, '/payments');
-      if (method === 'POST' && path === '/api/payments/sample') return proxy(req, res, '/payments/sample');
-      const m = /^\/api\/payments\/([^/]+)$/.exec(path);
-      if (method === 'GET' && m) {
-        let id: string;
-        try {
-          id = decodeURIComponent(m[1]!);
-        } catch {
-          return sendJson(res, 400, { error: 'bad payment id' });
-        }
-        const detail = projection.detail(id);
-        return detail ? sendJson(res, 200, detail) : sendJson(res, 404, { error: 'payment not found', paymentId: id });
-      }
-      return sendJson(res, method === 'GET' || method === 'POST' ? 404 : 405, { error: 'not found' });
-    }
+    if (path.startsWith('/api/') || path === '/api') return handleApi(req, res, url, method);
     if (method === 'GET' || method === 'HEAD') return serveStatic(req, res, path);
     return sendJson(res, 405, { error: 'method not allowed' });
   };
@@ -334,10 +553,12 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
   return {
     port,
     projection,
+    replayed,
     async close() {
       if (closed) return;
       closed = true;
       clearInterval(heartbeat);
+      if (statsTimer) clearInterval(statsTimer);
       if (flushTimer) clearTimeout(flushTimer);
       await subscription.unsubscribe().catch(() => undefined);
       for (const client of wss.clients) client.terminate();

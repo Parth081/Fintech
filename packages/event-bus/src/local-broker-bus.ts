@@ -3,7 +3,7 @@ import WebSocket from 'ws';
 import type { AnyEvent } from '@ct/contracts';
 import type { DeliveryMeta, EventBus, EventHandler, SubscribeOptions, Subscription } from './types';
 
-const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 2;
 
 type BrokerMessage =
   | { op: 'welcome'; protocol: number; length: number }
@@ -11,6 +11,8 @@ type BrokerMessage =
   | { op: 'subscribed'; reqId: number; subId: number; start: number }
   | { op: 'unsubscribed'; reqId: number; subId: number }
   | { op: 'deliver'; subId: number; offset: number; event: AnyEvent }
+  | { op: 'deliver-batch'; subId: number; offset: number; events: AnyEvent[] }
+  | { op: 'head'; reqId: number; length: number }
   | { op: 'error'; reqId?: number; message: string };
 
 export interface LocalBrokerBusOptions {
@@ -18,7 +20,7 @@ export interface LocalBrokerBusOptions {
   connectTimeoutMs?: number;
   /** A publish that cannot be acknowledged (broker unreachable) within this time is rejected. Default 30s. */
   publishTimeoutMs?: number;
-  /** Flow-control window per subscription: max deliveries buffered client-side. Default 256. */
+  /** Flow-control window per subscription: max deliveries buffered client-side. Default 1024. */
   window?: number;
   /** Max reconnect backoff. Default 2000ms. */
   maxReconnectDelayMs?: number;
@@ -39,12 +41,13 @@ interface PendingUnsub {
   resolve: () => void;
 }
 
-export class LocalBrokerBus implements EventBus {
-  /** M2 PLACEHOLDER: implemented by the scale/reliability agent. Callers fall back when this throws. */
-  async head(): Promise<number> {
-    throw new Error('head() not implemented yet');
-  }
+interface PendingHead {
+  resolve: (length: number) => void;
+  reject: (e: Error) => void;
+  timer: NodeJS.Timeout;
+}
 
+export class LocalBrokerBus implements EventBus {
   private ws: WebSocket | null = null;
   private connected = false;
   private closed = false;
@@ -54,6 +57,7 @@ export class LocalBrokerBus implements EventBus {
   private readonly subs = new Map<number, ClientSub>();
   private readonly subscribeReqs = new Map<number, ClientSub>();
   private readonly unsubReqs = new Map<number, PendingUnsub>();
+  private readonly headReqs = new Map<number, PendingHead>();
   private reconnectTimer: NodeJS.Timeout | null = null;
   private reconnectDelay = 100;
   private readonly opts: Required<Omit<LocalBrokerBusOptions, 'logger'>> & { logger: Pick<Console, 'warn' | 'error'> };
@@ -66,7 +70,7 @@ export class LocalBrokerBus implements EventBus {
     this.opts = {
       connectTimeoutMs: options.connectTimeoutMs ?? 10_000,
       publishTimeoutMs: options.publishTimeoutMs ?? 30_000,
-      window: Math.max(2, options.window ?? 256),
+      window: Math.max(2, options.window ?? 1024),
       maxReconnectDelayMs: options.maxReconnectDelayMs ?? 2000,
       maxRetryDelayMs: options.maxRetryDelayMs ?? 1000,
       logger: options.logger ?? console,
@@ -144,9 +148,10 @@ export class LocalBrokerBus implements EventBus {
     this.send({ op: 'hello', clientId: this.clientId, protocol: PROTOCOL_VERSION });
     for (const sub of this.subs.values()) this.sendSubscribe(sub);
     for (const [reqId, p] of this.publishes) {
-      this.send({ op: 'publish', reqId, event: p.event, retry: p.sentOnce || undefined });
+      this.sendPublish(reqId, p.event, p.sentOnce);
       p.sentOnce = true;
     }
+    for (const reqId of this.headReqs.keys()) this.send({ op: 'head', reqId });
   }
 
   private onDisconnected(): void {
@@ -172,10 +177,22 @@ export class LocalBrokerBus implements EventBus {
   }
 
   private send(msg: object): boolean {
+    return this.sendRaw(JSON.stringify(msg));
+  }
+
+  private sendRaw(frame: string): boolean {
     const ws = this.ws;
     if (!ws || !this.connected || ws.readyState !== WebSocket.OPEN) return false;
-    ws.send(JSON.stringify(msg));
+    ws.send(frame);
     return true;
+  }
+
+  /**
+   * Publish frame with `event` as the last key, so the broker can store the event's JSON as sent instead of
+   * re-serializing it (see rawEventText in services/broker). The broker deduplicates by eventId either way.
+   */
+  private sendPublish(reqId: number, event: AnyEvent, retry: boolean): boolean {
+    return this.sendRaw(`{"op":"publish","reqId":${reqId}${retry ? ',"retry":true' : ''},"event":${JSON.stringify(event)}}`);
   }
 
   private onMessage(raw: string): void {
@@ -212,6 +229,19 @@ export class LocalBrokerBus implements EventBus {
       case 'deliver':
         this.subs.get(msg.subId)?.onDeliver(msg.offset, msg.event);
         return;
+      case 'deliver-batch': {
+        const sub = this.subs.get(msg.subId);
+        if (sub) msg.events.forEach((event, i) => sub.onDeliver(msg.offset + i, event));
+        return;
+      }
+      case 'head': {
+        const h = this.headReqs.get(msg.reqId);
+        if (!h) return;
+        this.headReqs.delete(msg.reqId);
+        clearTimeout(h.timer);
+        h.resolve(msg.length);
+        return;
+      }
       case 'error': {
         const err = new Error(`broker: ${msg.message}`);
         if (msg.reqId !== undefined) {
@@ -251,8 +281,21 @@ export class LocalBrokerBus implements EventBus {
       }, this.opts.publishTimeoutMs);
       const p: PendingPublish = { event, sentOnce: false, resolve, reject, timer };
       this.publishes.set(reqId, p);
-      if (this.send({ op: 'publish', reqId, event })) p.sentOnce = true;
+      if (this.sendPublish(reqId, event, false)) p.sentOnce = true;
       // else: queued; sent (with retry flag where needed) on reconnect.
+    });
+  }
+
+  /** Number of durable events in the broker's log. Waits (up to publishTimeoutMs) for a connection. */
+  head(): Promise<number> {
+    if (this.closed) return Promise.reject(new Error('bus closed'));
+    return new Promise<number>((resolve, reject) => {
+      const reqId = ++this.reqSeq;
+      const timer = setTimeout(() => {
+        if (this.headReqs.delete(reqId)) reject(new Error(`head() timed out after ${this.opts.publishTimeoutMs}ms (broker ${this.url})`));
+      }, this.opts.publishTimeoutMs);
+      this.headReqs.set(reqId, { resolve, reject, timer });
+      this.send({ op: 'head', reqId }); // else sent on reconnect
     });
   }
 
@@ -288,6 +331,7 @@ export class LocalBrokerBus implements EventBus {
       ephemeral: sub.options.ephemeral === true,
       position: sub.position,
       credit: window,
+      batch: true,
     });
   }
 
@@ -323,6 +367,11 @@ export class LocalBrokerBus implements EventBus {
       p.reject(new Error('bus closed'));
     }
     this.publishes.clear();
+    for (const h of this.headReqs.values()) {
+      clearTimeout(h.timer);
+      h.reject(new Error('bus closed'));
+    }
+    this.headReqs.clear();
     const ws = this.ws;
     this.ws = null;
     this.connected = false;

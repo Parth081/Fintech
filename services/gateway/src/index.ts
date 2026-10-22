@@ -8,6 +8,7 @@ import { DEFAULT_WEB_DIST, startGateway } from './server';
 export { startGateway, DEFAULT_WEB_DIST } from './server';
 export type { GatewayOptions, GatewayHandle } from './server';
 export { Projection, summarize } from './projection';
+export type { MarketPort, IsoPort, Camt053Input } from './views';
 export type * from './api-types';
 
 async function main(): Promise<void> {
@@ -19,10 +20,12 @@ async function main(): Promise<void> {
     host: config.host,
     port: config.gatewayPort,
     paymentApiUrl: config.paymentApiUrl,
+    ledgerUrl: config.ledgerUrl,
+    simSeed: config.simSeed,
     webDist,
   });
   console.log(
-    `[gateway] listening on http://${config.host}:${gateway.port} (ws://${config.host}:${gateway.port}/ws), bus=${config.bus}, payment API ${config.paymentApiUrl}, UI from ${webDist}`,
+    `[gateway] listening on http://${config.host}:${gateway.port} (ws://${config.host}:${gateway.port}/ws), bus=${config.bus}, payment API ${config.paymentApiUrl}, ledger ${config.ledgerUrl}, UI from ${webDist}`,
   );
 
   let stopping = false;

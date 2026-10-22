@@ -1,10 +1,13 @@
-// fx stage (M1 stub; M2 owners replace the logic, keep the export name).
-import { corridorById } from '@ct/contracts';
-import { applySpread, convert, formatDecimal } from '../fx-math';
+// fx stage: payment.scored(approve) -> payment.quoted, priced by the simulated market (@ct/market).
+// The quote is taken at the TRIGGER's occurredAt (not the wall clock), so re-running the step for
+// the same trigger (restart, redelivery, replay) yields exactly the same quote.
+import { DEFAULT_SEED, PRICING_VERSION, QUOTE_TTL_MS as MARKET_QUOTE_TTL_MS, quote } from '@ct/market';
 import { shortRef, type Step } from './common';
 
+/** M1 flat spread, kept for compatibility. M2 pricing is per corridor + tier + volatility (see @ct/market pricing). */
 export const FX_SPREAD_BPS = 35;
-export const QUOTE_TTL_MS = 30_000;
+export const QUOTE_TTL_MS = MARKET_QUOTE_TTL_MS;
+export const FX_RULE_VERSION = PRICING_VERSION;
 
 export const fxSteps: Step[] = [
   {
@@ -13,24 +16,46 @@ export const fxSteps: Step[] = [
     produce: (trigger, state, ctx) => {
       if (trigger.type !== 'payment.scored' || trigger.payload.decision !== 'approve') return null;
       const init = state.initiated;
-      const corridor = corridorById(init.corridor);
-      if (!corridor) throw new Error(`unknown corridor ${init.corridor}`);
-      const rate = applySpread(corridor.midRate, FX_SPREAD_BPS);
-      const targetAmount = convert(init.amount, rate, init.targetCurrency);
-      const rateStr = formatDecimal(rate);
+      const atMs = Date.parse(trigger.occurredAt);
+      if (!Number.isFinite(atMs)) throw new Error(`trigger ${trigger.eventId} has no valid occurredAt`);
+      const seed = ctx.services.sim?.seed ?? DEFAULT_SEED;
+      const q = quote({ corridorId: init.corridor, sourceAmount: init.amount, atMs, seed });
+      if (q.targetAmount.currency !== init.targetCurrency) {
+        throw new Error(`corridor ${init.corridor} pays ${q.targetAmount.currency}, payment asks for ${init.targetCurrency}`);
+      }
+      const reasonCodes = ['MARKET_MID_RATE', `AMOUNT_TIER_${q.tier.toUpperCase()}`];
+      if (q.components.volatilityBps > 0) reasonCodes.push('VOLATILITY_ADD_ON');
+      reasonCodes.push('SPREAD_APPLIED');
       return {
         type: 'payment.quoted',
         payload: {
           quoteId: `q-${shortRef(state.paymentId, 'fx-quote')}`,
-          rate: rateStr,
-          spreadBps: FX_SPREAD_BPS,
-          sourceAmount: init.amount,
-          targetAmount,
-          expiresAt: new Date(Date.parse(ctx.now) + QUOTE_TTL_MS).toISOString(),
+          rate: q.rate,
+          midRate: q.midRate,
+          rateTimestamp: q.rateTimestamp,
+          spreadBps: q.spreadBps,
+          sourceAmount: q.sourceAmount,
+          targetAmount: q.targetAmount,
+          expiresAt: q.expiresAt,
         },
         decision: 'quoted',
-        reasonCodes: ['STUB_PASS', 'MID_RATE_PLUS_SPREAD'],
-        inputs: { corridor: corridor.id, midRate: corridor.midRate, spreadBps: FX_SPREAD_BPS, rate: rateStr, sourceAmount: init.amount },
+        reasonCodes,
+        ruleVersion: FX_RULE_VERSION,
+        inputs: {
+          corridor: q.corridorId,
+          seed,
+          pricedAt: trigger.occurredAt,
+          midRate: q.midRate,
+          rateTimestamp: q.rateTimestamp,
+          amountTier: q.tier,
+          spreadComponents: q.components,
+          recentRangeBps: q.recentRangeBps,
+          spreadBps: q.spreadBps,
+          rate: q.rate,
+          sourceAmount: q.sourceAmount,
+          targetAmount: q.targetAmount,
+          ttlMs: QUOTE_TTL_MS,
+        },
       };
     },
   },

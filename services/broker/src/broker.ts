@@ -22,6 +22,15 @@ export interface BrokerHandle {
 }
 
 const MAX_CREDIT = 10_000;
+/** A `deliver-batch` frame carries at most this many events / roughly this many bytes. */
+const MAX_BATCH_EVENTS = 512;
+const MAX_BATCH_BYTES = 1 << 20;
+const MAX_EVENTS_PAGE = 5000;
+const COMMA = Buffer.from(',');
+const BATCH_END = Buffer.from(']}');
+const OBJ_END = Buffer.from('}');
+/** Prefix LocalBrokerBus writes for publish frames, so the event JSON can be stored without re-serializing it. */
+const PUBLISH_PREFIX = /^\{"op":"publish","reqId":\d+(?:,"retry":true)?,"event":/;
 
 interface BrokerSub {
   subId: number;
@@ -30,6 +39,8 @@ interface BrokerSub {
   ephemeral: boolean;
   next: number;
   credit: number;
+  /** Client understands `deliver-batch` (protocol v2). */
+  batch: boolean;
 }
 
 interface Conn {
@@ -48,11 +59,30 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle>
   const pump = (sub: BrokerSub): void => {
     const { ws } = sub.conn;
     while (sub.credit > 0 && sub.next < store.length && ws.readyState === WebSocket.OPEN) {
-      const offset = sub.next;
-      // The stored line is already JSON; splice it in to avoid re-serializing.
-      ws.send(`{"op":"deliver","subId":${sub.subId},"offset":${offset},"event":${store.lines[offset]}}`);
-      sub.next += 1;
-      sub.credit -= 1;
+      const first = sub.next;
+      // Stored lines are already JSON (UTF-8 Buffers): splice them into the frame, never re-serialize.
+      if (!sub.batch) {
+        ws.send(Buffer.concat([Buffer.from(`{"op":"deliver","subId":${sub.subId},"offset":${first},"event":`), store.lines[first]!, OBJ_END]), { binary: false });
+        sub.next += 1;
+        sub.credit -= 1;
+        continue;
+      }
+      const limit = Math.min(sub.credit, MAX_BATCH_EVENTS, store.length - first);
+      const parts: Buffer[] = [Buffer.from(`{"op":"deliver-batch","subId":${sub.subId},"offset":${first},"events":[`)];
+      let n = 0;
+      let bytes = 0;
+      while (n < limit) {
+        const line = store.lines[first + n]!;
+        if (n > 0 && bytes + line.length > MAX_BATCH_BYTES) break;
+        if (n > 0) parts.push(COMMA);
+        parts.push(line);
+        bytes += line.length + 1;
+        n += 1;
+      }
+      parts.push(BATCH_END);
+      ws.send(Buffer.concat(parts), { binary: false });
+      sub.next += n;
+      sub.credit -= n;
     }
   };
 
@@ -64,7 +94,7 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle>
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
   };
 
-  const handle = async (conn: Conn, msg: ClientMessage): Promise<void> => {
+  const handle = async (conn: Conn, msg: ClientMessage, raw?: string): Promise<void> => {
     switch (msg.op) {
       case 'hello':
         conn.clientId = String(msg.clientId ?? 'anonymous');
@@ -76,17 +106,11 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle>
           send(conn.ws, { op: 'error', reqId: msg.reqId, message: 'publish: event must be an object with string eventId, type and paymentId' });
           return;
         }
-        if (msg.retry) {
-          // A resend after a lost connection: if the first attempt made it, return its offset.
-          const existing = store.findEventId(ev.eventId);
-          if (existing !== undefined) {
-            send(conn.ws, { op: 'ack', reqId: msg.reqId, offset: existing, duplicate: true });
-            return;
-          }
-        }
+        // Idempotent append for every publish (not only `retry`): an eventId already in the log, or being
+        // appended right now by another publish, acks with the existing offset and appends nothing.
         try {
-          const offset = await store.append(ev);
-          send(conn.ws, { op: 'ack', reqId: msg.reqId, offset });
+          const { offset, duplicate } = await store.append(ev.eventId, raw ?? JSON.stringify(ev));
+          send(conn.ws, duplicate ? { op: 'ack', reqId: msg.reqId, offset, duplicate: true } : { op: 'ack', reqId: msg.reqId, offset });
         } catch (err) {
           send(conn.ws, { op: 'error', reqId: msg.reqId, message: `publish failed: ${(err as Error).message}` });
         }
@@ -115,6 +139,7 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle>
           ephemeral,
           next: start,
           credit: clampCredit(msg.credit),
+          batch: msg.batch === true,
         };
         conn.subs.set(sub.subId, sub);
         send(conn.ws, { op: 'subscribed', reqId: msg.reqId, subId: sub.subId, start });
@@ -138,6 +163,10 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle>
         conn.subs.delete(msg.subId);
         send(conn.ws, { op: 'unsubscribed', reqId: msg.reqId, subId: msg.subId });
         return;
+      case 'head':
+        // Everything acked before this request is durable and therefore counted.
+        send(conn.ws, { op: 'head', reqId: msg.reqId, length: store.length });
+        return;
       default:
         send(conn.ws, { op: 'error', message: `unknown op "${String((msg as { op?: unknown }).op)}"` });
     }
@@ -151,14 +180,34 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle>
     };
     if (req.method === 'GET' && url.pathname === '/health') {
       json(200, { ok: true, events: store.length });
+    } else if (req.method === 'GET' && url.pathname === '/stats') {
+      const mem = process.memoryUsage();
+      let subscriptions = 0;
+      for (const c of conns) subscriptions += c.subs.size;
+      json(200, {
+        events: store.length,
+        logBytes: store.stats.bytes,
+        loadMs: store.stats.loadMs,
+        appendBatches: store.stats.appendBatches,
+        duplicatesSuppressed: store.stats.duplicatesSuppressed,
+        connections: conns.size,
+        subscriptions,
+        rssBytes: mem.rss,
+        heapUsedBytes: mem.heapUsed,
+        uptimeS: Math.round(process.uptime()),
+      });
     } else if (req.method === 'GET' && url.pathname === '/events') {
       const from = Math.max(0, Number.parseInt(url.searchParams.get('from') ?? '0', 10) || 0);
-      const limit = Math.min(1000, Math.max(1, Number.parseInt(url.searchParams.get('limit') ?? '100', 10) || 100));
-      const out: { offset: number; event: unknown }[] = [];
+      const limit = Math.min(MAX_EVENTS_PAGE, Math.max(1, Number.parseInt(url.searchParams.get('limit') ?? '100', 10) || 100));
+      // Splice the stored JSON lines into the response instead of parsing and re-serializing them.
+      const parts: Buffer[] = [Buffer.from('[')];
       for (let o = from; o < Math.min(store.length, from + limit); o += 1) {
-        out.push({ offset: o, event: JSON.parse(store.lines[o]!) });
+        parts.push(Buffer.from(`${o === from ? '' : ','}{"offset":${o},"event":`), store.lines[o]!, OBJ_END);
       }
-      json(200, out);
+      parts.push(Buffer.from(']'));
+      const body = Buffer.concat(parts);
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': body.length });
+      res.end(body);
     } else {
       json(404, { error: 'not found' });
     }
@@ -171,9 +220,10 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle>
     // Process messages from one connection strictly in order (a commit must land before a later unsubscribe ack).
     let chain: Promise<void> = Promise.resolve();
     ws.on('message', (data: RawData) => {
+      const text = data.toString();
       let msg: ClientMessage;
       try {
-        msg = JSON.parse(data.toString()) as ClientMessage;
+        msg = JSON.parse(text) as ClientMessage;
       } catch {
         send(ws, { op: 'error', message: 'invalid JSON' });
         return;
@@ -181,7 +231,7 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle>
       // Publishes are handled without waiting for earlier publishes, so a connection can have many in flight
       // (the log still assigns offsets in arrival order). Everything else waits for the chain.
       if (msg.op === 'publish') {
-        void handle(conn, msg);
+        void handle(conn, msg, rawEventText(text, msg));
         return;
       }
       chain = chain.then(() => handle(conn, msg)).catch((err) => logger.error(`[broker] ${String(err)}`));
@@ -220,6 +270,23 @@ export async function startBroker(options: BrokerOptions): Promise<BrokerHandle>
       return closing;
     },
   };
+}
+
+/**
+ * The event's JSON exactly as the client sent it, when the frame has the layout LocalBrokerBus writes
+ * (`{"op":"publish","reqId":N[,"retry":true],"event":<event>}` with `event` as the last key), so it can
+ * be stored without a JSON.stringify round trip. Undefined for any other layout (then we re-serialize).
+ */
+export function rawEventText(frame: string, parsed: object): string | undefined {
+  const m = PUBLISH_PREFIX.exec(frame);
+  if (!m) return undefined;
+  const keys = Object.keys(parsed);
+  if (keys[keys.length - 1] !== 'event') return undefined;
+  const end = frame.trimEnd();
+  if (!end.endsWith('}')) return undefined;
+  const raw = end.slice(m[0].length, -1).trim();
+  // A log line must be exactly one line: anything with a raw line break is re-serialized instead.
+  return /[\r\n]/.test(raw) ? undefined : raw;
 }
 
 function clampCredit(n: unknown): number {

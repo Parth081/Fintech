@@ -2,38 +2,60 @@
 import { promises as fsp } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
+import { performance } from 'node:perf_hooks';
 
 export interface LogStoreOptions {
   dir: string;
   logger?: Pick<Console, 'warn' | 'error'>;
 }
 
+export interface AppendResult {
+  offset: number;
+  /** True when an event with this eventId was already in the log (or being appended): nothing new was written. */
+  duplicate: boolean;
+}
+
 interface PendingAppend {
-  line: string; // serialized event, no trailing newline
+  eventId: string;
+  line: Buffer; // serialized event (UTF-8), no trailing newline
   resolve: (offset: number) => void;
   reject: (err: Error) => void;
 }
 
+const NEWLINE = Buffer.from('\n');
+
 /**
  * Append-only event log. Line N of `payments.log` is the event at offset N.
- * Appends are group-committed: everything queued while a write is in flight goes out in the next
- * write + datasync, and only then are offsets acknowledged. Offsets are strictly sequential.
+ *
+ * - Appends are group-committed: everything queued while a write is in flight goes out in the next
+ *   write + datasync, and only then are offsets acknowledged. Offsets are strictly sequential.
+ * - Appends are idempotent by eventId: an eventId that is already durable returns its offset, and one
+ *   that is queued or being written (a concurrent duplicate) shares the first append's result.
+ * - Lines are kept in memory as Buffers (slices of the file read at start + of each appended batch),
+ *   so delivering them never re-serializes or re-encodes an event.
  */
 export class LogStore {
-  /** Serialized events (JSON strings), index = offset. Only durable entries are here. */
-  readonly lines: string[] = [];
+  /** Serialized events (UTF-8 JSON), index = offset. Only durable entries are here. */
+  readonly lines: Buffer[] = [];
   private readonly eventIdToOffset = new Map<string, number>();
+  private readonly pendingIds = new Map<string, Promise<number>>();
   private readonly logPath: string;
   private readonly offsetsPath: string;
   private fh: FileHandle | null = null;
   private queue: PendingAppend[] = [];
   private writing: Promise<void> | null = null;
   private closed = false;
+  /** Set when the file and the in-memory log may disagree; every later append is refused (restart the broker). */
+  private broken: Error | null = null;
+  private fileSize = 0;
   private readonly logger: Pick<Console, 'warn' | 'error'>;
 
   readonly committed = new Map<string, number>();
   private offsetsDirty = false;
   private offsetsWriting: Promise<void> | null = null;
+
+  /** Statistics for /stats and the benchmark. */
+  readonly stats = { loadMs: 0, bytes: 0, appendBatches: 0, duplicatesSuppressed: 0 };
 
   /** Called (synchronously) after new entries became durable. */
   onAppended: (firstOffset: number, count: number) => void = () => {};
@@ -49,10 +71,12 @@ export class LogStore {
   }
 
   async open(): Promise<void> {
+    const t0 = performance.now();
     await fsp.mkdir(this.opts.dir, { recursive: true });
     await this.loadLog();
     await this.loadOffsets();
     this.fh = await fsp.open(this.logPath, 'a');
+    this.stats.loadMs = Math.round(performance.now() - t0);
   }
 
   private async loadLog(): Promise<void> {
@@ -69,14 +93,18 @@ export class LogStore {
     let needsNewline = false;
     while (pos < buf.length) {
       const nl = buf.indexOf(0x0a, pos);
-      const end = nl === -1 ? buf.length : nl;
-      const text = buf.subarray(pos, end).toString('utf8').trim();
+      let end = nl === -1 ? buf.length : nl;
       lineNo += 1;
       const isLast = nl === -1 || nl === buf.length - 1;
-      if (text.length > 0) {
+      // Trim surrounding whitespace (\r from an editor, stray spaces) without copying.
+      let start = pos;
+      while (start < end && isSpace(buf[start]!)) start += 1;
+      while (end > start && isSpace(buf[end - 1]!)) end -= 1;
+      if (end > start) {
+        const slice = buf.subarray(start, end);
         let parsed: unknown;
         try {
-          parsed = JSON.parse(text);
+          parsed = JSON.parse(slice.toString('utf8'));
         } catch {
           if (isLast) {
             this.logger.warn(`[broker] dropping truncated/corrupt final log line ${lineNo} (${end - pos} bytes)`);
@@ -84,12 +112,14 @@ export class LogStore {
           }
           throw new Error(`[broker] corrupt log line ${lineNo} in ${this.logPath} (not the final line); refusing to start`);
         }
-        this.addLine(JSON.stringify(parsed), parsed);
+        const id = (parsed as { eventId?: unknown } | null)?.eventId;
+        // The stored line is kept byte for byte (it is valid JSON); no re-serialization.
+        this.addLine(slice, typeof id === 'string' ? id : undefined);
       }
       if (nl === -1) {
         // Complete JSON without its trailing newline: keep it, repair the newline below.
         validLength = buf.length;
-        needsNewline = text.length > 0;
+        needsNewline = end > start;
         break;
       }
       validLength = nl + 1;
@@ -97,12 +127,13 @@ export class LogStore {
     }
     if (validLength < buf.length) await fsp.truncate(this.logPath, validLength);
     if (needsNewline) await fsp.appendFile(this.logPath, '\n');
+    this.fileSize = validLength + (needsNewline ? 1 : 0);
   }
 
-  private addLine(line: string, parsed: unknown): void {
+  private addLine(line: Buffer, eventId: string | undefined): void {
     const offset = this.lines.push(line) - 1;
-    const id = (parsed as { eventId?: unknown } | null)?.eventId;
-    if (typeof id === 'string' && !this.eventIdToOffset.has(id)) this.eventIdToOffset.set(id, offset);
+    this.stats.bytes += line.length;
+    if (eventId !== undefined && !this.eventIdToOffset.has(eventId)) this.eventIdToOffset.set(eventId, offset);
   }
 
   private async loadOffsets(): Promise<void> {
@@ -120,18 +151,39 @@ export class LogStore {
     }
   }
 
-  /** Offset of an already-appended event with this id, if any. */
+  /** Offset of an already-appended (durable) event with this id, if any. */
   findEventId(eventId: string): number | undefined {
     return this.eventIdToOffset.get(eventId);
   }
 
-  append(event: unknown): Promise<number> {
+  /**
+   * Append one serialized event (`line` must be its JSON, `eventId` its id). Idempotent by eventId:
+   * a duplicate (durable or still in flight) resolves to the original offset with `duplicate: true`.
+   */
+  append(eventId: string, line: string | Buffer): Promise<AppendResult> {
+    const existing = this.eventIdToOffset.get(eventId);
+    if (existing !== undefined) {
+      this.stats.duplicatesSuppressed += 1;
+      return Promise.resolve({ offset: existing, duplicate: true });
+    }
+    const inFlight = this.pendingIds.get(eventId);
+    if (inFlight) {
+      this.stats.duplicatesSuppressed += 1;
+      return inFlight.then((offset) => ({ offset, duplicate: true }));
+    }
     if (this.closed) return Promise.reject(new Error('broker log closed'));
-    const line = JSON.stringify(event);
-    return new Promise<number>((resolve, reject) => {
-      this.queue.push({ line, resolve, reject });
+    if (this.broken) return Promise.reject(new Error(`broker log unavailable after a failed write: ${this.broken.message}`));
+    const buf = typeof line === 'string' ? Buffer.from(line, 'utf8') : line;
+    const promise = new Promise<number>((resolve, reject) => {
+      this.queue.push({ eventId, line: buf, resolve, reject });
       this.kick();
     });
+    this.pendingIds.set(eventId, promise);
+    const clear = () => {
+      if (this.pendingIds.get(eventId) === promise) this.pendingIds.delete(eventId);
+    };
+    promise.then(clear, clear);
+    return promise.then((offset) => ({ offset, duplicate: false }));
   }
 
   private kick(): void {
@@ -150,19 +202,34 @@ export class LogStore {
       for (const p of batch) p.reject(new Error('broker log not open'));
       return;
     }
+    // One contiguous buffer per batch; each line becomes a slice of it (no per-line copies kept).
+    const parts: Buffer[] = [];
+    for (const p of batch) parts.push(p.line, NEWLINE);
+    const data = Buffer.concat(parts);
     try {
-      const data = batch.map((p) => p.line + '\n').join('');
       await fh.write(data);
       await fh.datasync();
     } catch (err) {
-      // We cannot know how much reached disk; fail the batch loudly. The broker should be restarted.
       this.logger.error(`[broker] log append failed: ${String(err)}`);
+      // Part of the batch may have reached the file. Cut it back so file line N stays offset N;
+      // if even that fails, refuse all further appends (the broker must be restarted).
+      try {
+        await fh.truncate(this.fileSize);
+        await fh.datasync();
+      } catch (truncErr) {
+        this.broken = truncErr as Error;
+        this.logger.error(`[broker] could not roll back the failed append; refusing further appends: ${String(truncErr)}`);
+      }
       for (const p of batch) p.reject(err as Error);
       return;
     }
+    this.fileSize += data.length;
+    this.stats.appendBatches += 1;
     const first = this.lines.length;
+    let pos = 0;
     for (const p of batch) {
-      this.addLine(p.line, JSON.parse(p.line));
+      this.addLine(data.subarray(pos, pos + p.line.length), p.eventId);
+      pos += p.line.length + 1;
     }
     batch.forEach((p, i) => p.resolve(first + i));
     this.onAppended(first, batch.length);
@@ -230,3 +297,8 @@ export class LogStore {
     this.fh = null;
   }
 }
+
+function isSpace(b: number): boolean {
+  return b === 0x20 || b === 0x09 || b === 0x0d || b === 0x0a;
+}
+
