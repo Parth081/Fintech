@@ -1,0 +1,36 @@
+import { describe, expect, it } from 'vitest';
+import { applySpread, bpsFee, convert, formatDecimal, parseDecimal } from './fx-math';
+
+describe('fx math (exact decimals)', () => {
+  it('parses and formats decimals', () => {
+    expect(parseDecimal('83.2500')).toEqual({ units: 832500n, scale: 4 });
+    expect(formatDecimal({ units: 8295862500n, scale: 8 })).toBe('82.958625');
+    expect(formatDecimal({ units: 72146600000n, scale: 9 })).toBe('72.1466');
+    expect(formatDecimal({ units: 5n, scale: 0 })).toBe('5.0000');
+    expect(() => parseDecimal('-1')).toThrow();
+  });
+
+  it('applies a 35 bps spread against the customer', () => {
+    expect(formatDecimal(applySpread('83.2500', 35))).toBe('82.958625');
+    expect(formatDecimal(applySpread('5.9100', 35))).toBe('5.889315');
+    expect(formatDecimal(applySpread('72.4000', 35))).toBe('72.1466');
+  });
+
+  it('converts with floor rounding in minor units', () => {
+    // 1,250.00 USD * 82.958625 = 103,698.28125 INR -> 10,369,828 paise
+    expect(convert({ amountMinor: 125_000, currency: 'USD' }, applySpread('83.2500', 35), 'INR')).toEqual({ amountMinor: 10_369_828, currency: 'INR' });
+    // 500.00 EUR * 5.889315 = 2,944.6575 BRL -> 294,465 centavos
+    expect(convert({ amountMinor: 50_000, currency: 'EUR' }, applySpread('5.9100', 35), 'BRL')).toEqual({ amountMinor: 294_465, currency: 'BRL' });
+    // 1,000.00 GBP * 72.1466 = 72,146.60 PHP
+    expect(convert({ amountMinor: 100_000, currency: 'GBP' }, applySpread('72.4000', 35), 'PHP')).toEqual({ amountMinor: 7_214_660, currency: 'PHP' });
+    // zero-decimal target currency
+    expect(convert({ amountMinor: 100, currency: 'USD' }, parseDecimal('150.5'), 'JPY')).toEqual({ amountMinor: 150, currency: 'JPY' });
+    // max amount stays exact
+    expect(convert({ amountMinor: 100_000_000, currency: 'USD' }, applySpread('83.2500', 35), 'INR').amountMinor).toBe(8_295_862_500);
+  });
+
+  it('computes basis-point fees with a minimum', () => {
+    expect(bpsFee({ amountMinor: 125_000, currency: 'USD' }, 15, 100)).toEqual({ amountMinor: 188, currency: 'USD' }); // 187.5 -> 188
+    expect(bpsFee({ amountMinor: 50_000, currency: 'EUR' }, 15, 100)).toEqual({ amountMinor: 100, currency: 'EUR' }); // 75 -> min 100
+  });
+});

@@ -1,0 +1,14 @@
+**/node_modules
+**/dist
+.data
+**/.data
+coverage
+*.log
+.git
+.github
+.vscode
+.idea
+**/*.drawio
+deploy/docker-compose*.yml
+Dockerfile*
+**/.DS_Store

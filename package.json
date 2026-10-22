@@ -1,0 +1,42 @@
+{
+  "name": "fintech-control-tower",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Global Fintech Control Tower - M1 walking skeleton (simulation, synthetic data only)",
+  "workspaces": [
+    "packages/*",
+    "services/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "tsx tools/launcher/index.ts",
+    "start:reset": "tsx tools/launcher/index.ts --reset",
+    "traffic": "tsx tools/traffic/index.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run --exclude \"tests/e2e/**\"",
+    "test:e2e": "vitest run tests/e2e",
+    "build:web": "npm run build -w @ct/web",
+    "ci": "npm run typecheck && npm test && npm run build:web && npm run test:e2e"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/ws": "^8.18.2",
+    "@vitejs/plugin-react": "^6.1.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5",
+    "vitest": "^5.0.5"
+  },
+  "dependencies": {
+    "kafkajs": "^2.2.4",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "ws": "^8.22.0"
+  }
+}

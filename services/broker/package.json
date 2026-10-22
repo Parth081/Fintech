@@ -1,0 +1,8 @@
+{
+  "name": "@ct/broker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/broker.ts",
+  "types": "src/broker.ts"
+}
