@@ -13,7 +13,7 @@ export const PIPELINE: readonly PaymentStatus[] = [
   'reconciled',
 ];
 
-export const TERMINAL_STATUSES: readonly PaymentStatus[] = ['reconciled', 'held', 'rejected'];
+export const TERMINAL_STATUSES: readonly PaymentStatus[] = ['reconciled', 'held', 'rejected', 'failed'];
 
 const PRE_APPROVAL: PaymentStatus[] = ['initiated', 'screened', 'scored'];
 
@@ -23,8 +23,10 @@ export const TRANSITIONS: Record<EventType, { from: (PaymentStatus | null)[]; to
   'payment.screened': { from: ['initiated'], to: 'screened' },
   'payment.scored': { from: ['screened'], to: 'scored' },
   'payment.quoted': { from: ['scored'], to: 'quoted' },
-  'payment.routed': { from: ['quoted'], to: 'routed' },
+  'payment.routed': { from: ['quoted', 'retrying'], to: 'routed' },
   'payment.sent': { from: ['routed'], to: 'sent' },
+  'payment.send_failed': { from: ['sent'], to: 'retrying' },
+  'payment.failed': { from: ['retrying'], to: 'failed' },
   'payment.settled': { from: ['sent'], to: 'settled' },
   'ledger.posted': { from: ['settled'], to: null },
   'payment.reconciled': { from: ['settled'], to: 'reconciled' },

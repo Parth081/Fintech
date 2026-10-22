@@ -59,6 +59,11 @@ export interface KafkaBusOptions {
 }
 
 export class KafkaBus implements EventBus {
+  /** M2 PLACEHOLDER: implemented by the scale/reliability agent. Callers fall back when this throws. */
+  async head(): Promise<number> {
+    throw new Error('head() not implemented yet');
+  }
+
   private readonly producer: ProducerLike;
   private started: Promise<void> | null = null;
   private closed = false;

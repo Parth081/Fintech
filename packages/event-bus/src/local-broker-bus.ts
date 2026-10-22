@@ -40,6 +40,11 @@ interface PendingUnsub {
 }
 
 export class LocalBrokerBus implements EventBus {
+  /** M2 PLACEHOLDER: implemented by the scale/reliability agent. Callers fall back when this throws. */
+  async head(): Promise<number> {
+    throw new Error('head() not implemented yet');
+  }
+
   private ws: WebSocket | null = null;
   private connected = false;
   private closed = false;

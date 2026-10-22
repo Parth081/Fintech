@@ -12,9 +12,18 @@ export class InMemoryBus implements EventBus {
     return this.log;
   }
 
+  private readonly offsetsById = new Map<string, number>();
+
+  async head(): Promise<number> {
+    return this.log.length;
+  }
+
   async publish(event: AnyEvent): Promise<DeliveryMeta> {
     if (this.closed) throw new Error('bus closed');
+    const existing = this.offsetsById.get(event.eventId);
+    if (existing !== undefined) return { offset: existing };
     const offset = this.log.push(structuredClone(event)) - 1;
+    this.offsetsById.set(event.eventId, offset);
     for (const c of this.consumers) c.wake();
     return { offset };
   }

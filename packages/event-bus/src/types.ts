@@ -31,9 +31,16 @@ export interface Subscription {
  * - At-least-once: the group's offset is committed after the handler resolves. If the handler
  *   throws, the event is retried (implementations may back off) — handlers must be idempotent.
  * - A single topic (PAYMENTS_TOPIC) carries the whole payment lifecycle.
+ * - Publishing an event whose eventId is already in the log is a no-op that returns the existing
+ *   offset (idempotent append), so retried publishes never create duplicates. (M2)
  */
 export interface EventBus {
   publish(event: AnyEvent): Promise<DeliveryMeta>;
+  /**
+   * The offset the next published event will get (= number of events in the log). A consumer that has
+   * processed every offset below head() has seen everything published before the call. (M2)
+   */
+  head(): Promise<number>;
   subscribe(options: SubscribeOptions, handler: EventHandler): Promise<Subscription>;
   close(): Promise<void>;
 }

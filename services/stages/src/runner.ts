@@ -16,7 +16,7 @@ import {
 } from '@ct/contracts';
 import type { DeliveryMeta, EventBus, Subscription } from '@ct/event-bus';
 import { Projection, StoppedError } from './projection';
-import { RULE_VERSION, STAGE_NAMES, STAGE_STEPS, type Outcome, type PipelineStage, type Step } from './stubs';
+import { RULE_VERSION, STAGE_NAMES, STAGE_STEPS, type Outcome, type PipelineStage, type StageServices, type Step } from './steps';
 
 export interface StageOptions {
   bus: EventBus;
@@ -24,8 +24,10 @@ export interface StageOptions {
   stageDelayMs?: number;
   /** Delay between payment.sent and payment.settled. */
   settlementDelayMs?: number;
-  /** Quiet period used to decide the projection has replayed the log before consuming triggers. */
+  /** Fallback only: quiet period used when the bus cannot report head(). */
   catchUpQuietMs?: number;
+  /** Services injected into steps (ledger store, simulation settings...). */
+  services?: StageServices;
   log?: (line: string) => void;
 }
 
@@ -65,7 +67,7 @@ export function buildEvent(stage: PipelineStage, trigger: AnyEvent, outcome: Out
       decision: outcome.decision,
       reasonCodes: outcome.reasonCodes,
       inputs: outcome.inputs,
-      ruleVersion: RULE_VERSION,
+      ruleVersion: outcome.ruleVersion ?? RULE_VERSION,
       latencyMs,
     },
   } as AnyEvent;
@@ -83,11 +85,12 @@ export async function startStage(name: PipelineStage, options: StageOptions): Pr
   const published = new Set<string>();
 
   /** The event this step would produce now, if (and only if) it is a valid, not-yet-done transition. */
-  const plan = (step: Step, trigger: AnyEvent, state: PaymentState | undefined) => {
+  const services = options.services ?? {};
+  const plan = async (step: Step, trigger: AnyEvent, state: PaymentState | undefined) => {
     if (!state || !state.history.some((h) => h.eventId === trigger.eventId)) return null; // trigger itself was invalid
     const now = new Date().toISOString();
     const t0 = performance.now();
-    const outcome = step.produce(trigger, state, { now });
+    const outcome = await step.produce(trigger, state, { now, services });
     if (!outcome) return null;
     const latencyMs = Math.round((performance.now() - t0) * 1000) / 1000;
     const event = buildEvent(name, trigger, outcome, now, latencyMs);
@@ -102,13 +105,13 @@ export async function startStage(name: PipelineStage, options: StageOptions): Pr
     if (relevant.length === 0) return;
     await projection.waitFor(meta.offset);
     for (const step of relevant) {
-      if (!plan(step, trigger, projection.states.get(trigger.paymentId))) continue;
+      if (!(await plan(step, trigger, projection.states.get(trigger.paymentId)))) continue; // idempotent by contract
       const delay = step.delay === 'settlement' ? settlementDelayMs : stageDelayMs;
       const triggeredAt = Date.parse(trigger.occurredAt);
       const wait = Number.isFinite(triggeredAt) ? Math.min(delay, triggeredAt + delay - Date.now()) : delay;
       await abortableSleep(wait, abort.signal);
       if (abort.signal.aborted) throw new StoppedError();
-      const event = plan(step, trigger, projection.states.get(trigger.paymentId)); // re-check after the delay
+      const event = await plan(step, trigger, projection.states.get(trigger.paymentId)); // re-check after the delay
       if (!event) continue;
       await options.bus.publish(event);
       published.add(event.eventId);
@@ -123,7 +126,16 @@ export async function startStage(name: PipelineStage, options: StageOptions): Pr
       { group: `${name}-projection-${process.pid}-${Math.random().toString(36).slice(2, 10)}`, from: 'earliest', ephemeral: true },
       (event, meta) => projection.apply(event, meta.offset),
     );
-    await projection.settle(options.catchUpQuietMs ?? 100);
+    // Catch up to the end of the log before acting on any trigger, so a restarted stage never re-acts
+    // on a trigger whose output is already in the log.
+    let head: number | undefined;
+    try {
+      head = await bus.head();
+    } catch {
+      head = undefined; // bus without head(): fall back to a quiet-period heuristic
+    }
+    if (head === undefined) await projection.settle(options.catchUpQuietMs ?? 100);
+    else if (head > 0) await projection.waitFor(head - 1);
     triggerSub = await bus.subscribe({ group: name, from: 'earliest' }, async (event, meta) => {
       try {
         await handle(event, meta);

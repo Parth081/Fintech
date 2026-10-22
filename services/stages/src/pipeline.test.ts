@@ -4,7 +4,7 @@ import type { EventBus } from '@ct/event-bus';
 import { InMemoryBus } from '@ct/event-bus';
 import { startPaymentApi, type PaymentApiHandle } from '@ct/payment-api';
 import { startAllStages, startStage, type StageHandle } from './runner';
-import { STAGE_NAMES, type PipelineStage } from './stubs';
+import { STAGE_NAMES, type PipelineStage } from './steps';
 
 const HAPPY = [
   'payment.initiated',
@@ -182,11 +182,12 @@ describe('pipeline (API -> reconciled)', () => {
     await bus.drain();
     const distinctBefore = new Set(bus.events.map((e) => e.eventId));
 
-    // 1) the same trigger events appear again in the log (at-least-once producer retry)
+    // 1) producers retry the same events (at-least-once); the bus must not append copies
     for (const e of eventsOf(id)) await bus.publish(structuredClone(e));
     // 2) every stage re-reads the whole log as if its committed offset had been lost
     const amnesiac: EventBus = {
       publish: (e) => bus.publish(e),
+      head: () => bus.head(),
       subscribe: (o, h) => bus.subscribe(o.ephemeral ? o : { ...o, group: `${o.group}-lost-offsets` }, h),
       close: async () => {},
     };
@@ -195,7 +196,7 @@ describe('pipeline (API -> reconciled)', () => {
     await bus.drain();
 
     expect(new Set(bus.events.map((e) => e.eventId))).toEqual(distinctBefore);
-    expect(bus.events.length).toBe(distinctBefore.size * 2); // only the copies we injected
+    expect(bus.events.length).toBe(distinctBefore.size); // idempotent append: re-published copies are no-ops
     expect(stateOf(id)?.status).toBe('reconciled');
   });
 

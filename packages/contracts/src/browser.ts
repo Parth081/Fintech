@@ -4,3 +4,4 @@ export * from './state-machine';
 export * from './money';
 export * from './corridors';
 export { PORTS } from './config';
+export * from './ledger-api';

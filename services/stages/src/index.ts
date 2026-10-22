@@ -6,10 +6,10 @@ import { fileURLToPath } from 'node:url';
 import { exitWithSupervisor, serviceConfig } from '@ct/contracts';
 import { createBus } from '@ct/event-bus';
 import { startAllStages, startStage, type StageHandle } from './runner';
-import { isStageName, STAGE_NAMES } from './stubs';
+import { isStageName, STAGE_NAMES } from './steps';
 
 export { startStage, startAllStages, buildEvent, type StageOptions, type StageHandle } from './runner';
-export { STAGE_NAMES, STAGE_STEPS, isStageName, type PipelineStage } from './stubs';
+export * from './steps';
 export * from './fx-math';
 
 async function main(argv: string[]): Promise<void> {
