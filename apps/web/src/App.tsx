@@ -41,6 +41,7 @@ export function App() {
     if (!live.focus || live.focus.seq === lastFocus.current) return;
     lastFocus.current = live.focus.seq;
     if (view === 'presenter') return; // the console opens its own drawer
+    if (view === 'stage') return; // the stage highlights the payment on the map instead of covering it
     setSelected(live.focus.paymentId);
   }, [live.focus, view]);
 
@@ -79,7 +80,7 @@ export function App() {
           <MainStage />
         </Suspense>
         {drawer}
-        {resetOverlay}
+        {/* the stage shows its own calmer reset state, so no full-screen overlay here */}
       </>
     );
   }

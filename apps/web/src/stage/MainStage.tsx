@@ -113,7 +113,7 @@ export function MainStage({ embedded = false }: MainStageProps = {}) {
     for (const id of PROVIDER_IDS) out[id] = hubStyle(id, breakers.get(id), outages[id], gatewayNow);
     return out;
   }, [breakers, outages, gatewayNow]);
-  const alert = useMemo(() => stageAlert(hubStyles, SHORT_PROVIDERS), [hubStyles]);
+  const alert = useMemo(() => stageAlert(hubStyles, SHORT_PROVIDERS, tick.map), [hubStyles, tick.map]);
 
   // ---- presenter focus: ring on the payment's dot + a small callout, for a while -------------
   const [focusId, setFocusId] = useState<string | null>(null);
@@ -126,6 +126,10 @@ export function MainStage({ embedded = false }: MainStageProps = {}) {
   }, [focus]);
 
   const ledger = usePoll(fetchTrialBalance, 2000);
+  const refreshLedger = ledger.refresh;
+  useEffect(() => {
+    if (reset.phase === 'back') refreshLedger();
+  }, [reset.phase, refreshLedger]);
   const badge = ledgerBadge(ledger.data);
 
   return (

@@ -87,11 +87,18 @@ function joinNames(names: readonly string[]): string {
  * The one message the map shouts (null when all is well). `providers` is the display order with
  * short names; the most serious state wins (open > failing > half-open > recovered).
  */
-export function stageAlert(styles: Readonly<Record<string, HubStyle>>, providers: readonly { id: string; name: string }[]): StageAlert | null {
+export function stageAlert(
+  styles: Readonly<Record<string, HubStyle>>,
+  providers: readonly { id: string; name: string }[],
+  /** Recent traffic share per provider: when known, only providers actually taking traffic are named. */
+  shares?: Readonly<Record<string, number>>,
+): StageAlert | null {
   for (const tone of PRIORITY) {
     const hit = providers.find((p) => styles[p.id]?.tone === tone);
     if (!hit) continue;
-    const others = providers.filter((p) => p.id !== hit.id && styles[p.id]?.tone !== 'open' && styles[p.id]?.tone !== 'failing').map((p) => p.name);
+    const healthy = providers.filter((p) => p.id !== hit.id && styles[p.id]?.tone !== 'open' && styles[p.id]?.tone !== 'failing');
+    const busy = shares ? healthy.filter((p) => (shares[p.id] ?? 0) > 0) : [];
+    const others = (busy.length ? busy : healthy).map((p) => p.name);
     const name = hit.name.toUpperCase();
     switch (tone) {
       case 'open':

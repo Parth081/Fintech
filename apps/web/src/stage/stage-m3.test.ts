@@ -47,6 +47,12 @@ describe('stageAlert (the big map message)', () => {
     expect(a).toMatchObject({ tone: 'open', providerId: 'orion', headline: 'ORION · CIRCUIT OPEN', sub: 'Traffic re-routed to Lyra and Vega' });
   });
 
+  it('names only the providers that actually took the traffic, when shares are known', () => {
+    const st = styles({ orion: hubStyle('orion', breaker('orion', 'open')) });
+    expect(stageAlert(st, SHORT, { orion: 0, lyra: 0, vega: 1 })?.sub).toBe('Traffic re-routed to Vega');
+    expect(stageAlert(st, SHORT, { orion: 1 })?.sub).toBe('Traffic re-routed to Lyra and Vega');
+  });
+
   it('the most serious state wins', () => {
     const a = stageAlert(styles({ lyra: hubStyle('lyra', breaker('lyra', 'half-open')), vega: hubStyle('vega', breaker('vega', 'open')) }), SHORT);
     expect(a?.providerId).toBe('vega');

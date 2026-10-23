@@ -118,7 +118,8 @@
 
 /* The one thing the map shouts: breaker open / failing / probing / recovered. */
 .ms-alert {
-  position: absolute; top: 0.6em; left: 50%; transform: translateX(-50%); z-index: 2;
+  /* Bottom of the map (South Atlantic / Southern Ocean): never covers a hub, city or Europe. */
+  position: absolute; bottom: 2.4em; left: 50%; transform: translateX(-50%); z-index: 2;
   display: flex; flex-direction: column; align-items: center; gap: 0.1em; text-align: center;
   padding: 0.45em 1.6em 0.55em; border-radius: 0.6em; border: 0.18em solid currentColor;
   background: color-mix(in srgb, currentColor 16%, var(--bg)); box-shadow: 0 0.4em 1.6em rgba(0, 0, 0, 0.35);
@@ -131,7 +132,7 @@
 .ms-alert-failing { color: var(--bad); }
 .ms-alert-half-open { color: var(--warn); }
 .ms-alert-recovered { color: var(--ok); }
-@keyframes ms-drop { from { opacity: 0; transform: translate(-50%, -0.6em); } to { opacity: 1; transform: translate(-50%, 0); } }
+@keyframes ms-drop { from { opacity: 0; transform: translate(-50%, 0.6em); } to { opacity: 1; transform: translate(-50%, 0); } }
 
 .ms-focus {
   position: absolute; right: 0.6em; bottom: 0.4em; z-index: 2; font-size: 1em; font-weight: 600;
