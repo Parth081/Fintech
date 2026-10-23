@@ -3,7 +3,7 @@ import { deterministicId, type AnyEvent, type ControlState, type EventType, type
 
 export const RULE_VERSION = 'stub-v1';
 
-export type PipelineStage = Exclude<StageName, 'payment-api'>;
+export type PipelineStage = Exclude<StageName, 'payment-api' | 'ops'>;
 
 export const STAGE_NAMES: readonly PipelineStage[] = [
   'screening',

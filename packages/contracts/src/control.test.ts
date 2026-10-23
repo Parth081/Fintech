@@ -42,4 +42,18 @@ describe('control timeline', () => {
     expect(states.get('p-1')?.status).toBe('reconciled');
     expect(states.has('__control__')).toBe(false);
   });
+
+  it('applies approved config updates in version order and ignores stale ones (M4)', () => {
+    const actor = { userId: 'u-1', name: 'A', role: 'admin' };
+    const t = new ControlTimeline();
+    expect(t.current().config['risk.thresholds']).toEqual({ hold: 0.7, reject: 0.92 });
+    t.apply(ctl(1, { type: 'control.config.updated', payload: { key: 'risk.thresholds', value: { hold: 0.6, reject: 0.9 }, version: 2, changeRequestId: 'CR-2', actor } }), 1);
+    t.apply(ctl(2, { type: 'control.config.updated', payload: { key: 'risk.thresholds', value: { hold: 0.5, reject: 0.8 }, version: 1, changeRequestId: 'CR-1', actor } }), 2);
+    expect(t.current().config['risk.thresholds']).toEqual({ hold: 0.6, reject: 0.9 });
+    expect(t.at(1).config['risk.thresholds']).toEqual({ hold: 0.7, reject: 0.92 }); // not yet visible before offset 1
+    t.apply(ctl(3, { type: 'control.fx_shock.started', payload: { shockId: 's1', corridorId: 'US-IN', driftBps: 300, noiseMultiplier: 4, rampMs: 5000, reason: 'spike' } }), 3);
+    expect(Object.keys(t.current().fxShocks)).toEqual(['s1']);
+    t.apply(ctl(4, { type: 'control.fx_shock.ended', payload: { shockId: 's1' } }), 4);
+    expect(t.current().fxShocks).toEqual({});
+  });
 });

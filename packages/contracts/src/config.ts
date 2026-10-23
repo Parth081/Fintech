@@ -9,6 +9,7 @@ export const PORTS = {
   gateway: 7072, // GATEWAY_PORT
   ledger: 7073, // LEDGER_PORT
   orchestrator: 7074, // ORCHESTRATOR_PORT (scenarios, ambient traffic, presenter API)
+  ops: 7075, // OPS_PORT (operations console back office)
   launcherControl: 7079, // LAUNCHER_CONTROL_PORT (reset; only when started by the launcher)
   webDev: 5173, // vite dev server (proxies /api and /ws to the gateway)
 } as const;
@@ -32,6 +33,7 @@ export function serviceConfig() {
   const gatewayPort = envInt('GATEWAY_PORT', PORTS.gateway);
   const ledgerPort = envInt('LEDGER_PORT', PORTS.ledger);
   const orchestratorPort = envInt('ORCHESTRATOR_PORT', PORTS.orchestrator);
+  const opsPort = envInt('OPS_PORT', PORTS.ops);
   const launcherControlPort = envInt('LAUNCHER_CONTROL_PORT', PORTS.launcherControl);
   return {
     host,
@@ -40,6 +42,7 @@ export function serviceConfig() {
     gatewayPort,
     ledgerPort,
     orchestratorPort,
+    opsPort,
     launcherControlPort,
     /** 'local' (built-in broker, default), 'memory' (tests only, single process), 'kafka' (Redpanda/Kafka) */
     bus: env('BUS', 'local') as 'local' | 'memory' | 'kafka',
@@ -49,6 +52,7 @@ export function serviceConfig() {
     gatewayUrl: env('GATEWAY_URL', `http://${host}:${gatewayPort}`),
     ledgerUrl: env('LEDGER_URL', `http://${host}:${ledgerPort}`),
     orchestratorUrl: env('ORCHESTRATOR_URL', `http://${host}:${orchestratorPort}`),
+    opsUrl: env('OPS_URL', `http://${host}:${opsPort}`),
     /** Empty when not started by the launcher (e.g. Docker): reset is then unavailable. */
     launcherControlUrl: env('LAUNCHER_CONTROL_URL', ''),
     /** Ambient payments per second the orchestrator generates when idle (0 = none). */

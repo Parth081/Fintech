@@ -17,7 +17,9 @@ export type PaymentStatus =
   | 'retrying' // a provider failed the instruction; routing picks another provider
   | 'held'
   | 'rejected'
-  | 'failed'; // every eligible provider failed; terminal, nothing was posted to the ledger
+  | 'failed' // every eligible provider failed; terminal, nothing was posted to the ledger
+  | 'refund_requested' // M4: an operator asked to refund a reconciled payment; the ledger posts the reversal
+  | 'refunded'; // M4: reversal journal posted
 
 export type EventType =
   | 'payment.initiated'
@@ -32,7 +34,13 @@ export type EventType =
   | 'payment.send_failed'
   | 'payment.failed'
   | 'payment.held'
-  | 'payment.rejected';
+  | 'payment.rejected'
+  // M4: risk alerts and operator actions (operator events have producer 'ops' and carry the actor)
+  | 'risk.alert_raised'
+  | 'payment.released'
+  | 'payment.retry_requested'
+  | 'payment.refund_requested'
+  | 'payment.refunded';
 
 export const EVENT_TYPES: readonly EventType[] = [
   'payment.initiated',
@@ -48,6 +56,11 @@ export const EVENT_TYPES: readonly EventType[] = [
   'payment.failed',
   'payment.held',
   'payment.rejected',
+  'risk.alert_raised',
+  'payment.released',
+  'payment.retry_requested',
+  'payment.refund_requested',
+  'payment.refunded',
 ];
 
 /** Services that produce events. Each pipeline stage is its own process. */
@@ -59,7 +72,8 @@ export type StageName =
   | 'routing'
   | 'settlement'
   | 'ledger'
-  | 'reconciliation';
+  | 'reconciliation'
+  | 'ops'; // M4: human operator actions from the operations console
 
 /** Money is always integer minor units (cents, paise...) plus an ISO 4217 code. Never floats. */
 export interface Money {
@@ -143,8 +157,35 @@ export interface PayloadMap {
     breaks?: string[]; // empty when matched (M2+)
   };
   'payment.failed': { reason: string; atStage: StageName; attempts?: number };
-  'payment.held': { reason: string; atStage: StageName };
-  'payment.rejected': { reason: string; atStage: StageName };
+  'payment.held': { reason: string; atStage: StageName; alertIds?: string[] };
+  /** System rejection (atStage = a pipeline stage) or an operator decision (atStage 'ops', actor set). */
+  'payment.rejected': { reason: string; atStage: StageName; actor?: Actor; caseId?: string };
+  /** A risk/compliance alert about a payment. Raised by screening or risk; worked as a case in the console. */
+  'risk.alert_raised': {
+    alertId: string;
+    kind: 'sanctions' | 'fraud' | 'aml';
+    severity: 'low' | 'medium' | 'high' | 'critical';
+    rule: string; // e.g. "SANCTIONS_FUZZY_MATCH", "FRAUD_MODEL_HIGH", "AML_FAN_IN"
+    score?: number; // 0..1 where meaningful
+    summary: string; // one plain-English sentence for the queue
+    reasons: { code: string; text: string; weight?: number }[]; // explainable factors
+    evidence: Record<string, unknown>; // matched list entry, related payments, features...
+  };
+  /** Operator approved a held payment; it resumes at FX quoting. */
+  'payment.released': { actor: Actor; reason: string; caseId?: string; approvedBy?: Actor };
+  /** Operator asks to retry a failed payment; routing starts a fresh attempt budget. */
+  'payment.retry_requested': { actor: Actor; reason: string };
+  /** Operator asks to refund a reconciled payment (full amount). The ledger posts the reversal. */
+  'payment.refund_requested': { actor: Actor; reason: string; approvedBy?: Actor };
+  /** The ledger posted the reversal journal. */
+  'payment.refunded': { journalId: string; entries: LedgerEntry[] };
+}
+
+/** A person acting in the operations console (demo users in M4). */
+export interface Actor {
+  userId: string;
+  name: string;
+  role: string;
 }
 
 /** One provider's score in a routing decision. Higher score wins. */

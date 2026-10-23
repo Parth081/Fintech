@@ -7,3 +7,4 @@ export { PORTS } from './config';
 export * from './ledger-api';
 export * from './control';
 export * from './orchestrator-api';
+export * from './ops-api';

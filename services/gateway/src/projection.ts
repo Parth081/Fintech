@@ -25,7 +25,7 @@ import type {
 } from './api-types';
 import { ThroughputMeter } from './throughput';
 
-export const ALL_STATUSES: readonly PaymentStatus[] = [...PIPELINE, 'retrying', 'held', 'rejected', 'failed'];
+export const ALL_STATUSES: readonly PaymentStatus[] = [...PIPELINE, 'retrying', 'held', 'rejected', 'failed', 'refund_requested', 'refunded'];
 const MAX_REJECTED = 500;
 /** Per-payment event cap. A normal payment has 9-20 events; this only bites on a runaway retry loop. */
 export const MAX_EVENTS_PER_PAYMENT = 64;

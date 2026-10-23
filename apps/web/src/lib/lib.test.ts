@@ -26,7 +26,7 @@ function stateOf(events: AnyEvent[]): PaymentState {
 
 const stats = (over: Partial<Stats> = {}): Stats => ({
   total: 1,
-  byStatus: { initiated: 1, screened: 0, scored: 0, quoted: 0, routed: 0, sent: 0, settled: 0, reconciled: 0, retrying: 0, held: 0, rejected: 0, failed: 0 },
+  byStatus: { initiated: 1, screened: 0, scored: 0, quoted: 0, routed: 0, sent: 0, settled: 0, reconciled: 0, retrying: 0, held: 0, rejected: 0, failed: 0, refund_requested: 0, refunded: 0 },
   reconciled: 0,
   inFlight: 1,
   held: 0,

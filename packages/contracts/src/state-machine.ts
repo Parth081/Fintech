@@ -13,7 +13,11 @@ export const PIPELINE: readonly PaymentStatus[] = [
   'reconciled',
 ];
 
-export const TERMINAL_STATUSES: readonly PaymentStatus[] = ['reconciled', 'held', 'rejected', 'failed'];
+/**
+ * No automatic step follows these. (M4: 'held' waits for an operator decision, 'failed' can be retried and
+ * 'reconciled' refunded by an operator — but nothing happens to them without a human.)
+ */
+export const TERMINAL_STATUSES: readonly PaymentStatus[] = ['reconciled', 'held', 'rejected', 'failed', 'refunded'];
 
 const PRE_APPROVAL: PaymentStatus[] = ['initiated', 'screened', 'scored'];
 
@@ -31,7 +35,13 @@ export const TRANSITIONS: Record<EventType, { from: (PaymentStatus | null)[]; to
   'ledger.posted': { from: ['settled'], to: null },
   'payment.reconciled': { from: ['settled'], to: 'reconciled' },
   'payment.held': { from: PRE_APPROVAL, to: 'held' },
-  'payment.rejected': { from: PRE_APPROVAL, to: 'rejected' },
+  'payment.rejected': { from: [...PRE_APPROVAL, 'held'], to: 'rejected' },
+  // M4
+  'risk.alert_raised': { from: ['initiated', 'screened', 'scored', 'held'], to: null },
+  'payment.released': { from: ['held'], to: 'scored' },
+  'payment.retry_requested': { from: ['failed'], to: 'retrying' },
+  'payment.refund_requested': { from: ['reconciled'], to: 'refund_requested' },
+  'payment.refunded': { from: ['refund_requested'], to: 'refunded' },
 };
 
 export interface PaymentHistoryItem {

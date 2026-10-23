@@ -14,6 +14,8 @@ export const STAGE_LABELS: Record<PaymentStatus, { title: string; detail?: strin
   held: { title: 'Held' },
   rejected: { title: 'Rejected' },
   failed: { title: 'Failed', detail: 'all providers' },
+  refund_requested: { title: 'Refund requested' },
+  refunded: { title: 'Refunded' },
 };
 
 export function stageLabel(status: PaymentStatus): string {
@@ -35,6 +37,11 @@ export const EVENT_LABELS: Record<EventType, string> = {
   'payment.failed': 'Payment failed',
   'payment.held': 'Payment held',
   'payment.rejected': 'Payment rejected',
+  'risk.alert_raised': 'Risk alert raised',
+  'payment.released': 'Released by operator',
+  'payment.retry_requested': 'Retry requested by operator',
+  'payment.refund_requested': 'Refund requested',
+  'payment.refunded': 'Refund posted to ledger',
 };
 
 /** Status a payment enters because of this event type, if any. */
