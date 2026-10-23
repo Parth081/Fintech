@@ -1,0 +1,144 @@
+/*
+ * Operations Console design system (M4). One look for every console page: an enterprise back office in the
+ * spirit of modern payment platforms — neutral surfaces, one indigo accent, dense readable tables, quiet chrome.
+ * All console code uses these tokens and classes (prefix ct-). Extend here; don't restyle per page.
+ * Booth views (#/stage, #/presenter) keep their own styling.
+ */
+.ct-console {
+  --ct-font: 'Segoe UI', system-ui, -apple-system, 'Helvetica Neue', Arial, sans-serif;
+  --ct-mono: 'Cascadia Mono', 'SF Mono', Consolas, 'Liberation Mono', monospace;
+
+  --ct-bg: #f6f7f9;
+  --ct-surface: #ffffff;
+  --ct-surface-2: #f1f3f6;
+  --ct-border: #e3e6eb;
+  --ct-border-strong: #cfd4dc;
+  --ct-text: #1a1f2b;
+  --ct-text-2: #4b5466;
+  --ct-text-3: #7a8396;
+  --ct-accent: #4f46e5;
+  --ct-accent-hover: #4338ca;
+  --ct-accent-soft: #eef0ff;
+  --ct-focus: 0 0 0 3px rgba(79, 70, 229, 0.28);
+
+  --ct-ok: #0f8a5f;      --ct-ok-soft: #e6f6ef;
+  --ct-warn: #b26a00;    --ct-warn-soft: #fff4e0;
+  --ct-bad: #c8312b;     --ct-bad-soft: #fdecea;
+  --ct-info: #1f6feb;    --ct-info-soft: #e8f1ff;
+  --ct-neutral-soft: #eef0f3;
+
+  --ct-radius: 8px;
+  --ct-radius-sm: 6px;
+  --ct-shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 1px 3px rgba(16, 24, 40, 0.08);
+  --ct-shadow-pop: 0 12px 32px rgba(16, 24, 40, 0.18);
+
+  --ct-sidebar-w: 248px;
+  --ct-topbar-h: 56px;
+  --ct-space-1: 4px; --ct-space-2: 8px; --ct-space-3: 12px; --ct-space-4: 16px; --ct-space-5: 24px; --ct-space-6: 32px;
+
+  font-family: var(--ct-font);
+  font-size: 14px;
+  line-height: 1.45;
+  color: var(--ct-text);
+  background: var(--ct-bg);
+  min-height: 100vh;
+}
+
+@media (prefers-color-scheme: dark) {
+  .ct-console:not([data-theme='light']) {
+    --ct-bg: #0e1116; --ct-surface: #161a22; --ct-surface-2: #1d222c; --ct-border: #262c38; --ct-border-strong: #343b4a;
+    --ct-text: #e7eaf0; --ct-text-2: #b3bac8; --ct-text-3: #8690a3;
+    --ct-accent: #7c75ff; --ct-accent-hover: #918bff; --ct-accent-soft: #23234a;
+    --ct-ok: #3ccf91; --ct-ok-soft: #10291f; --ct-warn: #f2b24b; --ct-warn-soft: #2d2410;
+    --ct-bad: #ff6b63; --ct-bad-soft: #321615; --ct-info: #5ea2ff; --ct-info-soft: #13243d; --ct-neutral-soft: #222835;
+    --ct-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  }
+}
+.ct-console[data-theme='dark'] {
+  --ct-bg: #0e1116; --ct-surface: #161a22; --ct-surface-2: #1d222c; --ct-border: #262c38; --ct-border-strong: #343b4a;
+  --ct-text: #e7eaf0; --ct-text-2: #b3bac8; --ct-text-3: #8690a3;
+  --ct-accent: #7c75ff; --ct-accent-hover: #918bff; --ct-accent-soft: #23234a;
+  --ct-ok: #3ccf91; --ct-ok-soft: #10291f; --ct-warn: #f2b24b; --ct-warn-soft: #2d2410;
+  --ct-bad: #ff6b63; --ct-bad-soft: #321615; --ct-info: #5ea2ff; --ct-info-soft: #13243d; --ct-neutral-soft: #222835;
+  --ct-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
+/* ---- page structure ---------------------------------------------------------------------------------- */
+.ct-page { padding: var(--ct-space-5) var(--ct-space-6); max-width: 1440px; }
+.ct-page-header { display: flex; align-items: flex-end; justify-content: space-between; gap: var(--ct-space-4); margin-bottom: var(--ct-space-5); }
+.ct-page-title { font-size: 22px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+.ct-page-subtitle { color: var(--ct-text-2); margin: 4px 0 0; }
+.ct-breadcrumb { color: var(--ct-text-3); font-size: 13px; margin-bottom: 6px; }
+.ct-breadcrumb a { color: inherit; text-decoration: none; }
+.ct-grid { display: grid; gap: var(--ct-space-4); }
+.ct-grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.ct-grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.ct-grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.ct-split { display: grid; grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr); gap: var(--ct-space-4); align-items: start; }
+@media (max-width: 1100px) { .ct-grid-3, .ct-grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } .ct-split { grid-template-columns: 1fr; } }
+
+/* ---- cards & metrics -------------------------------------------------------------------------------- */
+.ct-card { background: var(--ct-surface); border: 1px solid var(--ct-border); border-radius: var(--ct-radius); box-shadow: var(--ct-shadow); }
+.ct-card-header { display: flex; align-items: center; justify-content: space-between; padding: var(--ct-space-3) var(--ct-space-4); border-bottom: 1px solid var(--ct-border); }
+.ct-card-title { font-size: 14px; font-weight: 600; margin: 0; }
+.ct-card-body { padding: var(--ct-space-4); }
+.ct-metric { padding: var(--ct-space-4); }
+.ct-metric-label { color: var(--ct-text-2); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+.ct-metric-value { font-size: 26px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.ct-metric-delta { font-size: 12px; color: var(--ct-text-3); margin-top: 2px; }
+
+/* ---- tables ------------------------------------------------------------------------------------------- */
+.ct-table-wrap { overflow-x: auto; }
+.ct-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ct-table th { text-align: left; font-weight: 600; color: var(--ct-text-2); font-size: 12px; padding: 10px 12px; border-bottom: 1px solid var(--ct-border); background: var(--ct-surface-2); white-space: nowrap; position: sticky; top: 0; }
+.ct-table td { padding: 10px 12px; border-bottom: 1px solid var(--ct-border); vertical-align: middle; }
+.ct-table tr:last-child td { border-bottom: none; }
+.ct-table tbody tr.ct-row-link { cursor: pointer; }
+.ct-table tbody tr.ct-row-link:hover { background: var(--ct-surface-2); }
+.ct-num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ct-mono { font-family: var(--ct-mono); font-size: 12px; }
+.ct-muted { color: var(--ct-text-3); }
+.ct-empty { padding: var(--ct-space-6); text-align: center; color: var(--ct-text-3); }
+
+/* ---- controls ----------------------------------------------------------------------------------------- */
+.ct-btn { display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 14px; border-radius: var(--ct-radius-sm); border: 1px solid var(--ct-border-strong); background: var(--ct-surface); color: var(--ct-text); font: inherit; font-weight: 500; cursor: pointer; }
+.ct-btn:hover { background: var(--ct-surface-2); }
+.ct-btn:focus-visible, .ct-input:focus-visible, .ct-select:focus-visible { outline: none; box-shadow: var(--ct-focus); }
+.ct-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.ct-btn-primary { background: var(--ct-accent); border-color: var(--ct-accent); color: #fff; }
+.ct-btn-primary:hover { background: var(--ct-accent-hover); }
+.ct-btn-danger { background: var(--ct-bad); border-color: var(--ct-bad); color: #fff; }
+.ct-btn-ghost { border-color: transparent; background: transparent; }
+.ct-btn-sm { height: 28px; padding: 0 10px; font-size: 13px; }
+.ct-input, .ct-select, .ct-textarea { height: 34px; padding: 0 10px; border-radius: var(--ct-radius-sm); border: 1px solid var(--ct-border-strong); background: var(--ct-surface); color: var(--ct-text); font: inherit; }
+.ct-textarea { height: auto; min-height: 80px; padding: 8px 10px; resize: vertical; }
+.ct-field { display: flex; flex-direction: column; gap: 4px; }
+.ct-label { font-size: 12px; font-weight: 600; color: var(--ct-text-2); }
+.ct-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ct-space-2); padding: var(--ct-space-3) var(--ct-space-4); border-bottom: 1px solid var(--ct-border); }
+.ct-tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--ct-border); margin-bottom: var(--ct-space-4); }
+.ct-tab { padding: 8px 14px; border: none; background: none; color: var(--ct-text-2); font: inherit; font-weight: 500; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.ct-tab[aria-selected='true'] { color: var(--ct-accent); border-bottom-color: var(--ct-accent); }
+
+/* ---- badges & status ---------------------------------------------------------------------------------- */
+.ct-badge { display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 8px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--ct-neutral-soft); color: var(--ct-text-2); white-space: nowrap; }
+.ct-badge-ok { background: var(--ct-ok-soft); color: var(--ct-ok); }
+.ct-badge-warn { background: var(--ct-warn-soft); color: var(--ct-warn); }
+.ct-badge-bad { background: var(--ct-bad-soft); color: var(--ct-bad); }
+.ct-badge-info { background: var(--ct-info-soft); color: var(--ct-info); }
+.ct-badge-accent { background: var(--ct-accent-soft); color: var(--ct-accent); }
+.ct-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: currentColor; }
+
+/* ---- feedback ----------------------------------------------------------------------------------------- */
+.ct-banner { padding: 10px 14px; border-radius: var(--ct-radius-sm); border: 1px solid var(--ct-border); background: var(--ct-surface-2); }
+.ct-banner-warn { background: var(--ct-warn-soft); border-color: transparent; color: var(--ct-warn); }
+.ct-banner-bad { background: var(--ct-bad-soft); border-color: transparent; color: var(--ct-bad); }
+.ct-banner-info { background: var(--ct-info-soft); border-color: transparent; color: var(--ct-info); }
+.ct-skeleton { background: linear-gradient(90deg, var(--ct-surface-2), var(--ct-border), var(--ct-surface-2)); background-size: 200% 100%; animation: ct-shimmer 1.2s infinite; border-radius: 4px; min-height: 14px; }
+@keyframes ct-shimmer { to { background-position: -200% 0; } }
+@media (prefers-reduced-motion: reduce) { .ct-skeleton { animation: none; } }
+
+/* ---- overlays ----------------------------------------------------------------------------------------- */
+.ct-drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(720px, 92vw); background: var(--ct-surface); box-shadow: var(--ct-shadow-pop); z-index: 50; overflow-y: auto; }
+.ct-modal-backdrop { position: fixed; inset: 0; background: rgba(15, 18, 25, 0.45); z-index: 60; display: grid; place-items: center; }
+.ct-modal { background: var(--ct-surface); border-radius: var(--ct-radius); box-shadow: var(--ct-shadow-pop); width: min(520px, 92vw); }
+.ct-toast { position: fixed; bottom: 20px; right: 20px; z-index: 70; background: var(--ct-text); color: var(--ct-surface); padding: 10px 14px; border-radius: var(--ct-radius-sm); box-shadow: var(--ct-shadow-pop); }
