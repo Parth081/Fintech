@@ -3,3 +3,6 @@ dist/
 .data/
 *.log
 coverage/
+
+# git worktrees for parallel milestones
+.worktrees/
