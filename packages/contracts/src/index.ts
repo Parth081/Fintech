@@ -9,3 +9,5 @@ export * from './ledger-api';
 export * from './control';
 export * from './orchestrator-api';
 export * from './ops-api';
+export * from './assistant-api';
+export * from './booth-api';

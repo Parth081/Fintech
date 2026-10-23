@@ -10,6 +10,8 @@ export const PORTS = {
   ledger: 7073, // LEDGER_PORT
   orchestrator: 7074, // ORCHESTRATOR_PORT (scenarios, ambient traffic, presenter API)
   ops: 7075, // OPS_PORT (operations console back office)
+  assistant: 7076, // ASSISTANT_PORT (AI explainer)
+  booth: 7077, // BOOTH_PORT (lead capture + analytics)
   launcherControl: 7079, // LAUNCHER_CONTROL_PORT (reset; only when started by the launcher)
   webDev: 5173, // vite dev server (proxies /api and /ws to the gateway)
 } as const;
@@ -34,6 +36,8 @@ export function serviceConfig() {
   const ledgerPort = envInt('LEDGER_PORT', PORTS.ledger);
   const orchestratorPort = envInt('ORCHESTRATOR_PORT', PORTS.orchestrator);
   const opsPort = envInt('OPS_PORT', PORTS.ops);
+  const assistantPort = envInt('ASSISTANT_PORT', PORTS.assistant);
+  const boothPort = envInt('BOOTH_PORT', PORTS.booth);
   const launcherControlPort = envInt('LAUNCHER_CONTROL_PORT', PORTS.launcherControl);
   return {
     host,
@@ -43,6 +47,8 @@ export function serviceConfig() {
     ledgerPort,
     orchestratorPort,
     opsPort,
+    assistantPort,
+    boothPort,
     launcherControlPort,
     /** 'local' (built-in broker, default), 'memory' (tests only, single process), 'kafka' (Redpanda/Kafka) */
     bus: env('BUS', 'local') as 'local' | 'memory' | 'kafka',
@@ -53,6 +59,12 @@ export function serviceConfig() {
     ledgerUrl: env('LEDGER_URL', `http://${host}:${ledgerPort}`),
     orchestratorUrl: env('ORCHESTRATOR_URL', `http://${host}:${orchestratorPort}`),
     opsUrl: env('OPS_URL', `http://${host}:${opsPort}`),
+    assistantUrl: env('ASSISTANT_URL', `http://${host}:${assistantPort}`),
+    boothUrl: env('BOOTH_URL', `http://${host}:${boothPort}`),
+    /** 'auto' = use Claude when credentials work, else grounded; 'off' = grounded/cached only (offline booth). */
+    assistantLlm: env('ASSISTANT_LLM', 'auto') as 'auto' | 'off',
+    /** Staff PIN for booth lead export (demo default; change per event). */
+    boothStaffPin: env('BOOTH_STAFF_PIN', '2468'),
     /** Empty when not started by the launcher (e.g. Docker): reset is then unavailable. */
     launcherControlUrl: env('LAUNCHER_CONTROL_URL', ''),
     /** Ambient payments per second the orchestrator generates when idle (0 = none). */
