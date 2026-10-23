@@ -1,0 +1,495 @@
+// Orchestrator: ambient traffic, the scenario engine and the presenter HTTP API (see @ct/contracts
+// orchestrator-api.ts). Scenario steps and demo controls are published as control events on the payment
+// log; every service reacts to them at the same log position.
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import {
+  ControlTimeline,
+  deterministicId,
+  isControlEvent,
+  makeControlEvent,
+  newId,
+  type ControlEvent,
+  type ControlEventType,
+  type ControlPayloadMap,
+  type OrchestratorState,
+  type PacePreset,
+} from '@ct/contracts';
+import type { EventBus, Subscription } from '@ct/event-bus';
+import { AmbientTraffic, ambientIndexOf, MAX_AMBIENT_RATE, type PaymentSender } from './ambient';
+import { systemClock, type Clock, type TimerHandle } from './clock';
+import { SCENARIOS, scenarioInfo, validateScript, type ScenarioAction, type ScenarioScript } from './scenarios';
+
+export const PACE_PRESETS: Record<PacePreset, { stageDelayMs: number | null; settlementDelayMs: number | null }> = {
+  normal: { stageDelayMs: null, settlementDelayMs: null },
+  slow: { stageDelayMs: 1500, settlementDelayMs: 3000 },
+  fast: { stageDelayMs: 0, settlementDelayMs: 150 },
+};
+
+export interface OrchestratorOptions {
+  bus: EventBus;
+  host?: string;
+  port?: number;
+  paymentApiUrl: string;
+  /** Seed for ambient traffic and the default scenario seed. */
+  seed: string;
+  /** Ambient payments per second at startup (0 = none). */
+  ambientRate: number;
+  scenarios?: readonly ScenarioScript[];
+  clock?: Clock;
+  /** Replaces the HTTP POST to the Payment API (tests). */
+  send?: PaymentSender;
+  log?: (line: string) => void;
+  /** Max time to wait for the log replay on startup. */
+  catchUpTimeoutMs?: number;
+}
+
+export interface OrchestratorHandle {
+  port: number;
+  /** Stops the active run cleanly (restores outages) unless `restore: false`, then stops serving. */
+  close(opts?: { restore?: boolean }): Promise<void>;
+  state(): OrchestratorState;
+  /** Resolves when every queued control-event publish has completed (tests). */
+  idle(): Promise<void>;
+}
+
+interface ActiveRun {
+  runId: string;
+  script: ScenarioScript;
+  seed: string;
+  startedAtIso: string;
+  /** Scenario time accumulated before the current resume (the scenario clock stops while paused). */
+  elapsedBase: number;
+  resumedAt: number | null;
+  nextStep: number;
+  stepId: string | null;
+  timer: TimerHandle | undefined;
+  openOutages: Set<string>;
+  ambientBefore: number;
+  finishing: boolean;
+}
+
+class HttpError extends Error {
+  constructor(readonly status: number, readonly code: string, readonly details?: unknown) {
+    super(code);
+  }
+}
+
+const MAX_BODY = 16 * 1024;
+
+function send(res: ServerResponse, status: number, body: unknown): void {
+  const text = JSON.stringify(body);
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(text) });
+  res.end(text);
+}
+
+function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let failed = false;
+    req.on('data', (c: Buffer) => {
+      if (failed) return;
+      size += c.length;
+      if (size > MAX_BODY) {
+        failed = true;
+        reject(new HttpError(413, 'payload_too_large'));
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      if (failed) return;
+      const text = Buffer.concat(chunks).toString('utf8').trim();
+      if (!text) return resolve({});
+      try {
+        const v: unknown = JSON.parse(text);
+        if (typeof v !== 'object' || v === null || Array.isArray(v)) return reject(new HttpError(400, 'validation_failed', ['body must be a JSON object']));
+        resolve(v as Record<string, unknown>);
+      } catch {
+        reject(new HttpError(400, 'invalid_json'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+export async function startOrchestrator(options: OrchestratorOptions): Promise<OrchestratorHandle> {
+  const { bus, seed } = options;
+  const clock = options.clock ?? systemClock;
+  const log = options.log ?? (() => {});
+  const scripts = options.scenarios ?? SCENARIOS;
+  for (const s of scripts) validateScript(s);
+  const scriptById = new Map(scripts.map((s) => [s.id, s]));
+  const infos = scripts.map(scenarioInfo);
+  const iso = () => new Date(clock.now()).toISOString();
+
+  // ---- log projection: control timeline + ambient progress (ephemeral, from earliest) ----
+  const timeline = new ControlTimeline();
+  let appliedOffset = -1;
+  let maxAmbientIndex = -1;
+  let ambientInLog = 0;
+  const ambientKeysSeen = new Set<number>();
+  let runsInLog = 0;
+  let run: ActiveRun | null = null;
+  /** Set once ambient traffic exists; called when another producer ends our active run. */
+  let onRunEndedElsewhere: (r: ActiveRun) => void = () => {};
+  const sub: Subscription = await bus.subscribe(
+    { group: `orchestrator-projection-${process.pid}-${Math.random().toString(36).slice(2, 10)}`, from: 'earliest', ephemeral: true },
+    (event, meta) => {
+      if (isControlEvent(event)) {
+        timeline.apply(event, meta.offset);
+        if (event.type === 'control.scenario.started') runsInLog += 1;
+        if (event.type === 'control.scenario.ended' && run && run.runId === event.payload.runId && !run.finishing) onRunEndedElsewhere(run);
+      } else if (event.type === 'payment.initiated') {
+        const idx = ambientIndexOf(seed, event.payload.idempotencyKey);
+        if (idx !== undefined && !ambientKeysSeen.has(idx)) {
+          ambientKeysSeen.add(idx);
+          ambientInLog += 1;
+          if (idx > maxAmbientIndex) maxAmbientIndex = idx;
+        }
+      }
+      appliedOffset = meta.offset;
+    },
+  );
+  const head = await bus.head();
+  const deadline = Date.now() + (options.catchUpTimeoutMs ?? 30_000);
+  while (appliedOffset < head - 1) {
+    if (Date.now() > deadline) {
+      await sub.unsubscribe();
+      throw new Error(`orchestrator: log replay did not reach offset ${head - 1} in time`);
+    }
+    await realSleep(5);
+  }
+  ambientKeysSeen.clear(); // only needed during replay
+
+  // ---- serialized, retried publishing (eventIds are deterministic, so a retry never duplicates) ----
+  let closed = false;
+  let queue: Promise<void> = Promise.resolve();
+  const publishNow = async <T extends ControlEventType>(type: T, payload: ControlPayloadMap[T], eventId: string) => {
+    const event = makeControlEvent(type, payload, { eventId, occurredAt: iso(), producer: 'orchestrator' });
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const meta = await bus.publish(event as ControlEvent);
+        log(`[orchestrator] published ${type} @${meta.offset}`);
+        return;
+      } catch (err) {
+        if (attempt >= 20) throw err;
+        log(`[orchestrator] publish ${type} failed (${(err as Error).message}); retrying`);
+        await realSleep(Math.min(2000, 100 * 2 ** attempt));
+      }
+    }
+  };
+  const enqueue = <T>(fn: () => Promise<T>): Promise<T> => {
+    const p = queue.then(fn);
+    queue = p.then(
+      () => undefined,
+      (err: unknown) => log(`[orchestrator] control publish failed: ${(err as Error).message}`),
+    );
+    return p;
+  };
+
+  // ---- restart recovery: never leave the system stuck in an outage or a half-finished scenario ----
+  {
+    const s = timeline.current();
+    for (const outage of Object.values(s.outages)) {
+      const id = outage.runId ? deterministicId('orchestrator', outage.runId, 'restore', outage.providerId) : deterministicId('orchestrator', 'recover', outage.providerId, outage.since);
+      log(`[orchestrator] recovery: ending dangling ${outage.mode} outage of ${outage.providerId}`);
+      await publishNow('control.provider_outage.ended', { providerId: outage.providerId, ...(outage.runId ? { runId: outage.runId } : {}) }, id);
+    }
+    if (s.scenario) {
+      log(`[orchestrator] recovery: closing interrupted scenario run ${s.scenario.runId}`);
+      await publishNow(
+        'control.scenario.ended',
+        { runId: s.scenario.runId, scenarioId: s.scenario.scenarioId, outcome: 'stopped' },
+        deterministicId('orchestrator', s.scenario.runId, 'ended'),
+      );
+    }
+  }
+
+  const initial = timeline.current();
+  let paused = initial.paused;
+  let pace: PacePreset = 'normal';
+  if (initial.speed && (initial.speed.label === 'slow' || initial.speed.label === 'fast')) pace = initial.speed.label;
+
+  // ---- ambient traffic ----
+  const ambient = new AmbientTraffic({ seed, paymentApiUrl: options.paymentApiUrl, clock, rate: options.ambientRate, send: options.send, log });
+  ambient.resumeFrom(maxAmbientIndex + 1, ambientInLog);
+  ambient.setPaused(paused);
+  ambient.start();
+
+  // ---- scenario engine ----
+  let runCounter = runsInLog;
+  onRunEndedElsewhere = (r) => {
+    // e.g. a second orchestrator instance recovered the log: stop driving this run, restore our traffic.
+    log(`[orchestrator] run ${r.runId} was ended by another producer; abandoning it`);
+    r.finishing = true;
+    clock.clearTimeout(r.timer);
+    r.timer = undefined;
+    ambient.setRate(r.ambientBefore);
+    if (run === r) run = null;
+  };
+
+  const elapsed = (r: ActiveRun) => r.elapsedBase + (r.resumedAt === null ? 0 : clock.now() - r.resumedAt);
+
+  const applyAction = async (r: ActiveRun, stepId: string, a: ScenarioAction, i: number) => {
+    const id = deterministicId('orchestrator', r.runId, 'step', stepId, 'action', String(i));
+    switch (a.kind) {
+      case 'outage.start':
+        r.openOutages.add(a.providerId);
+        await publishNow(
+          'control.provider_outage.started',
+          { providerId: a.providerId, mode: a.mode, ...(a.failureRate !== undefined ? { failureRate: a.failureRate } : {}), reason: a.reason, runId: r.runId },
+          id,
+        );
+        return;
+      case 'outage.end':
+        await publishNow('control.provider_outage.ended', { providerId: a.providerId, runId: r.runId }, id);
+        r.openOutages.delete(a.providerId);
+        return;
+      case 'ambient.rate':
+        ambient.setRate(a.rate);
+        return;
+    }
+  };
+
+  /** End the run: restore anything still open, publish scenario.ended, put ambient traffic back. */
+  const finish = (r: ActiveRun, outcome: 'completed' | 'stopped') => {
+    r.finishing = true;
+    clock.clearTimeout(r.timer);
+    r.timer = undefined;
+    return enqueue(async () => {
+      for (const providerId of [...r.openOutages]) {
+        await publishNow('control.provider_outage.ended', { providerId, runId: r.runId }, deterministicId('orchestrator', r.runId, 'restore', providerId));
+        r.openOutages.delete(providerId);
+      }
+      await publishNow('control.scenario.ended', { runId: r.runId, scenarioId: r.script.id, outcome }, deterministicId('orchestrator', r.runId, 'ended'));
+      ambient.setRate(r.ambientBefore);
+      if (run === r) run = null;
+      log(`[orchestrator] scenario ${r.script.id} run ${r.runId} ${outcome}`);
+    });
+  };
+
+  const scheduleNext = (r: ActiveRun) => {
+    clock.clearTimeout(r.timer);
+    r.timer = undefined;
+    if (r.finishing || r.resumedAt === null) return; // paused: the scenario clock is stopped
+    const step = r.script.steps[r.nextStep];
+    const dueAt = step ? step.atMs : r.script.durationMs;
+    const fire = () => {
+      r.timer = undefined;
+      if (r.finishing || run !== r) return;
+      const s = r.script.steps[r.nextStep];
+      if (!s) {
+        void finish(r, 'completed');
+        return;
+      }
+      r.nextStep += 1;
+      r.stepId = s.id;
+      void enqueue(async () => {
+        if (r.finishing) return;
+        await publishNow(
+          'control.scenario.step',
+          { runId: r.runId, scenarioId: r.script.id, stepId: s.id, title: s.title, ...(s.narration !== undefined ? { narration: s.narration } : {}) },
+          deterministicId('orchestrator', r.runId, 'step', s.id),
+        );
+        let i = 0;
+        for (const a of s.actions ?? []) {
+          if (r.finishing) return;
+          await applyAction(r, s.id, a, i++);
+        }
+      });
+      scheduleNext(r);
+    };
+    const delay = dueAt - elapsed(r);
+    if (delay <= 0) fire(); // due now (e.g. the step at 0 ms): publish without waiting for a timer tick
+    else r.timer = clock.setTimeout(fire, delay);
+  };
+
+  const startRun = async (scenarioId: string, runSeed: string): Promise<string> => {
+    const script = scriptById.get(scenarioId);
+    if (!script) throw new HttpError(404, 'unknown_scenario', { scenarioId, available: [...scriptById.keys()] });
+    if (run) throw new HttpError(409, 'scenario_active', { runId: run.runId, scenarioId: run.script.id });
+    runCounter += 1;
+    const runId = `run-${runCounter}-${scenarioId}`;
+    const r: ActiveRun = {
+      runId,
+      script,
+      seed: runSeed,
+      startedAtIso: iso(),
+      elapsedBase: 0,
+      resumedAt: paused ? null : clock.now(),
+      nextStep: 0,
+      stepId: null,
+      timer: undefined,
+      openOutages: new Set(),
+      ambientBefore: ambient.rate,
+      finishing: false,
+    };
+    run = r;
+    await enqueue(() => publishNow('control.scenario.started', { runId, scenarioId, title: script.title, seed: runSeed }, deterministicId('orchestrator', runId, 'started')));
+    log(`[orchestrator] scenario ${scenarioId} started (run ${runId}, seed ${runSeed})`);
+    if (run === r) scheduleNext(r);
+    return runId;
+  };
+
+  const stopRun = async (): Promise<boolean> => {
+    const r = run;
+    if (!r) return false;
+    if (!r.finishing) await finish(r, 'stopped');
+    else await queue;
+    return true;
+  };
+
+  const setPaused = async (value: boolean) => {
+    await enqueue(() => publishNow('control.demo.paused', { paused: value }, newId()));
+    paused = value;
+    ambient.setPaused(value);
+    const r = run;
+    if (r && !r.finishing) {
+      if (value && r.resumedAt !== null) {
+        r.elapsedBase += clock.now() - r.resumedAt;
+        r.resumedAt = null;
+        clock.clearTimeout(r.timer);
+        r.timer = undefined;
+      } else if (!value && r.resumedAt === null) {
+        r.resumedAt = clock.now();
+        scheduleNext(r);
+      }
+    }
+  };
+
+  const setPace = async (preset: PacePreset) => {
+    const p = PACE_PRESETS[preset];
+    await enqueue(() => publishNow('control.demo.speed', { ...p, label: preset }, newId()));
+    pace = preset;
+  };
+
+  const state = (): OrchestratorState => ({
+    ambient: { rate: ambient.rate, running: ambient.running, sent: ambient.sent },
+    pace,
+    paused,
+    scenarios: infos,
+    activeRun: run
+      ? { runId: run.runId, scenarioId: run.script.id, startedAt: run.startedAtIso, elapsedMs: Math.round(elapsed(run)), stepId: run.stepId }
+      : null,
+  });
+
+  // ---- HTTP API ----
+  const server: Server = createServer((req, res) => {
+    const path = (req.url ?? '/').split('?')[0]?.replace(/\/+$/, '') || '/';
+    const method = req.method ?? 'GET';
+    const only = (m: string) => {
+      if (method !== m) throw new HttpError(405, 'method_not_allowed');
+    };
+    const route = async () => {
+      if (path === '/health') {
+        only('GET');
+        return send(res, 200, { ok: true });
+      }
+      if (path === '/state') {
+        only('GET');
+        return send(res, 200, state());
+      }
+      if (path === '/scenarios/stop') {
+        only('POST');
+        return send(res, 200, { stopped: await stopRun() });
+      }
+      const m = /^\/scenarios\/([^/]+)\/start$/.exec(path);
+      if (m) {
+        only('POST');
+        const body = await readJson(req);
+        if (body.seed !== undefined && typeof body.seed !== 'string' && typeof body.seed !== 'number') {
+          throw new HttpError(400, 'validation_failed', ['seed must be a string']);
+        }
+        const runSeed = body.seed === undefined || body.seed === '' ? seed : String(body.seed);
+        const runId = await startRun(decodeURIComponent(m[1]!), runSeed);
+        return send(res, 200, { runId });
+      }
+      if (path === '/ambient') {
+        only('POST');
+        const body = await readJson(req);
+        const rate = body.rate;
+        if (typeof rate !== 'number' || !Number.isFinite(rate) || rate < 0 || rate > MAX_AMBIENT_RATE) {
+          throw new HttpError(400, 'validation_failed', [`rate must be a number between 0 and ${MAX_AMBIENT_RATE}`]);
+        }
+        if (run && !run.finishing) run.ambientBefore = rate; // a scenario holds its own rate; this applies after it
+        else ambient.setRate(rate);
+        return send(res, 200, state());
+      }
+      if (path === '/pace') {
+        only('POST');
+        const body = await readJson(req);
+        const preset = body.preset;
+        if (preset !== 'normal' && preset !== 'slow' && preset !== 'fast') {
+          throw new HttpError(400, 'validation_failed', ['preset must be one of normal, slow, fast']);
+        }
+        await setPace(preset);
+        return send(res, 200, state());
+      }
+      if (path === '/pause') {
+        only('POST');
+        const body = await readJson(req);
+        if (typeof body.paused !== 'boolean') throw new HttpError(400, 'validation_failed', ['paused must be true or false']);
+        await setPaused(body.paused);
+        return send(res, 200, state());
+      }
+      throw new HttpError(404, 'not_found');
+    };
+    if (closed) return send(res, 503, { error: 'shutting_down' });
+    route().catch((err: unknown) => {
+      if (res.headersSent) return res.destroy();
+      if (err instanceof HttpError) return send(res, err.status, { error: err.code, ...(err.details !== undefined ? { details: err.details } : {}) });
+      log(`[orchestrator] internal error: ${(err as Error)?.stack ?? String(err)}`);
+      send(res, 500, { error: 'internal_error' });
+    });
+  });
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(options.port ?? 0, options.host ?? '127.0.0.1', () => {
+        server.off('error', reject);
+        resolve();
+      });
+    });
+  } catch (err) {
+    await ambient.stop();
+    await sub.unsubscribe();
+    throw err;
+  }
+  const port = (server.address() as AddressInfo).port;
+
+  let closing: Promise<void> | undefined;
+  return {
+    port,
+    state,
+    idle: async () => {
+      for (;;) {
+        const q = queue;
+        await q;
+        if (q === queue) return;
+      }
+    },
+    close: (opts) =>
+      (closing ??= (async () => {
+        closed = true;
+        const r = run;
+        if (r && opts?.restore !== false) {
+          if (!r.finishing) await finish(r, 'stopped').catch(() => {});
+        } else if (r) {
+          clock.clearTimeout(r.timer);
+          r.finishing = true;
+        }
+        await queue;
+        await ambient.stop();
+        await sub.unsubscribe();
+        await new Promise<void>((resolve) => {
+          server.close(() => resolve());
+          server.closeAllConnections?.();
+        });
+      })()),
+  };
+}

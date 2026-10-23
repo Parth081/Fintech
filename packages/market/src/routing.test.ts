@@ -46,10 +46,12 @@ describe('scoreProviders', () => {
     expect(rows.find((r) => r.providerId === 'orion')!.successRate).toBe(0.5);
   });
 
-  it('blends observed latency with the catalogue p50', () => {
+  it('scores speed from the catalogue p50, not the simulated observed latency (M3)', () => {
     const slow: ProviderHealth = { providerId: 'orion', attempts: 45, settled: 45, failed: 0, successRate: 0.97, avgLatencyMs: 10_900 };
-    const rows = scoreProviders({ corridorId: 'US-IN', sourceAmount: usd(125_000), health: { orion: slow } });
-    expect(rows.find((r) => r.providerId === 'orion')!.latencyMs).toBe(Math.round((900 * 5 + 10_900 * 45) / 50));
+    const fastVega: ProviderHealth = { providerId: 'vega', attempts: 45, settled: 45, failed: 0, successRate: 0.99, avgLatencyMs: 300 };
+    const rows = scoreProviders({ corridorId: 'US-IN', sourceAmount: usd(125_000), health: { orion: slow, vega: fastVega } });
+    expect(rows.find((r) => r.providerId === 'orion')!.latencyMs).toBe(900);
+    expect(rows.find((r) => r.providerId === 'vega')!.latencyMs).toBe(15_000);
   });
 
   it('breaks ties deterministically (lower fee, then success, then id)', () => {

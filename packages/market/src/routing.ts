@@ -1,7 +1,8 @@
 // Smart routing: score every catalogue provider for one payment.
 //
-// Eligibility: the provider has a fee schedule for the corridor (else CORRIDOR_NOT_SERVED) and has
-// not already failed this payment (else FAILED_THIS_PAYMENT).
+// Eligibility: the provider has a fee schedule for the corridor (else CORRIDOR_NOT_SERVED), has
+// not already failed this payment (else FAILED_THIS_PAYMENT) and is not blocked by its circuit breaker
+// (input.circuit: providerId -> CIRCUIT_OPEN | CIRCUIT_HALF_OPEN, decided by the caller; M3).
 //
 // For eligible providers, each factor is normalised against the best eligible provider (1 = best):
 //   success = clamp(1 - (failRate - bestFailRate) / FAILURE_SPAN, 0, 1)   FAILURE_SPAN = 10 points
@@ -30,12 +31,16 @@ export const LATENCY_PRIOR_WEIGHT = 5;
 
 export const EXCLUDED_CORRIDOR_NOT_SERVED = 'CORRIDOR_NOT_SERVED';
 export const EXCLUDED_FAILED_THIS_PAYMENT = 'FAILED_THIS_PAYMENT';
+export const EXCLUDED_CIRCUIT_OPEN = 'CIRCUIT_OPEN';
+export const EXCLUDED_CIRCUIT_HALF_OPEN = 'CIRCUIT_HALF_OPEN';
 
 export interface ScoreInput {
   corridorId: string;
   sourceAmount: Money;
   /** Providers that already failed this payment. */
   excluded?: readonly string[];
+  /** Providers blocked by their circuit breaker, with the excludedReason to show (M3). */
+  circuit?: Readonly<Record<string, string>>;
   /** Observed health by provider id; missing providers use the catalogue prior. */
   health?: Readonly<Record<string, ProviderHealth>>;
   weights?: RoutingWeights;
@@ -64,9 +69,18 @@ export function scoreProviders(input: ScoreInput): ProviderScore[] {
     const h = input.health?.[p.id];
     const successRate = round4(h ? h.successRate : priorSuccessRate(p, input.failureScale ?? 1));
     const observed = h && h.avgLatencyMs !== null ? h.settled : 0;
-    const latencyMs = Math.round((p.latencyMs.p50 * LATENCY_PRIOR_WEIGHT + (h?.avgLatencyMs ?? 0) * observed) / (LATENCY_PRIOR_WEIGHT + observed));
+    // M3: in the simulation every provider settles after the same artificial delay, so observed latency says
+    // nothing real about a provider and let a slow rail (Vega) look as fast as an instant one after absorbing
+    // re-routed traffic — Orion then never won its traffic back after an outage. Speed is therefore scored from
+    // the catalogue profile; observed latency is still reported by providerHealth for the screens.
+    void observed;
+    const latencyMs = p.latencyMs.p50;
     const fee = schedule ? scheduleFee(input.sourceAmount, schedule) : { amountMinor: 0, currency: input.sourceAmount.currency };
-    const excludedReason = !schedule ? EXCLUDED_CORRIDOR_NOT_SERVED : excluded.has(p.id) ? EXCLUDED_FAILED_THIS_PAYMENT : undefined;
+    const excludedReason = !schedule
+      ? EXCLUDED_CORRIDOR_NOT_SERVED
+      : excluded.has(p.id)
+        ? EXCLUDED_FAILED_THIS_PAYMENT
+        : input.circuit?.[p.id];
     const row: ProviderScore = { providerId: p.id, eligible: excludedReason === undefined, fee, successRate, latencyMs, score: 0 };
     if (excludedReason) row.excludedReason = excludedReason;
     return row;

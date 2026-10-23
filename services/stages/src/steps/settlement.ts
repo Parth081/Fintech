@@ -4,7 +4,15 @@
 //                  or payment.send_failed (pacs.002 RJCT with an ISO reason code; routing retries)
 // Every outcome is a pure function of (seed, paymentId, attempt, providerId) and the trigger, so a
 // redelivered trigger yields the same event (same id, same payload).
-import { unitHash, type AnyEvent, type Money, type PayloadMap, type PaymentState, type StatementEntry } from '@ct/contracts';
+//
+// Provider outages (M3, control.provider_outage.*): the outcome of a payment.sent honours the outage
+// state AS OF THE TRIGGER's log position (ctx.control: only control events before the payment.sent),
+// so a replay or restart decides identically:
+//   mode 'down'     -> every instruction is rejected: pacs.002 RJCT, reason NARR "Provider unavailable (outage)";
+//   mode 'degraded' -> rejected when unitHash(seed|paymentId|attempt|providerId|outage) < failureRate
+//                      (NARR "Provider degraded (outage): instruction rejected"); otherwise the normal draw.
+// An instruction sent before the outage started is not affected (the provider had already accepted it).
+import { unitHash, type AnyEvent, type ControlState, type Money, type PayloadMap, type PaymentState, type ProviderOutage, type StatementEntry } from '@ct/contracts';
 import { buildPacs002, buildPacs008, originatorBic, SIMULATED_REJECT_CODES, statementIdFor, statusReason } from '@ct/iso20022';
 import { providerProfile } from '@ct/market';
 import { shortRef, type Outcome, type StageServices, type Step } from './common';
@@ -13,6 +21,32 @@ export const SETTLEMENT_RULE_VERSION = 'settlement-sim-v1';
 const DEFAULT_SEED = 'control-tower';
 const DEFAULT_SUCCESS_RATE = 0.95; // unknown provider (not in the catalogue)
 const SCENARIO_REJECT_CODE = 'AG01';
+export const OUTAGE_REJECT_CODE = 'NARR';
+export const OUTAGE_DOWN_TEXT = 'Provider unavailable (outage)';
+export const OUTAGE_DEGRADED_TEXT = 'Provider degraded (outage): instruction rejected';
+/** failureRate used for a 'degraded' outage that does not give one. */
+export const DEFAULT_DEGRADED_FAILURE_RATE = 0.5;
+
+export interface OutageDraw {
+  mode: 'down' | 'degraded';
+  failureRate: number;
+  draw: number | null; // null for 'down'
+  fail: boolean;
+}
+
+/** The outage's decision for one attempt (null when the provider has no active outage). */
+export function outageDraw(
+  input: { paymentId: string; attempt: number; providerId: string },
+  outage: ProviderOutage | undefined,
+  sim: StageServices['sim'],
+): OutageDraw | null {
+  if (!outage) return null;
+  if (outage.mode === 'down') return { mode: 'down', failureRate: 1, draw: null, fail: true };
+  const rate = outage.failureRate;
+  const failureRate = typeof rate === 'number' && Number.isFinite(rate) ? Math.min(1, Math.max(0, rate)) : DEFAULT_DEGRADED_FAILURE_RATE;
+  const draw = unitHash(`${sim?.seed ?? DEFAULT_SEED}|${input.paymentId}|${input.attempt}|${input.providerId}|outage`);
+  return { mode: 'degraded', failureRate, draw, fail: failureRate >= 1 || draw < failureRate };
+}
 
 export const messageIdFor = (paymentId: string, kind: 'pacs.008' | 'pacs.002', attempt: number) =>
   `MSG-${shortRef(paymentId, kind, String(attempt))}`;
@@ -109,7 +143,7 @@ function produceSent(trigger: AnyEvent, state: PaymentState): Outcome | null {
   };
 }
 
-function produceOutcome(trigger: AnyEvent, state: PaymentState, services: StageServices): Outcome | null {
+function produceOutcome(trigger: AnyEvent, state: PaymentState, services: StageServices, control: ControlState): Outcome | null {
   if (trigger.type !== 'payment.sent') return null;
   const sent = trigger.payload;
   const latest = state.facts['payment.sent'];
@@ -133,6 +167,45 @@ function produceOutcome(trigger: AnyEvent, state: PaymentState, services: StageS
     rule: 'fail if draw < (1 - baseSuccessRate) x providerFailureScale',
     scenario: scenario ?? null,
   };
+  const activeOutage = control.outages[sent.providerId];
+  const od = outageDraw({ paymentId: state.paymentId, attempt, providerId: sent.providerId }, activeOutage, services.sim);
+  if (od && activeOutage) {
+    inputs.outage = {
+      providerId: activeOutage.providerId,
+      mode: activeOutage.mode,
+      failureRate: od.failureRate,
+      since: activeOutage.since,
+      reason: activeOutage.reason,
+      runId: activeOutage.runId ?? null,
+      ...(od.draw !== null ? { draw: Number(od.draw.toFixed(6)) } : {}),
+      rule: od.mode === 'down' ? 'provider down: every instruction is rejected' : 'provider degraded: fail if outage draw < failureRate',
+    };
+    inputs.controlAsOfOffset = control.lastOffset;
+  }
+
+  if (od?.fail) {
+    const text = od.mode === 'down' ? OUTAGE_DOWN_TEXT : OUTAGE_DEGRADED_TEXT;
+    const reason = statusReason(OUTAGE_REJECT_CODE);
+    const message = buildPacs002({
+      messageId: statusMessageId,
+      createdAt: trigger.occurredAt,
+      originalMessageId: sent.messageId,
+      paymentId: state.paymentId,
+      status: 'RJCT',
+      reasonCode: reason.code,
+      reasonText: text,
+      instructingAgentBic: bic,
+      instructedAgentBic: originatorBic(state.initiated.debtor.country),
+    });
+    return {
+      type: 'payment.send_failed',
+      payload: { providerId: sent.providerId, attempt, reasonCode: reason.code, reason: text, statusMessage: 'pacs.002', message },
+      decision: 'rejected_by_provider',
+      reasonCodes: ['PROVIDER_REJECTED', 'PROVIDER_OUTAGE', od.mode === 'down' ? 'OUTAGE_DOWN' : 'OUTAGE_DEGRADED', reason.code],
+      inputs: { ...inputs, reasonCode: reason.code, reasonName: reason.name },
+      ruleVersion: SETTLEMENT_RULE_VERSION,
+    };
+  }
 
   if (d.fail) {
     const reason = statusReason(d.reasonCode ?? 'MS03');
@@ -198,7 +271,7 @@ function produceOutcome(trigger: AnyEvent, state: PaymentState, services: StageS
       statementEntry,
     },
     decision: 'settled',
-    reasonCodes: ['PROVIDER_CONFIRMED', 'ACSC', ...(reconBreak ? ['SCENARIO_RECON_BREAK'] : [])],
+    reasonCodes: ['PROVIDER_CONFIRMED', 'ACSC', ...(reconBreak ? ['SCENARIO_RECON_BREAK'] : []), ...(od ? ['OUTAGE_DEGRADED_PASSED'] : [])],
     inputs: { ...inputs, quotedAmount: quoted.targetAmount, settledAmount, statementId: statementEntry.statementId },
     ruleVersion: SETTLEMENT_RULE_VERSION,
   };
@@ -206,5 +279,5 @@ function produceOutcome(trigger: AnyEvent, state: PaymentState, services: StageS
 
 export const settlementSteps: Step[] = [
   { trigger: 'payment.routed', delay: 'stage', produce: (t, state) => produceSent(t, state) },
-  { trigger: 'payment.sent', delay: 'settlement', produce: (t, state, ctx) => produceOutcome(t, state, ctx.services) },
+  { trigger: 'payment.sent', delay: 'settlement', produce: (t, state, ctx) => produceOutcome(t, state, ctx.services, ctx.control) },
 ];
