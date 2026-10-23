@@ -209,7 +209,10 @@ export function resetReducer(state: ResetState, ev: ResetEvent): ResetState {
         return { ...state, sawDown: true };
       }
       const restarted = state.beforeInstance !== null && h.instanceId !== undefined && h.instanceId !== state.beforeInstance;
-      if (h.replayed && (restarted || state.sawDown || state.postOk)) {
+      // The gateway asks the launcher to reset in the background (202 straight away), so a successful POST
+      // proves nothing by itself: only trust it when we could not record the old instance id.
+      const postProves = state.postOk && state.beforeInstance === null;
+      if (h.replayed && (restarted || state.sawDown || postProves)) {
         return { phase: 'back', startedAtMs: state.startedAtMs, tookMs: ev.nowMs - state.startedAtMs };
       }
       if (ev.nowMs - state.startedAtMs > RESET_GIVE_UP_MS) return { phase: 'failed', error: 'The system did not come back within 60 s' };

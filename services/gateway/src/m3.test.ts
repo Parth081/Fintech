@@ -271,8 +271,8 @@ describe('POST /api/control/reset', () => {
     const launcher = await listen((req, res) => {
       calls.push(`${req.method} ${req.url}`);
       setTimeout(() => {
-        res.setHeader('content-type', 'application/json');
-        res.end(JSON.stringify({ ok: true, durationMs: 42 }));
+        res.writeHead(202, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, accepted: true }));
       }, 50);
     });
     const { base, gw } = await setup({ launcherControlUrl: launcher.url });
@@ -284,9 +284,9 @@ describe('POST /api/control/reset', () => {
       messages.push(...(Array.isArray(p) ? p : [p]));
     });
     await new Promise<void>((r) => ws.once('open', () => r()));
-    const r = await getJson<{ ok: boolean; durationMs: number }>(`${base}/api/control/reset`, { method: 'POST' });
-    expect(r).toEqual({ status: 200, body: { ok: true, durationMs: 42 } });
-    expect(calls).toEqual(['POST /reset']);
+    const r = await getJson<{ ok: boolean; accepted: boolean }>(`${base}/api/control/reset`, { method: 'POST' });
+    expect(r).toEqual({ status: 202, body: { ok: true, accepted: true } });
+    expect(calls).toEqual(['POST /reset?wait=0']); // background reset: this gateway is restarted by it
     await until(() => messages.some((m) => m.kind === 'reset'));
     expect(messages.some((m) => m.kind === 'reset')).toBe(true);
   });

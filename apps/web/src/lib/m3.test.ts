@@ -183,6 +183,14 @@ describe('resetReducer', () => {
     expect(resetReducer(s, { type: 'dismiss' }).phase).toBe('idle');
   });
 
+  it('an accepted (202) POST does not end the reset while the old gateway is still up', () => {
+    let s = resetReducer(start(), { type: 'post', ok: true });
+    s = resetReducer(s, { type: 'health', health: health('a'), nowMs: 300 }); // same old instance, still replayed
+    expect(s.phase).toBe('resetting');
+    s = resetReducer(s, { type: 'health', health: health('b'), nowMs: 5000 });
+    expect(s.phase).toBe('back');
+  });
+
   it('a new instance id alone is enough (fast restart between polls)', () => {
     expect(resetReducer(start(), { type: 'health', health: health('z'), nowMs: 3000 }).phase).toBe('back');
   });

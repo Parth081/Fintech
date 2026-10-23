@@ -22,8 +22,9 @@ the semantics that screens, routing and verification rely on.
   `breakerStates(states, atMs)`. No process holds breaker state of its own, so every process (routing,
   gateway, verify) and every replay computes the same breaker for the same time.
 - **States.** `closed` → `open` when enough recent attempts failed (a count and a failure share within a
-  sliding window). `open` → `half-open` after a fixed open period. `half-open` → `closed` on the first
-  successful probe; `half-open` → `open` on a failed probe. Outcomes of attempts sent before a trip do not
+  sliding window). `open` → `half-open` after a fixed open period. `half-open` → `closed` on a
+  successful probe; `half-open` → `open` when probes keep failing (the exact count is a breaker option;
+  currently two failed probes re-open it). Outcomes of attempts sent before a trip do not
   count afterwards.
 - **Routing honours it at the trigger's time.** Routing evaluates the breaker as of the trigger's
   `occurredAt` minus a small lag (the same cut-off as provider health), records it in the decision trace

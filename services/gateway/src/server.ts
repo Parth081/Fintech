@@ -621,7 +621,9 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
     const rm: ResetMessage = { kind: 'reset', startedAt: new Date(now()).toISOString() };
     broadcast(JSON.stringify(rm));
     try {
-      const upstream = await fetch(`${launcherControlUrl}/reset`, {
+      // wait=0: the launcher answers 202 at once and resets in the background. Waiting for the full reset
+      // would never work: the reset restarts this gateway mid-request. The UI detects completion via /health.
+      const upstream = await fetch(`${launcherControlUrl}/reset?wait=0`, {
         method: 'POST',
         headers: { accept: 'application/json' },
         signal: AbortSignal.timeout(resetTimeoutMs),
