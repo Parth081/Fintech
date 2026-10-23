@@ -1,6 +1,6 @@
 // Pure analysis for `npm run verify:m2`: folds the event log into payment states with the real state
 // machine, counts duplicates and invalid transitions, and turns everything into pass/fail checks.
-import { applyEvent, isTerminal, type AnyEvent, type PaymentState, type TrialBalance } from '@ct/contracts';
+import { applyEvent, isControlEvent, isTerminal, type AnyEvent, type BusEvent, type ControlEvent, type PaymentState, type TrialBalance } from '@ct/contracts';
 
 /** Max routing attempts per payment (ADR 0007). */
 export const MAX_ATTEMPTS = 3;
@@ -27,8 +27,10 @@ export class LogAnalyzer {
   /** Next offset expected (offsets must be dense). */
   nextOffset = 0;
   readonly gaps: { expected: number; got: number }[] = [];
+  /** Control events (M3) in log order. They share the log but are not payment events. */
+  readonly controls: { offset: number; event: ControlEvent }[] = [];
 
-  apply(offset: number, event: AnyEvent): void {
+  apply(offset: number, event: AnyEvent | BusEvent): void {
     if (offset !== this.nextOffset) this.gaps.push({ expected: this.nextOffset, got: offset });
     this.nextOffset = offset + 1;
     this.events += 1;
@@ -37,6 +39,10 @@ export class LogAnalyzer {
       return;
     }
     this.eventIds.add(event.eventId);
+    if (isControlEvent(event)) {
+      this.controls.push({ offset, event });
+      return;
+    }
     // ISO 20022 XML is irrelevant to the state machine; drop it so 10k payments stay small in memory.
     const slim = stripMessage(event);
     const prev = this.payments.get(event.paymentId);

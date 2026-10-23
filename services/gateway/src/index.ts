@@ -8,6 +8,7 @@ import { DEFAULT_WEB_DIST, startGateway } from './server';
 export { startGateway, DEFAULT_WEB_DIST } from './server';
 export type { GatewayOptions, GatewayHandle } from './server';
 export { Projection, summarize } from './projection';
+export { ControlProjection, TrafficMeter } from './control';
 export type { MarketPort, IsoPort, Camt053Input } from './views';
 export type * from './api-types';
 
@@ -23,9 +24,11 @@ async function main(): Promise<void> {
     ledgerUrl: config.ledgerUrl,
     simSeed: config.simSeed,
     webDist,
+    orchestratorUrl: config.orchestratorUrl,
+    launcherControlUrl: config.launcherControlUrl,
   });
   console.log(
-    `[gateway] listening on http://${config.host}:${gateway.port} (ws://${config.host}:${gateway.port}/ws), bus=${config.bus}, payment API ${config.paymentApiUrl}, ledger ${config.ledgerUrl}, UI from ${webDist}`,
+    `[gateway] listening on http://${config.host}:${gateway.port} (ws://${config.host}:${gateway.port}/ws), bus=${config.bus}, payment API ${config.paymentApiUrl}, ledger ${config.ledgerUrl}, orchestrator ${config.orchestratorUrl}, reset ${config.launcherControlUrl || 'unavailable'}, UI from ${webDist}`,
   );
 
   let stopping = false;

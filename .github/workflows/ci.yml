@@ -50,6 +50,27 @@ jobs:
           name: verify-m2-report
           path: verify-report/
 
+  verify-m3:
+    name: M3 Gate 2 - provider-outage scenario (verify:m3, 2 runs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # Launches the whole system on temp ports (PGlite ledger, ambient traffic on, offline), runs the
+      # provider-outage scenario twice; after each run checks control events, breaker open / respected /
+      # recovered, terminal payments, duplicates, state machine, ledger, gateway, and a reset under 10 s.
+      - run: npm run verify:m3 -- --runs 2 --report-dir verify-report
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verify-m3-report
+          path: verify-report/
+
   compose:
     name: Validate docker compose file
     runs-on: ubuntu-latest

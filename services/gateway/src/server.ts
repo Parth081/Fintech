@@ -5,12 +5,19 @@ import { stat } from 'node:fs/promises';
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
-import { isControlEvent, type AnyEvent, type EventType, type PaymentStatus } from '@ct/contracts';
+import { randomUUID } from 'node:crypto';
+import { isControlEvent, type AnyEvent, type EventType, type OrchestratorState, type PaymentStatus } from '@ct/contracts';
+import { breakerStates } from '@ct/market';
 import type { EventBus } from '@ct/event-bus';
 import { ALL_STATUSES, Projection, type PaymentFilter } from './projection';
+import { ControlProjection, safeBreakers, type BreakerFn } from './control';
 import { camt053For, defaultIso, defaultMarket, fxRates, providerViews, type IsoPort, type MarketPort } from './views';
 import type {
+  ControlMessage,
   EventBrief,
+  FocusMessage,
+  GatewayControlView,
+  ResetMessage,
   Health,
   PaymentSummary,
   ProviderView,
@@ -48,11 +55,22 @@ export interface GatewayOptions {
   now?: () => number;
   /** Log replay progress to the console. Default true unless running under vitest. */
   log?: boolean;
+  /** Orchestrator base URL (GET /state; proxied under /api/control/orchestrator/*). Default http://127.0.0.1:7074. */
+  orchestratorUrl?: string;
+  /** Launcher control URL (POST /reset). Empty = reset unavailable (503). Default ''. */
+  launcherControlUrl?: string;
+  /** Breaker engine (tests). Default @ct/market breakerStates. */
+  breakers?: BreakerFn;
+  /** Control-plane push tick: changes are pushed at most this often, and at least every 2 s while a scenario runs. Default 1000 ms; 0 disables. */
+  controlIntervalMs?: number;
+  /** Timeout of the launcher reset call. Default 20 s. */
+  resetTimeoutMs?: number;
 }
 
 export interface GatewayHandle {
   port: number;
   projection: Projection;
+  control: ControlProjection;
   /** Resolves when the startup replay reached the log head seen at start. */
   replayed: Promise<{ events: number; ms: number }>;
   close(): Promise<void>;
@@ -143,6 +161,14 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
   const now = options.now ?? Date.now;
   const log = options.log ?? !isVitest();
   const projection = new Projection({ now });
+  const control = new ControlProjection();
+  const orchestratorUrl = (options.orchestratorUrl ?? 'http://127.0.0.1:7074').replace(/\/$/, '');
+  const launcherControlUrl = (options.launcherControlUrl ?? '').replace(/\/$/, '');
+  const breakerFn: BreakerFn = options.breakers ?? breakerStates;
+  const controlIntervalMs = options.controlIntervalMs ?? 1000;
+  const resetTimeoutMs = options.resetTimeoutMs ?? 20_000;
+  const instanceId = randomUUID();
+  const startedAt = new Date(now()).toISOString();
 
   // ---- WebSocket fan-out: coalesced per payment, capped per frame ----------------------
   const wss = new WebSocketServer({ noServer: true });
@@ -249,6 +275,11 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
     flush(socket);
     const msg: ServerMessage = snapshot();
     socket.send(JSON.stringify(msg));
+    void controlView().then((view) => {
+      if (socket.readyState !== WebSocket.OPEN) return;
+      const cm: ControlMessage = { kind: 'control', view };
+      socket.send(JSON.stringify(cm));
+    });
   });
 
   const heartbeat = setInterval(() => {
@@ -277,6 +308,112 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
       : null;
   statsTimer?.unref();
 
+  // ---- Control plane: ControlView, cached orchestrator state, throttled push -------------
+  type OrchResult = { state: OrchestratorState | null; error?: string };
+  let orchestratorCache: (OrchResult & { at: number }) | null = null;
+  let orchestratorInflight: Promise<OrchResult> | null = null;
+  const ORCH_CACHE_MS = 500;
+
+  const fetchOrchestrator = (fresh = false): Promise<OrchResult> => {
+    const t = now();
+    if (!fresh && orchestratorCache && t - orchestratorCache.at < ORCH_CACHE_MS) return Promise.resolve(orchestratorCache);
+    if (orchestratorInflight) return orchestratorInflight;
+    orchestratorInflight = (async (): Promise<OrchResult> => {
+      let result: OrchResult;
+      try {
+        const res = await fetch(`${orchestratorUrl}/state`, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(1500) });
+        if (!res.ok) result = { state: null, error: `orchestrator HTTP ${res.status}` };
+        else result = { state: (await res.json()) as OrchestratorState };
+      } catch (err) {
+        result = { state: null, error: `orchestrator unreachable: ${(err as Error).message}` };
+      }
+      orchestratorCache = { at: now(), ...result };
+      return result;
+    })().finally(() => {
+      orchestratorInflight = null;
+    });
+    return orchestratorInflight;
+  };
+
+  let breakerCache: { at: number; events: number; value: ReturnType<typeof safeBreakers> } | null = null;
+  const breakers = () => {
+    const t = now();
+    if (breakerCache && breakerCache.events === projection.totalEvents && t - breakerCache.at < 250) return breakerCache.value;
+    breakerCache = { at: t, events: projection.totalEvents, value: safeBreakers(breakerFn, projection.states(), t) };
+    return breakerCache.value;
+  };
+
+  const controlView = async (freshOrchestrator = false): Promise<GatewayControlView> => {
+    const orch = await fetchOrchestrator(freshOrchestrator);
+    const t = now();
+    const b = breakers();
+    const view: GatewayControlView = {
+      control: control.timeline.current(),
+      breakers: b.breakers,
+      orchestrator: orch.state,
+      resetAvailable: launcherControlUrl !== '',
+      atMs: t,
+      traffic: control.traffic.view(t),
+      reroutes: control.reroutes(),
+    };
+    if (b.error) view.breakerError = b.error;
+    if (orch.error) view.orchestratorError = orch.error;
+    return view;
+  };
+
+  /** What counts as a change worth pushing (traffic and clock fields excluded: they tick constantly). */
+  const pushKey = (v: GatewayControlView) => {
+    const o = v.orchestrator;
+    return JSON.stringify([
+      v.control,
+      v.breakers.map((x) => [x.providerId, x.state, x.since, x.reason]),
+      o && [o.ambient.rate, o.ambient.running, o.pace, o.paused, o.activeRun?.runId, o.activeRun?.stepId, o.scenarios.length],
+      v.resetAvailable,
+      v.breakerError,
+      v.orchestratorError,
+      v.reroutes[0]?.paymentId,
+    ]);
+  };
+  let lastPushKey = '';
+  let lastPushAt = 0;
+  let pushing = false;
+  let pushTimer: NodeJS.Timeout | null = null;
+  const PUSH_MIN_GAP_MS = 250;
+  const RUNNING_PUSH_MS = 2000;
+
+  const pushControl = async (freshOrchestrator = false) => {
+    if (pushing || listeners() === 0) return;
+    pushing = true;
+    try {
+      const view = await controlView(freshOrchestrator);
+      const key = pushKey(view);
+      const running = view.control.scenario !== null || (view.orchestrator?.activeRun ?? null) !== null;
+      const due = running && now() - lastPushAt >= RUNNING_PUSH_MS - 50;
+      if (key === lastPushKey && !due) return;
+      lastPushKey = key;
+      lastPushAt = now();
+      const msg: ControlMessage = { kind: 'control', view };
+      broadcast(JSON.stringify(msg));
+    } catch (err) {
+      console.error('[gateway] control push failed', err);
+    } finally {
+      pushing = false;
+    }
+  };
+
+  /** Throttled push soon (after a control event or an orchestrator command). */
+  const schedulePush = (freshOrchestrator = false) => {
+    if (pushTimer) return;
+    const wait = Math.max(0, PUSH_MIN_GAP_MS - (now() - lastPushAt));
+    pushTimer = setTimeout(() => {
+      pushTimer = null;
+      void pushControl(freshOrchestrator);
+    }, wait);
+  };
+
+  const controlTimer = controlIntervalMs > 0 ? setInterval(() => void pushControl(), controlIntervalMs) : null;
+  controlTimer?.unref();
+
   // ---- Bus subscription + replay timing -----------------------------------------------
   const replayStart = performance.now();
   const headAtStart = await bus.head().catch(() => 0);
@@ -295,10 +432,21 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
 
   const subscription = await bus.subscribe({ group: 'gateway', from: 'earliest', ephemeral: true }, (event, meta) => {
     // Never throw: a throwing handler would be retried forever.
-    if (isControlEvent(event)) return; // M3: control events are projected separately (gateway agent)
+    if (typeof event?.type === 'string' && isControlEvent(event)) {
+      try {
+        if (control.applyControl(event, meta.offset) && replayDone) schedulePush(true);
+      } catch (err) {
+        console.error('[gateway] control projection failed', err);
+      }
+      if (!replayDone && meta.offset + 1 >= headAtStart) finishReplay();
+      return;
+    }
     try {
       const result = projection.apply(event);
-      if (result.kind === 'applied') enqueue(result.event, result.summary);
+      if (result.kind === 'applied') {
+        enqueue(result.event, result.summary);
+        control.applyPayment(result.event, result.state);
+      }
       else if (result.kind === 'rejected' && log) {
         console.warn(`[gateway] rejected event ${String(event?.eventId)} (${String(event?.type)}): ${result.error}`);
       }
@@ -430,8 +578,101 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
     createReadStream(file).on('error', () => res.destroy()).pipe(res);
   };
 
+  /** * /api/control/orchestrator/<rest> -> {orchestratorUrl}/<rest> (method, query and body passed through). */
+  const proxyOrchestrator = async (req: IncomingMessage, res: ServerResponse, url: URL, method: string) => {
+    const rest = url.pathname.slice('/api/control/orchestrator'.length) || '/';
+    let body: Buffer;
+    try {
+      body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
+    } catch (err) {
+      sendJson(res, 413, { error: (err as Error).message });
+      return;
+    }
+    try {
+      const upstream = await fetch(`${orchestratorUrl}${rest}${url.search}`, {
+        method,
+        headers: { 'content-type': req.headers['content-type'] ?? 'application/json', accept: 'application/json' },
+        body: body.length > 0 ? new Uint8Array(body) : undefined,
+        signal: AbortSignal.timeout(5000),
+      });
+      const text = await upstream.text();
+      res.writeHead(upstream.status, {
+        'content-type': upstream.headers.get('content-type') ?? 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+      });
+      res.end(text);
+      if (method !== 'GET' && method !== 'HEAD') {
+        orchestratorCache = null;
+        schedulePush(true);
+      }
+    } catch (err) {
+      sendJson(res, 502, { error: 'orchestrator unavailable', detail: (err as Error).message });
+    }
+  };
+
+  /** POST /api/control/reset -> {launcherControlUrl}/reset. The launcher restarts this process too. */
+  const reset = async (res: ServerResponse) => {
+    if (!launcherControlUrl) {
+      return sendJson(res, 503, {
+        error: 'reset unavailable',
+        detail: 'this stack was not started by the launcher (LAUNCHER_CONTROL_URL is empty), e.g. Docker',
+      });
+    }
+    const rm: ResetMessage = { kind: 'reset', startedAt: new Date(now()).toISOString() };
+    broadcast(JSON.stringify(rm));
+    try {
+      const upstream = await fetch(`${launcherControlUrl}/reset`, {
+        method: 'POST',
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(resetTimeoutMs),
+      });
+      const text = await upstream.text();
+      if (res.writableEnded || res.destroyed) return;
+      res.writeHead(upstream.status, {
+        'content-type': upstream.headers.get('content-type') ?? 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+      });
+      res.end(text);
+    } catch (err) {
+      const failed: ResetMessage = { kind: 'reset', startedAt: rm.startedAt, failed: (err as Error).message };
+      broadcast(JSON.stringify(failed));
+      if (res.writableEnded || res.destroyed) return;
+      sendJson(res, 502, { error: 'launcher unavailable', detail: (err as Error).message });
+    }
+  };
+
+  /** POST /api/control/focus { paymentId | null } -> every screen opens/closes that payment's drawer. */
+  const focus = async (req: IncomingMessage, res: ServerResponse) => {
+    let paymentId: unknown;
+    try {
+      const raw = (await readBody(req)).toString('utf8');
+      paymentId = raw ? (JSON.parse(raw) as { paymentId?: unknown }).paymentId : undefined;
+    } catch {
+      return sendJson(res, 400, { error: 'body must be JSON { paymentId: string | null }' });
+    }
+    if (paymentId !== null && (typeof paymentId !== 'string' || paymentId === '' || paymentId.length > 200)) {
+      return sendJson(res, 400, { error: 'body must be JSON { paymentId: string | null }' });
+    }
+    if (typeof paymentId === 'string' && !projection.state(paymentId)) return sendJson(res, 404, { error: 'payment not found', paymentId });
+    const msg: FocusMessage = { kind: 'focus', paymentId };
+    broadcast(JSON.stringify(msg));
+    return sendJson(res, 200, { ok: true, screens: listeners() });
+  };
+
   const handleApi = async (req: IncomingMessage, res: ServerResponse, url: URL, method: string) => {
     const path = url.pathname;
+    if (path === '/api/control/orchestrator' || path.startsWith('/api/control/orchestrator/')) return proxyOrchestrator(req, res, url, method);
+    if (path === '/api/control/reset') {
+      if (method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' });
+      return reset(res);
+    }
+    if (path === '/api/control/focus') {
+      if (method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' });
+      return focus(req, res);
+    }
+    if (method === 'GET' && path === '/api/control/state') return sendJson(res, 200, await controlView(url.searchParams.has('fresh')));
+    if (method === 'GET' && path === '/api/control/traffic') return sendJson(res, 200, control.traffic.view(now()));
+    if (method === 'GET' && path === '/api/control/reroutes') return sendJson(res, 200, control.reroutes());
     if (method === 'GET') {
       if (path === '/api/payments') {
         const q = url.searchParams;
@@ -515,6 +756,8 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
         events: projection.totalEvents,
         replayed: replayDone !== null,
         replayMs: replayDone?.ms ?? null,
+        instanceId,
+        startedAt,
       };
       return sendJson(res, 200, body);
     }
@@ -554,6 +797,7 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
   return {
     port,
     projection,
+    control,
     replayed,
     async close() {
       if (closed) return;
@@ -561,6 +805,8 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
       clearInterval(heartbeat);
       if (statsTimer) clearInterval(statsTimer);
       if (flushTimer) clearTimeout(flushTimer);
+      if (controlTimer) clearInterval(controlTimer);
+      if (pushTimer) clearTimeout(pushTimer);
       await subscription.unsubscribe().catch(() => undefined);
       for (const client of wss.clients) client.terminate();
       await new Promise<void>((r) => wss.close(() => r()));

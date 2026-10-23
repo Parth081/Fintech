@@ -7,6 +7,7 @@ import type {
   PaymentState,
   PaymentStatus,
   StatementEntry,
+  ControlView,
 } from '@ct/contracts/browser';
 
 export interface PaymentSummary {
@@ -94,6 +95,9 @@ export interface Health {
   /** True once the startup replay reached the log head seen at start. */
   replayed: boolean;
   replayMs: number | null;
+  /** Changes every time the gateway process starts (the UI uses it to detect a completed reset). */
+  instanceId: string;
+  startedAt: string;
 }
 
 /** GET /api/payments/:id/messages */
@@ -241,7 +245,79 @@ export interface StatsMessage {
   stats: Stats;
 }
 
-export type ServerMessage = SnapshotMessage | UpdateMessage | StatsMessage;
+// ---- M3 control plane ------------------------------------------------------------------
+
+/** Per-provider routing traffic, one value per bucket, oldest first. */
+export interface ProviderTraffic {
+  providerId: string;
+  /** First-attempt routings (attempt 1) per bucket. */
+  firstAttempt: number[];
+  /** Re-routes INTO this provider (attempt > 1) per bucket. */
+  rerouted: number[];
+  /** Provider rejects (payment.send_failed) per bucket. */
+  failed: number[];
+  settled: number[];
+  total: { firstAttempt: number; rerouted: number; failed: number; settled: number };
+}
+
+/** GET /api/control/traffic (also inside GatewayControlView.traffic). Buckets by event time. */
+export interface TrafficView {
+  bucketMs: number;
+  buckets: number;
+  /** Start of the oldest bucket / end of the newest bucket (epoch ms). */
+  fromMs: number;
+  toMs: number;
+  providers: ProviderTraffic[];
+}
+
+/** A payment that was re-routed away from a provider that rejected it. */
+export interface RerouteBrief {
+  paymentId: string;
+  fromProviderId: string;
+  toProviderId: string;
+  attempt: number;
+  reasonCode?: string;
+  reason?: string;
+  at: string;
+}
+
+/** GET /api/control/state: the contract's ControlView plus gateway extras. */
+export interface GatewayControlView extends ControlView {
+  /** Gateway clock when the view was computed (epoch ms). */
+  atMs: number;
+  /** Set when breakerStates() is unavailable (breakers is then []). */
+  breakerError?: string;
+  /** Why orchestrator is null (unreachable, HTTP error). */
+  orchestratorError?: string;
+  traffic: TrafficView;
+  /** Newest first. */
+  reroutes: RerouteBrief[];
+}
+
+/** Control plane changed (control event, breaker change, orchestrator change; at least every 2 s while a scenario runs). */
+export interface ControlMessage {
+  kind: 'control';
+  view: GatewayControlView;
+}
+
+/** A reset was requested: every screen shows "Resetting…" and reconnects when the gateway is back. */
+export interface ResetMessage {
+  kind: 'reset';
+  startedAt: string;
+  /** Set when the launcher could not be reached: screens drop the "Resetting…" overlay. */
+  failed?: string;
+}
+
+/**
+ * The presenter asked every screen to open (or close, paymentId null) the payment drawer.
+ * POST /api/control/focus { paymentId: string | null }. UI-only: nothing goes on the event log.
+ */
+export interface FocusMessage {
+  kind: 'focus';
+  paymentId: string | null;
+}
+
+export type ServerMessage = SnapshotMessage | UpdateMessage | StatsMessage | ControlMessage | ResetMessage | FocusMessage;
 
 /** One WebSocket frame: a single message or a batch (array) of messages, in order. */
 export type ServerFrame = ServerMessage | ServerMessage[];

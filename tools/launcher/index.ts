@@ -39,7 +39,15 @@ async function main(): Promise<void> {
   try {
     system = await launch({
       host: args.host,
-      ports: { broker: args.brokerPort, paymentApi: args.paymentApiPort, gateway: args.gatewayPort, ledger: args.ledgerPort },
+      ports: {
+        broker: args.brokerPort,
+        paymentApi: args.paymentApiPort,
+        gateway: args.gatewayPort,
+        ledger: args.ledgerPort,
+        orchestrator: args.orchestratorPort,
+      },
+      controlPort: args.controlPort ?? undefined,
+      ambientRate: args.ambientRate,
       dataDir: args.dataDir,
       reset: args.reset,
       stageDelayMs: args.stageDelayMs,
@@ -59,7 +67,11 @@ async function main(): Promise<void> {
     await system.stop();
     process.exit(0);
   }
-  console.log(`\n${banner(system.urls.gateway)}\n`);
+  const extra = [
+    `  Ambient traffic ${args.ambientRate}/s` + (system.urls.control ? ` · reset: POST ${system.urls.control}/reset` : ''),
+    `  Started in ${(system.startup.totalMs / 1000).toFixed(1)} s`,
+  ];
+  console.log(`\n${banner(system.urls.gateway, extra)}\n`);
 }
 
 void main();

@@ -1,0 +1,244 @@
+/* Main stage (big screen). Everything is sized in em off one viewport-relative font size, so the
+   same layout fills 1366x768 up to 3840x2160. Colours come from the app's theme variables. */
+.ms-root {
+  --ms-orion: #4cc2ff;
+  --ms-lyra: #c08cff;
+  --ms-vega: #2ee6c9;
+  --ms-land: #1a2540;
+  --ms-land-hi: #25345a;
+  --ms-land-edge: #2c3a5c;
+  --ms-ocean: #0c1426;
+  --ms-grid: rgba(154, 168, 195, 0.07);
+  --ms-muted: #56627d;
+  --ms-halo: var(--bg);
+
+  position: relative;
+  box-sizing: border-box;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: min(1vw, 1.78vh);
+  line-height: 1.25;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 25em;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-areas:
+    'head head'
+    'hero side'
+    'pipe pipe';
+  gap: 0.9em 1.1em;
+  padding: 1em 1.4em 1.1em;
+}
+.ms-root.ms-embedded { width: 100%; height: 100%; }
+
+@media (prefers-color-scheme: light) {
+  .ms-root {
+    --ms-orion: #0a74c2;
+    --ms-lyra: #7a3fd1;
+    --ms-vega: #078a78;
+    --ms-land: #dfe6f1;
+    --ms-land-hi: #c9d5e8;
+    --ms-land-edge: #b8c5da;
+    --ms-ocean: #f8fafd;
+    --ms-grid: rgba(77, 91, 117, 0.08);
+    --ms-muted: #8a95aa;
+  }
+}
+
+/* ---------- header ---------- */
+.ms-head { grid-area: head; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 1.5em; }
+.ms-brand h1 { margin: 0; font-size: 1.75em; letter-spacing: 0.01em; line-height: 1.1; }
+.ms-brand-sub { color: var(--text-dim); font-size: 1em; }
+.ms-caption {
+  justify-self: center; text-align: center; display: flex; flex-direction: column; gap: 0.15em;
+  padding: 0.35em 1.4em; border-radius: 0.6em; border: 2px solid transparent; min-width: 0; max-width: 100%;
+}
+.ms-caption-active { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.ms-caption-scenario { font-size: 0.95em; font-weight: 700; color: var(--accent); text-transform: uppercase; letter-spacing: 0.08em; }
+.ms-caption-paused {
+  margin-left: 0.7em; padding: 0.05em 0.5em; border-radius: 0.3em; background: var(--warn); color: #1a1000; letter-spacing: 0.04em;
+}
+.ms-caption-step { font-size: 1.85em; font-weight: 800; line-height: 1.1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; animation: ms-rise 0.5s ease-out; }
+@keyframes ms-rise { from { opacity: 0; transform: translateY(0.4em); } to { opacity: 1; transform: none; } }
+.ms-head-right { display: flex; align-items: center; gap: 1em; }
+.ms-sim {
+  background: var(--sim); color: var(--sim-text); font-weight: 900; letter-spacing: 0.08em; font-size: 1.05em;
+  padding: 0.4em 0.85em; border-radius: 0.35em; border: 2px solid rgba(0, 0, 0, 0.25); white-space: nowrap;
+}
+.ms-conn { display: inline-flex; align-items: center; gap: 0.45em; font-weight: 700; font-size: 1em; color: var(--text-dim); }
+.ms-conn i { width: 0.8em; height: 0.8em; border-radius: 50%; background: currentColor; }
+.ms-conn-live { color: var(--ok); }
+.ms-conn-connecting, .ms-conn-reconnecting, .ms-conn-polling { color: var(--warn); }
+.ms-conn-offline { color: var(--bad); }
+
+/* ---------- map ---------- */
+.ms-hero { grid-area: hero; min-height: 0; min-width: 0; }
+.ms-map { position: relative; width: 100%; height: 100%; }
+.ms-map-svg, .ms-map-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.ms-map-canvas { pointer-events: none; }
+.ms-sphere { fill: var(--ms-ocean); stroke: var(--ms-land-edge); stroke-width: 0.6; }
+.ms-graticule { fill: none; stroke: var(--ms-grid); stroke-width: 0.6; }
+.ms-land { fill: var(--ms-land); stroke: var(--ms-land-edge); stroke-width: 0.35; }
+.ms-land-hi { fill: var(--ms-land-hi); stroke: var(--ms-land-edge); stroke-width: 0.5; }
+.ms-route { fill: none; stroke-linecap: round; stroke-linejoin: round; transition: stroke-width 1s ease, opacity 1s ease, stroke 0.6s; }
+.ms-route-muted { stroke: var(--ms-muted); opacity: 0.45; stroke-dasharray: 3 5; }
+
+.ms-city { fill: var(--text); }
+.ms-city-ring { fill: none; stroke: var(--text); stroke-width: 1.2; opacity: 0.45; }
+.ms-city-label, .ms-hub-name, .ms-hub-pill text {
+  font-family: var(--font); paint-order: stroke; stroke: var(--ms-halo); stroke-linejoin: round;
+}
+.ms-city-label { font-size: 13px; font-weight: 700; fill: var(--text); stroke-width: 3.5px; }
+.ms-city-ccy { fill: var(--text-dim); font-weight: 600; }
+
+.ms-hub { color: var(--accent); }
+.ms-hub-halo { fill: color-mix(in srgb, currentColor 18%, transparent); stroke: currentColor; stroke-width: 2.2; transition: stroke 0.4s, fill 0.4s; }
+.ms-hub-core { fill: currentColor; transition: fill 0.4s; }
+.ms-hub-x { stroke: var(--bg); stroke-width: 2.6; stroke-linecap: round; }
+.ms-hub-name { font-size: 15px; font-weight: 900; letter-spacing: 0.06em; fill: currentColor; stroke-width: 4px; }
+.ms-hub-pill rect { fill: currentColor; }
+.ms-hub-pill text { font-size: 19px; font-weight: 900; letter-spacing: 0.05em; fill: #fff; stroke: none; }
+.ms-hub-pill-big text { font-size: 25px; }
+.ms-hub-half-open .ms-hub-pill text, .ms-hub-recovered .ms-hub-pill text { fill: #141000; }
+.ms-hub-open .ms-hub-halo { stroke-width: 3; }
+.ms-hub-open .ms-hub-core { r: 10px; }
+.ms-hub-alert {
+  fill: none; stroke: currentColor; stroke-width: 3;
+  transform-box: fill-box; transform-origin: center;
+  animation: ms-ring 1.4s ease-out infinite;
+}
+.ms-hub-half-open .ms-hub-alert { animation-duration: 2.2s; }
+@keyframes ms-ring { from { transform: scale(1); opacity: 0.9; } to { transform: scale(3.2); opacity: 0; } }
+.ms-hub-open .ms-hub-pill { animation: ms-blink 1s ease-in-out infinite alternate; }
+@keyframes ms-blink { from { opacity: 1; } to { opacity: 0.55; } }
+
+/* The one thing the map shouts: breaker open / failing / probing / recovered. */
+.ms-alert {
+  position: absolute; top: 0.6em; left: 50%; transform: translateX(-50%); z-index: 2;
+  display: flex; flex-direction: column; align-items: center; gap: 0.1em; text-align: center;
+  padding: 0.45em 1.6em 0.55em; border-radius: 0.6em; border: 0.18em solid currentColor;
+  background: color-mix(in srgb, currentColor 16%, var(--bg)); box-shadow: 0 0.4em 1.6em rgba(0, 0, 0, 0.35);
+  max-width: 92%; animation: ms-drop 0.45s ease-out;
+}
+.ms-alert-head { font-size: 2.6em; font-weight: 900; letter-spacing: 0.04em; line-height: 1.05; white-space: nowrap; }
+.ms-alert-sub { font-size: 1.3em; font-weight: 700; color: var(--text); }
+.ms-alert-open { color: var(--bad); }
+.ms-alert-open .ms-alert-head { animation: ms-blink 1s ease-in-out infinite alternate; }
+.ms-alert-failing { color: var(--bad); }
+.ms-alert-half-open { color: var(--warn); }
+.ms-alert-recovered { color: var(--ok); }
+@keyframes ms-drop { from { opacity: 0; transform: translate(-50%, -0.6em); } to { opacity: 1; transform: translate(-50%, 0); } }
+
+.ms-focus {
+  position: absolute; right: 0.6em; bottom: 0.4em; z-index: 2; font-size: 1em; font-weight: 600;
+  padding: 0.3em 0.8em; border-radius: 0.4em; border: 1px solid var(--text-dim);
+  background: color-mix(in srgb, var(--bg) 80%, transparent); color: var(--text-dim);
+}
+.ms-focus b { color: var(--text); font-family: ui-monospace, Consolas, monospace; }
+
+.ms-legend {
+  position: absolute; left: 0.6em; bottom: 0.4em; display: flex; flex-wrap: wrap; gap: 0.4em 1.1em;
+  font-size: 0.95em; color: var(--text-dim); font-weight: 600;
+  background: color-mix(in srgb, var(--bg) 70%, transparent); padding: 0.3em 0.7em; border-radius: 0.4em;
+}
+.ms-legend-item { display: inline-flex; align-items: center; gap: 0.4em; }
+.ms-legend-item i { width: 0.75em; height: 0.75em; border-radius: 50%; display: inline-block; }
+.ms-legend-ok { border: 0.15em solid var(--ok); background: transparent; }
+.ms-legend-bad { background: var(--bad); }
+
+/* ---------- side panel ---------- */
+.ms-side { grid-area: side; display: flex; flex-direction: column; gap: 0.9em; min-height: 0; }
+.ms-kpis { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6em; }
+.ms-kpi {
+  display: flex; flex-direction: column; padding: 0.5em 0.8em; border-radius: 0.6em;
+  background: var(--bg-elev); border: 1px solid var(--border);
+}
+.ms-kpi-value { font-size: 2.3em; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.05; }
+.ms-kpi-label { font-size: 0.95em; color: var(--text-dim); font-weight: 600; }
+.ms-kpi-info .ms-kpi-value { color: var(--accent); }
+.ms-kpi-ok .ms-kpi-value { color: var(--ok); }
+.ms-kpi-warn .ms-kpi-value { color: var(--warn); }
+.ms-kpi-bad .ms-kpi-value { color: var(--bad); }
+.ms-ledger {
+  grid-column: 1 / -1; display: flex; align-items: center; gap: 0.6em; padding: 0.5em 0.9em;
+  border-radius: 0.6em; border: 3px solid var(--border); background: var(--bg-elev);
+}
+.ms-ledger-mark { font-size: 3.2em; font-weight: 900; line-height: 1; }
+.ms-ledger-text { display: flex; flex-direction: column; min-width: 0; }
+.ms-ledger-title { font-size: 1.75em; font-weight: 900; line-height: 1.1; }
+.ms-ledger-sub { font-size: 0.95em; color: var(--text-dim); }
+.ms-ledger-ok { color: var(--ok); border-color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, var(--bg-elev)); }
+.ms-ledger-bad { color: var(--bad); border-color: var(--bad); background: color-mix(in srgb, var(--bad) 14%, var(--bg-elev)); }
+
+.ms-providers {
+  flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 0.55em;
+  background: var(--bg-elev); border: 1px solid var(--border); border-radius: 0.6em; padding: 0.7em 0.9em;
+}
+.ms-panel-title { margin: 0; font-size: 1.25em; display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.2em 0.6em; }
+.ms-panel-title span { font-size: 0.72em; color: var(--text-dim); font-weight: 600; }
+.ms-prov { padding: 0.45em 0.6em; border-radius: 0.5em; border: 2px solid transparent; transition: border-color 0.4s, background 0.4s; }
+.ms-prov-head { display: flex; align-items: center; gap: 0.5em; }
+.ms-prov-swatch { width: 0.9em; height: 0.9em; border-radius: 50%; flex: none; }
+.ms-prov-name { font-size: 1.35em; font-weight: 800; }
+.ms-prov-state { font-size: 0.9em; font-weight: 900; letter-spacing: 0.04em; white-space: nowrap; }
+.ms-prov-pct { margin-left: auto; font-size: 1.5em; font-weight: 800; font-variant-numeric: tabular-nums; }
+.ms-prov-bar { margin-top: 0.3em; height: 0.85em; border-radius: 999px; background: var(--bg-elev-2); border: 1px solid var(--border); overflow: hidden; }
+.ms-prov-bar span { display: block; height: 100%; border-radius: 999px; transition: width 0.8s ease, background 0.4s; }
+.ms-prov-detail { margin-top: 0.2em; font-size: 0.9em; color: var(--text-dim); min-height: 1.25em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ms-prov-open { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 13%, transparent); }
+.ms-prov-half-open { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 11%, transparent); }
+.ms-prov-failing { border-color: color-mix(in srgb, var(--bad) 60%, transparent); }
+.ms-prov-recovered { border-color: var(--ok); background: color-mix(in srgb, var(--ok) 10%, transparent); }
+
+/* ---------- pipeline (reuses PipelineStrip; resized in em for the stage) ---------- */
+.ms-pipe { grid-area: pipe; }
+.ms-pipe .pipeline { gap: 0.8em; }
+.ms-pipe .stages { gap: 0.9em; }
+.ms-pipe .stage, .ms-pipe .offpath-tile { padding: 0.35em 0.3em; border-radius: 0.6em; }
+.ms-pipe .stage:not(:last-child)::after { right: -0.95em; width: 0.9em; }
+.ms-pipe .stage-num { width: 1.5em; height: 1.5em; font-size: 0.85em; }
+.ms-pipe .stage-title { font-size: 1em; margin-top: 0.15em; }
+.ms-pipe .stage-detail { font-size: 0.8em; }
+.ms-pipe .stage-count { font-size: 1.7em; margin-top: 0; }
+.ms-pipe .offpath { width: 15em; gap: 0.4em; }
+.ms-pipe .offpath-tile { padding: 0.2em; }
+.ms-pipe .offpath-tile .stage-title { font-size: 0.85em; margin-top: 0; }
+.ms-pipe .offpath-tile .stage-count { font-size: 1.2em; }
+.ms-pipe .stage-pulse { border-radius: 0.6em; }
+
+/* ---------- reset ---------- */
+.ms-hero, .ms-side, .ms-pipe { transition: opacity 0.6s ease, filter 0.6s ease; }
+.ms-is-resetting .ms-hero, .ms-is-resetting .ms-side, .ms-is-resetting .ms-pipe { opacity: 0.25; filter: grayscale(0.8); }
+.ms-veil { position: absolute; inset: 0; z-index: 5; display: grid; place-items: center; pointer-events: none; }
+.ms-veil-box {
+  display: flex; flex-direction: column; align-items: center; gap: 0.5em; text-align: center;
+  padding: 1.6em 3em; border-radius: 1em; background: var(--bg-elev); border: 2px solid var(--border);
+  box-shadow: 0 1em 3em rgba(0, 0, 0, 0.4);
+}
+.ms-veil-box h2 { margin: 0; font-size: 2.6em; }
+.ms-veil-box p { margin: 0; font-size: 1.3em; color: var(--text-dim); }
+.ms-veil-back .ms-veil-box { border-color: var(--ok); }
+.ms-veil-back h2 { color: var(--ok); }
+.ms-veil-spinner {
+  width: 3em; height: 3em; border-radius: 50%; border: 0.35em solid var(--border); border-top-color: var(--accent);
+  animation: ms-spin 1.1s linear infinite;
+}
+@keyframes ms-spin { to { transform: rotate(360deg); } }
+
+@media (max-width: 1100px) {
+  .ms-pipe .stages { grid-template-columns: repeat(8, minmax(0, 1fr)); }
+  .ms-pipe .pipeline { flex-direction: row; }
+  .ms-pipe .offpath { width: 15em; grid-template-columns: 1fr 1fr; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ms-hub-alert { animation: none; opacity: 0.7; transform: scale(1.8); }
+  .ms-hub-open .ms-hub-pill, .ms-alert, .ms-alert-open .ms-alert-head, .ms-caption-step { animation: none; }
+  .ms-veil-spinner { animation-duration: 4s; }
+  .ms-hero, .ms-side, .ms-pipe { transition: none; }
+  .ms-route, .ms-prov-bar span { transition: none; }
+}

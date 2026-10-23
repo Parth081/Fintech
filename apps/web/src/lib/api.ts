@@ -1,7 +1,9 @@
 // Same-origin HTTP helpers (served by the gateway, or proxied by the vite dev server).
-import type { AccountBalance, JournalView, TrialBalance } from '@ct/contracts/browser';
+import type { AccountBalance, JournalView, OrchestratorState, PacePreset, TrialBalance } from '@ct/contracts/browser';
 import type {
   FxCorridorRates,
+  GatewayControlView,
+  Health,
   IsoMessage,
   PaymentDetail,
   PaymentSummary,
@@ -115,6 +117,9 @@ function isMessage(m: unknown): boolean {
   if (o.kind === 'snapshot') return Array.isArray(o.payments) && hasStats;
   if (o.kind === 'update') return Array.isArray(o.payments) && typeof o.counts === 'object' && o.counts !== null && hasStats;
   if (o.kind === 'stats') return hasStats;
+  if (o.kind === 'control') return typeof o.view === 'object' && o.view !== null && typeof (o.view as Record<string, unknown>).control === 'object';
+  if (o.kind === 'reset') return typeof o.startedAt === 'string';
+  if (o.kind === 'focus') return o.paymentId === null || typeof o.paymentId === 'string';
   return false;
 }
 
@@ -131,6 +136,39 @@ export function parseFrame(data: string): ServerMessage[] {
     return [];
   }
 }
+
+// ---- M3 control plane ---------------------------------------------------------------------
+
+export const fetchHealth = (signal?: AbortSignal) => getJson<Health>('/health', signal);
+export const fetchControl = (fresh = false, signal?: AbortSignal) =>
+  getJson<GatewayControlView>(`/api/control/state${fresh ? '?fresh=1' : ''}`, signal);
+
+async function postJson<T>(path: string, body: unknown, timeoutMs = 8000): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify(body ?? {}),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    throw new ApiError(err instanceof Error && err.name === 'TimeoutError' ? 'Request timed out' : 'Gateway unreachable', 0);
+  }
+  if (!res.ok) throw new ApiError(await readError(res), res.status);
+  return (await res.json().catch(() => ({}))) as T;
+}
+
+const orch = (path: string) => `/api/control/orchestrator${path}`;
+export const startScenario = (id: string) => postJson<{ runId: string }>(orch(`/scenarios/${encodeURIComponent(id)}/start`), {});
+export const stopScenario = () => postJson<{ stopped: boolean }>(orch('/scenarios/stop'), {});
+export const setAmbient = (rate: number) => postJson<OrchestratorState>(orch('/ambient'), { rate });
+export const setPace = (preset: PacePreset) => postJson<OrchestratorState>(orch('/pace'), { preset });
+export const setPaused = (paused: boolean) => postJson<OrchestratorState>(orch('/pause'), { paused });
+/** Long timeout: the launcher stops, wipes and restarts everything (and usually kills this request). */
+export const requestReset = () => postJson<{ ok: boolean; durationMs?: number }>('/api/control/reset', {}, 25_000);
+/** Ask every screen to open (or close) a payment's drawer. */
+export const focusPayment = (paymentId: string | null) => postJson<{ ok: boolean; screens: number }>('/api/control/focus', { paymentId });
 
 /** Exponential backoff with jitter, capped. attempt starts at 0. */
 export function backoffMs(attempt: number, base = 500, cap = 10_000, random = Math.random): number {

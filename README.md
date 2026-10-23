@@ -7,10 +7,11 @@ reason for every decision visible on screen.
 > **Simulation · synthetic data · runs offline.** No real customers, banks, providers or money. Provider
 > names (Orion, Lyra, Vega), rails and corridors are fictional.
 
-This repository is at **Milestone M2 - money core**: a real double-entry ledger, simulated FX rates and
-spreads, routing with retries over three fictional providers, a settlement simulator speaking ISO 20022,
-reconciliation, and a verification tool that proves 10,000 payments balance with no duplicates
-(see [M2 - Money core](#m2---money-core)). M1 (walking skeleton) is described below it as before. The
+This repository is at **Milestone M3 - first scenario live**: a scripted provider outage, circuit breakers
+with automatic failover, a world map and pipeline view, a presenter console, and a 10-second reset
+(see [M3 - First scenario live](#m3---first-scenario-live)). Below it, **M2 - money core** (a real
+double-entry ledger, simulated FX, routing with retries over three fictional providers, ISO 20022 settlement,
+reconciliation, the 10,000-payment proof) and M1 (walking skeleton) are described as before. The
 end-to-end picture and the roadmap are in [`fintech-control-tower.drawio`](fintech-control-tower.drawio)
 (open with [diagrams.net](https://app.diagrams.net) or the VS Code Draw.io extension).
 
@@ -46,10 +47,12 @@ Requires Node.js 22+ (`.nvmrc` pins 24). No Docker, database or internet needed 
 
 ```bash
 npm install          # once (needs network); afterwards everything runs offline
-npm start            # builds the UI if needed, starts all 10 processes (broker, api, 6 stages, ledger, gateway)
+npm start            # builds the UI if needed, starts all 11 processes (broker, api, 6 stages, ledger, orchestrator, gateway)
 ```
 
 Open **http://127.0.0.1:7072**, click **Send test payment**, and watch it go from *initiated* to *settled*.
+Ambient traffic (3 payments/s, `--ambient 0` to turn it off) keeps the screens alive; the presenter console
+is at **http://127.0.0.1:7072/#/presenter** (start the outage scenario, change the pace, **Reset**).
 
 In a second terminal, send seeded synthetic traffic:
 
@@ -64,11 +67,13 @@ Stop everything with **Ctrl+C** (all child processes are stopped, none are left 
 
 | Script | What it does |
 | --- | --- |
-| `npm start` | Launcher: builds the UI if `apps/web/dist` is missing, checks ports, starts broker → payment-api + 6 stages + ledger → gateway, waits for each to be healthy, prints the URL. `npm start -- --help` lists options. |
+| `npm start` | Launcher: builds the UI if `apps/web/dist` is missing, checks ports, starts broker + ledger → payment-api, 6 stages, gateway → orchestrator (in parallel where possible), waits for each to be healthy, serves the launcher control API (reset) on 7079, prints the URL. `npm start -- --help` lists options. |
 | `npm run start:reset` | Same, but deletes the data directory (event log) first. |
 | `npm run traffic -- [opts]` | Posts seeded synthetic payments to `POST /payments` (`--count`, `--seed`, `--rate`, `--scenario`, `--mix`, `--concurrency`, `--url`, `--start`, `--quiet`). Same seed = same payments = same Idempotency-Keys, so re-running is idempotent. Prints accepted / duplicates / errors. |
 | `npm run verify:m2 -- [opts]` | M2 proof at scale: launches everything, sends 10,000 payments, checks ledger balance, journals, duplicates, state machine, stuck payments; JSON report in `.data/reports`. See [M2](#m2---money-core). |
 | `npm run verify:m2:quick` | Same with 500 payments (~30 s). |
+| `npm run verify:m3 -- [opts]` | M3 Gate 2: runs the provider-outage scenario 10 times in a row (offline), checks breaker, failover, recovery, ledger and a < 10 s reset after each run; JSON report. See [M3](#m3---first-scenario-live). |
+| `npm run verify:m3:quick` | Same with 2 runs (~3 min, what CI runs). |
 | `npm run bench:broker` | Broker benchmark: publish / catch-up throughput, reload time, memory for 120k events. |
 | `npm run typecheck` | `tsc` over all packages, services, apps, tools and tests. |
 | `npm test` | Unit tests (vitest), excluding e2e. |
@@ -77,7 +82,8 @@ Stop everything with **Ctrl+C** (all child processes are stopped, none are left 
 | `npm run ci` | typecheck + test + build:web + test:e2e, as CI does. |
 
 Launcher options: `--reset`, `--no-build`, `--quiet`, `--host`, `--broker-port`, `--api-port`,
-`--gateway-port`, `--ledger-port`, `--data-dir`, `--stage-delay`, `--settlement-delay`, `--timeout`.
+`--gateway-port`, `--ledger-port`, `--orchestrator-port`, `--control-port`, `--no-control`, `--ambient`,
+`--data-dir`, `--stage-delay`, `--settlement-delay`, `--timeout`.
 
 ## Ports and environment
 
@@ -91,6 +97,8 @@ All defaults live in [`packages/contracts/src/config.ts`](packages/contracts/src
 | `PAYMENT_API_PORT` | `7071` | payment-api | `POST /payments`, `POST /payments/sample`, `GET /health` |
 | `GATEWAY_PORT` | `7072` | gateway | UI, API for the browser, live updates, `GET /health` |
 | `LEDGER_PORT` | `7073` | ledger | `GET /health`, `/ledger/trial-balance`, `/ledger/accounts`, `/ledger/journals?paymentId=`, `/ledger/invariants` |
+| `ORCHESTRATOR_PORT` | `7074` | orchestrator | Scenarios, ambient traffic, pace (`packages/contracts/src/orchestrator-api.ts`) |
+| `LAUNCHER_CONTROL_PORT` | `7079` | launcher | `GET /status`, `POST /reset` (only when started by `npm start`; `--control-port`) |
 | (vite dev) | `5173` | apps/web | `npm run dev -w @ct/web`, proxies `/api` and `/ws` to the gateway |
 | `BUS` | `local` | all | `local` (built-in broker), `memory` (single-process tests), `kafka` (Redpanda/Kafka) |
 | `BROKER_URL` | `ws://HOST:BROKER_PORT` | clients of the bus | Where the local broker is |
@@ -98,6 +106,9 @@ All defaults live in [`packages/contracts/src/config.ts`](packages/contracts/src
 | `PAYMENT_API_URL` | `http://HOST:PAYMENT_API_PORT` | gateway, traffic | Where the Payment API is |
 | `GATEWAY_URL` | `http://HOST:GATEWAY_PORT` | tools | Where the gateway is |
 | `LEDGER_URL` | `http://HOST:LEDGER_PORT` | gateway, tools | Where the ledger is |
+| `ORCHESTRATOR_URL` | `http://HOST:ORCHESTRATOR_PORT` | gateway | Where the orchestrator is (proxied under `/api/control/orchestrator/*`) |
+| `LAUNCHER_CONTROL_URL` | (empty) | gateway | Set by the launcher; empty (e.g. Docker) = reset unavailable, `POST /api/control/reset` answers 503 |
+| `AMBIENT_RATE` | `0` (`npm start`: 3) | orchestrator | Ambient payments per second while no scenario runs (`npm start -- --ambient <n>`) |
 | `DATABASE_URL` | (empty) | ledger | Postgres URL; empty = embedded PGlite in `DATA_DIR/ledger` (offline default, ADR 0005) |
 | `SIM_SEED` | `control-tower` | fx, routing, settlement | Seed for simulated rates and provider behaviour |
 | `PROVIDER_FAILURE_SCALE` | `1` | settlement | Scales provider reject rates; `0` disables failures |
@@ -115,13 +126,14 @@ services/broker/      built-in event broker: one topic, append-only log in DATA_
 services/payment-api/ validates requests, de-duplicates by Idempotency-Key, publishes payment.initiated
 services/stages/      screening, risk, fx, routing, settlement, reconciliation (one process each)
 services/ledger/      double-entry ledger service (PGlite offline / Postgres in Docker), HTTP API on 7073
+services/orchestrator/ scenarios (provider outage), ambient traffic, pacing; control events on the log; API on 7074
 packages/market/      simulated FX rates, spreads, provider catalogue and routing scores
 packages/iso20022/    pacs.008 / pacs.002 / camt.053 builders and validation
 services/gateway/     serves the UI, projects events into payment views, pushes live updates
 apps/web/             React UI (first basic screen)
-tools/launcher/       `npm start`: process supervisor (ordering, health, logs, clean shutdown)
+tools/launcher/       `npm start`: process supervisor (ordering, health, logs, clean shutdown, control API + reset)
 tools/traffic/        `npm run traffic`: seeded synthetic payment generator (v2: population, corridor mix, log-normal amounts)
-tools/verify/         `npm run verify:m2`: 10k-payment proof (balances, journals, duplicates, chaos)
+tools/verify/         `npm run verify:m2`: 10k-payment proof; `npm run verify:m3`: Gate 2 (outage scenario x10)
 tools/bench/          `npm run bench:broker`: broker performance benchmark
 tests/e2e/            end-to-end test (launches everything)
 deploy/               Dockerfile + docker-compose.yml (optional)
@@ -145,7 +157,7 @@ docker compose -f deploy/docker-compose.yml down -v                # stop and re
 ```
 
 One image (`deploy/Dockerfile`) runs every service; Compose starts broker, payment-api, each stage, the
-ledger, **Postgres 17** (`postgres:17-alpine`, volume `ledger-pg`, `pg_isready` health check) and the
+ledger, the orchestrator (7074, `AMBIENT_RATE` default 3), **Postgres 17** (`postgres:17-alpine`, volume `ledger-pg`, `pg_isready` health check) and the
 gateway, with health checks and a volume for the broker's data. In Docker the ledger uses Postgres via
 `DATABASE_URL`; with `npm start` it uses embedded PGlite, no server needed (ADR 0005). Broker, API,
 gateway and ledger ports are published on `127.0.0.1` only. The `redpanda` profile adds a single-node
@@ -155,6 +167,12 @@ Redpanda and switches the services to the Kafka adapter:
 BUS=kafka docker compose -f deploy/docker-compose.yml --profile redpanda up -d --build --wait
 BUS=kafka docker compose -f deploy/docker-compose.yml --profile redpanda down -v   # include the profile, or the redpanda volume stays
 ```
+
+**Reset is not available in Docker**: there is no launcher to stop and restart the containers, so
+`LAUNCHER_CONTROL_URL` is empty and the presenter console's Reset (`POST /api/control/reset`) answers 503.
+Start clean with `down -v` and `up` again. Scenarios, pace and ambient traffic work as with `npm start`;
+`npm run verify:m3 -- --url http://127.0.0.1:7072 --orchestrator-url http://127.0.0.1:7074 --runs 1` runs the
+scenario checks against the containers (no reset, so check h is skipped).
 
 In Kafka mode the local broker container idles, so `verify:m2 --url` (which reads the broker's `/events`)
 does not apply; Kafka-side duplicate protection is described in ADR 0006.
@@ -169,15 +187,17 @@ npm run build:web
 npm run test:e2e         # whole system on temp ports + temp data dir, zero delays
 ```
 
-CI (`.github/workflows/ci.yml`) runs typecheck, tests, UI build and e2e on Node 22 and 24, and validates the
-Compose file with `docker compose config`.
+CI (`.github/workflows/ci.yml`) runs typecheck, tests, UI build and e2e on Node 22 and 24, `verify:m2`
+(500 payments, plus a chaos run), `verify:m3 --runs 2`, and validates the Compose file with `docker compose config`.
 
 ## Troubleshooting
 
 - **"Cannot start: port(s) busy."** Another copy is probably still running. Stop it, or find the process:
   Windows `netstat -ano | findstr :7072` then `taskkill /PID <pid> /F`; macOS/Linux `lsof -i :7072`. Or use
   other ports: `npm start -- --broker-port 7170 --api-port 7171 --gateway-port 7172`.
-- **Odd state or old payments on screen.** `npm run start:reset` deletes `.data/` and starts clean.
+- **Odd state or old payments on screen.** Press **Reset** in the presenter console (or
+  `curl -X POST http://127.0.0.1:7079/reset`): everything restarts clean in about 5 s. Or stop and run
+  `npm run start:reset`.
 - **"did not become ready within … ms".** The launcher names the service and prints its last log lines.
   Raise the limit with `npm start -- --timeout 60000` if the machine is slow.
 - **Blank page at :7072.** The UI was not built: run `npm run build:web` (the launcher does this
@@ -258,3 +278,74 @@ It writes `DATA_DIR/reports/verify-m2-<time>.json` and exits non-zero if any che
 | gateway | 7072 | UI + browser API |
 | ledger | 7073 | ledger HTTP API (`packages/contracts/src/ledger-api.ts`) |
 | postgres | (internal) | Docker only; offline the ledger uses PGlite in `DATA_DIR/ledger` |
+
+## M3 - First scenario live
+
+**Done when (Gate 2): the provider-outage scenario runs offline 10 times in a row, and the ledger balances.**
+Proven by `npm run verify:m3`.
+
+### The story (provider-outage, about 72 s)
+
+1. **Normal day.** Ambient payments flow on the three corridors (US-IN, GB-PH, DE-BR), and most of them go
+   through **Orion**, the fastest provider.
+2. **Orion goes down** (+10 s). The orchestrator publishes `control.provider_outage.started` on the payment
+   log ([ADR 0008](docs/adr/0008-control-events-on-the-payment-log.md)). Settlement rejects every Orion
+   instruction from then on, and those payments retry on Lyra or Vega (ADR 0007).
+3. **Breaker trips, traffic re-routes** (a few seconds later). Orion's **circuit breaker** opens. Routing stops sending
+   first attempts to Orion (`CIRCUIT_OPEN`) and the world map shows the traffic moving.
+4. **Orion comes back** (+35 s). The breaker goes **half-open** and lets a few probe payments through. One
+   success closes it ([ADR 0009](docs/adr/0009-circuit-breakers-and-reset.md)).
+5. **Back to normal, and the ledger proves it.** Traffic returns to Orion. Every payment is terminal and
+   the trial balance is still balanced to the cent.
+
+### Running it
+
+```bash
+npm start                                   # 11 processes + launcher control API; ambient traffic 3/s
+```
+
+- **Presenter console:** http://127.0.0.1:7072/#/presenter. Start the scenario, follow the narration for
+  each step, change the pace (normal / slow / fast; delays only, never decisions), pause, adjust ambient
+  traffic, **Reset**.
+- **Reset in about 5 s** (target < 10 s): stops every service, deletes the data dir and starts everything
+  again (no UI rebuild). From a terminal: `curl -X POST http://127.0.0.1:7079/reset`, which answers
+  `{ ok, durationMs, phases, ready }`. `GET http://127.0.0.1:7079/status` lists the services. A second reset
+  while one is running gets 409. Reset is not available in Docker (503); see [Docker](#docker-optional).
+- Orchestrator API on **7074** (`packages/contracts/src/orchestrator-api.ts`), for example
+  `curl -X POST http://127.0.0.1:7074/scenarios/provider-outage/start`.
+
+### Proving it: `npm run verify:m3`
+
+```bash
+npm run verify:m3                    # 10 runs, launches its own system (ports 27170-27174, control 27179)
+npm run verify:m3 -- --runs 2        # quick (what CI runs; also: npm run verify:m3:quick)
+npm run verify:m3 -- --help
+```
+
+It launches the whole system on non-default ports with a temp data dir, the PGlite ledger, ambient traffic
+at 3/s and the normal stage delays, all on 127.0.0.1 with no internet. Then, for each run: it starts the
+scenario, reads the broker's `/events` until `control.scenario.ended`, waits until Orion carries normal
+traffic again, stops ambient traffic, lets in-flight payments finish, checks, and finally `POST /reset`
+(timed):
+
+| | check |
+| --- | --- |
+| a | the run's control events are in order (started → steps → outage started → outage ended → ended); no outage left open |
+| b | Orion's breaker opened during the outage: a routing decision excluded it with `CIRCUIT_OPEN` within **10 s** of the outage start (`--breaker-bound`) |
+| c | from then until the first half-open sign, no first-attempt payment was routed to Orion; and none while the breaker, recomputed from the log (`@ct/market breakerFor` at the decision's `breakerAsOf`), was open |
+| d | Orion got traffic again after recovery: first-attempt routes beyond the probes, and settlements |
+| e | every payment terminal, zero duplicate eventIds, every history a valid state-machine walk, ≤ 3 attempts |
+| f | ledger trial balance balanced, invariants ok, exactly one journal per reconciled payment |
+| g | gateway `rejectedEvents = 0` |
+| h | the reset took < 10 s (`--max-reset`), and the system came back empty and healthy |
+
+It prints a table with one row per run, plus a summary, writes `<data dir>/reports/verify-m3-<time>.json`
+(the temp dir is kept for the report; `--report-dir` to choose), and exits non-zero if any check fails.
+
+### M3 ports
+
+| Service | Port | Notes |
+| --- | --- | --- |
+| orchestrator | 7074 | scenarios, ambient traffic, pace (`ORCHESTRATOR_PORT`) |
+| launcher control | 7079 | `GET /status`, `POST /reset` (`LAUNCHER_CONTROL_PORT`; only with `npm start`) |
+| verify:m3 | 27170-27174, 27179 | its own system (`--base-port`) |

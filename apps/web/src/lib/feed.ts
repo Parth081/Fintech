@@ -64,6 +64,7 @@ export function applyMessage(state: FeedState, msg: ServerMessage): FeedState {
     return { ...state, payments: [...msg.payments].sort(byNewest).slice(0, MAX_ROWS), stats: msg.stats, lastBatch: [] };
   }
   if (msg.kind === 'stats') return { ...state, stats: msg.stats };
+  if (msg.kind !== 'update') return state; // control-plane messages are handled by useLiveFeed
   const seq = state.seq + 1;
   const last = msg.payments.at(-1);
   return {

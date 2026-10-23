@@ -6,9 +6,17 @@
 #   npm run verify:m2 -- --url http://127.0.0.1:7072 --count 500     # optional: prove it
 #   docker compose -f deploy/docker-compose.yml down -v               # stop + delete volumes
 #
-# Ports published on 127.0.0.1 only: broker 7070, payment-api 7071, gateway 7072, ledger 7073.
+# Ports published on 127.0.0.1 only: broker 7070, payment-api 7071, gateway 7072, ledger 7073,
+# orchestrator 7074 (scenarios, ambient traffic, presenter API).
 # Unlike `npm start` (embedded PGlite under DATA_DIR/ledger), the ledger here uses the `postgres`
 # service through DATABASE_URL (ADR 0005).
+#
+# M3: the presenter console works here too (http://127.0.0.1:7072/#/presenter: scenarios, pace,
+# ambient traffic), but RESET IS NOT AVAILABLE in Docker: there is no launcher process to stop and
+# restart the services, so LAUNCHER_CONTROL_URL is empty and POST /api/control/reset answers 503.
+# To start from a clean slate in Docker, recreate the stack:
+#   docker compose -f deploy/docker-compose.yml down -v && docker compose -f deploy/docker-compose.yml up -d --wait
+# Ambient payments per second while no scenario runs: AMBIENT_RATE (default 3; 0 = off).
 #
 # Redpanda / Kafka profile:
 #   BUS=kafka docker compose -f deploy/docker-compose.yml --profile redpanda up --build
@@ -33,12 +41,17 @@ x-service: &service
     PAYMENT_API_PORT: "7071"
     GATEWAY_PORT: "7072"
     LEDGER_PORT: "7073"
+    ORCHESTRATOR_PORT: "7074"
     BUS: ${BUS:-local}
     BROKER_URL: ws://broker:7070
     KAFKA_BROKERS: redpanda:9092
     PAYMENT_API_URL: http://payment-api:7071
     GATEWAY_URL: http://gateway:7072
     LEDGER_URL: http://ledger:7073
+    ORCHESTRATOR_URL: http://orchestrator:7074
+    # No launcher in Docker: reset is unavailable (the gateway answers 503).
+    LAUNCHER_CONTROL_URL: ""
+    AMBIENT_RATE: ${AMBIENT_RATE:-3}
     DATA_DIR: /data
     STAGE_DELAY_MS: ${STAGE_DELAY_MS:-400}
     SETTLEMENT_DELAY_MS: ${SETTLEMENT_DELAY_MS:-900}
@@ -159,6 +172,28 @@ services:
       retries: 30
       start_period: 5s
 
+  # M3: scenarios (provider outage), ambient traffic and presentation pacing. Publishes control
+  # events on the payment log and posts ambient payments to the payment API.
+  orchestrator:
+    <<: *service
+    command: ["services/orchestrator/src/index.ts"]
+    depends_on:
+      broker:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+        required: false
+      payment-api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:7074:7074"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7074/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
   gateway:
     <<: *service
     command: ["services/gateway/src/index.ts"]
@@ -166,6 +201,8 @@ services:
       payment-api:
         condition: service_healthy
       ledger:
+        condition: service_healthy
+      orchestrator:
         condition: service_healthy
     ports:
       - "127.0.0.1:7072:7072"

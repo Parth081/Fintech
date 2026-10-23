@@ -12,6 +12,11 @@ export interface LauncherArgs {
   paymentApiPort: number;
   gatewayPort: number;
   ledgerPort: number;
+  orchestratorPort: number;
+  /** Launcher control API port (GET /status, POST /reset); null = --no-control. */
+  controlPort: number | null;
+  /** Ambient payments per second from the orchestrator. */
+  ambientRate: number;
   dataDir: string;
   stageDelayMs: number;
   settlementDelayMs: number;
@@ -20,7 +25,8 @@ export interface LauncherArgs {
 
 export const LAUNCHER_USAGE = `Usage: npm start [-- options]
 
-Starts the whole Control Tower on this machine (broker, payment-api, 6 stages, ledger, gateway + UI).
+Starts the whole Control Tower on this machine (broker, payment-api, 6 stages, ledger, orchestrator,
+gateway + UI) and the launcher control API (reset) on 127.0.0.1.
 
 Options:
   --reset                    Delete the data directory (event log) before starting
@@ -31,6 +37,10 @@ Options:
   --api-port <n>             (env PAYMENT_API_PORT, default 7071)
   --gateway-port <n>         (env GATEWAY_PORT, default 7072)
   --ledger-port <n>          (env LEDGER_PORT, default 7073)
+  --orchestrator-port <n>    (env ORCHESTRATOR_PORT, default 7074)
+  --control-port <n>         Launcher control API: GET /status, POST /reset (env LAUNCHER_CONTROL_PORT, default 7079)
+  --no-control               Do not start the control API (the UI's Reset button then answers 503)
+  --ambient <n>              Ambient payments per second while no scenario runs (env AMBIENT_RATE, default 3; 0 = off)
   --data-dir <dir>           (env DATA_DIR, default .data)
   --stage-delay <ms>         (env STAGE_DELAY_MS, default 400)
   --settlement-delay <ms>    (env SETTLEMENT_DELAY_MS, default 900)
@@ -63,6 +73,10 @@ export function parseLauncherArgs(argv: readonly string[], defaults = serviceCon
     paymentApiPort: defaults.paymentApiPort,
     gatewayPort: defaults.gatewayPort,
     ledgerPort: defaults.ledgerPort,
+    orchestratorPort: defaults.orchestratorPort ?? 7074,
+    controlPort: defaults.launcherControlPort ?? 7079,
+    // npm start shows a living system by default; tests and verify tools pass their own rate.
+    ambientRate: process.env.AMBIENT_RATE ? Number(process.env.AMBIENT_RATE) : 3,
     dataDir: defaults.dataDir,
     stageDelayMs: defaults.stageDelayMs,
     settlementDelayMs: defaults.settlementDelayMs,
@@ -114,6 +128,24 @@ export function parseLauncherArgs(argv: readonly string[], defaults = serviceCon
       case '--ledger-port':
         args.ledgerPort = toPort(flag, next());
         break;
+      case '--orchestrator-port':
+        args.orchestratorPort = toPort(flag, next());
+        break;
+      case '--control-port':
+        args.controlPort = toPort(flag, next());
+        break;
+      case '--no-control':
+        args.controlPort = null;
+        break;
+      case '--ambient': {
+        const v = next();
+        const n = Number(v);
+        if (v === undefined || v.startsWith('--') || !Number.isFinite(n) || n < 0 || n > 50) {
+          throw new Error(`--ambient must be a number of payments per second between 0 and 50, got "${v ?? ''}"`);
+        }
+        args.ambientRate = n;
+        break;
+      }
       case '--stage-delay':
         args.stageDelayMs = toInt(flag, next());
         break;
@@ -127,9 +159,16 @@ export function parseLauncherArgs(argv: readonly string[], defaults = serviceCon
         throw new Error(`Unknown option "${raw}". Run "npm start -- --help" for usage.`);
     }
   }
-  const ports = [args.brokerPort, args.paymentApiPort, args.gatewayPort, args.ledgerPort];
-  if (new Set(ports).size !== ports.length) {
-    throw new Error(`Ports must be different (broker ${ports[0]}, payment-api ${ports[1]}, gateway ${ports[2]}, ledger ${ports[3]})`);
+  const named: [string, number][] = [
+    ['broker', args.brokerPort],
+    ['payment-api', args.paymentApiPort],
+    ['gateway', args.gatewayPort],
+    ['ledger', args.ledgerPort],
+    ['orchestrator', args.orchestratorPort],
+    ...(args.controlPort !== null ? ([['control', args.controlPort]] as [string, number][]) : []),
+  ];
+  if (new Set(named.map(([, p]) => p)).size !== named.length) {
+    throw new Error(`Ports must be different (${named.map(([n, p]) => `${n} ${p}`).join(', ')})`);
   }
   return args;
 }

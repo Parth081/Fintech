@@ -16,6 +16,14 @@ export type {
   ProviderView,
   ProviderFailure,
   StatementRef,
+  Health,
+  GatewayControlView,
+  ControlMessage,
+  ResetMessage,
+  FocusMessage,
+  TrafficView,
+  ProviderTraffic,
+  RerouteBrief,
 } from '../../../../services/gateway/src/api-types';
 
 export type ConnectionStatus = 'connecting' | 'live' | 'reconnecting' | 'polling' | 'offline';

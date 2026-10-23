@@ -1,4 +1,4 @@
-import { hashFor, VIEW_LABELS, VIEWS, type View } from '../lib/route';
+import { hashFor, NAV_VIEWS, VIEW_LABELS, type View } from '../lib/route';
 import type { ConnectionStatus } from '../lib/types';
 
 const CONNECTION_TEXT: Record<ConnectionStatus, string> = {
@@ -14,10 +14,10 @@ export function Header({ connection, view }: { connection: ConnectionStatus; vie
     <header className="header">
       <div className="header-title">
         <h1>Global Fintech Control Tower</h1>
-        <span className="milestone">M2 money core</span>
+        <span className="milestone">M3 first scenario</span>
       </div>
       <nav className="nav" aria-label="Views">
-        {VIEWS.map((v) => (
+        {NAV_VIEWS.map((v) => (
           <a key={v} href={hashFor(v)} className={`nav-link${v === view ? ' nav-active' : ''}`} aria-current={v === view ? 'page' : undefined}>
             {VIEW_LABELS[v]}
           </a>

@@ -3,9 +3,12 @@ import { formatMoney } from '@ct/contracts/browser';
 import { fetchProviders } from '../lib/api';
 import { corridorLabel, formatClock, formatCount, formatDuration, formatPct, shortId } from '../lib/format';
 import { usePoll } from '../hooks/usePoll';
+import { BREAKER_LABEL, breakerSentence, outageSentence, providerStatusRows } from '../lib/control';
+import type { GatewayControlView } from '../lib/types';
 import { StatementViewer } from './StatementViewer';
 
-export function ProvidersView() {
+export function ProvidersView({ control = null }: { control?: GatewayControlView | null }) {
+  const status = providerStatusRows(control);
   const providers = usePoll(fetchProviders, 3000);
   const [statement, setStatement] = useState<{ providerId: string; date: string; currency: string } | null>(null);
   const close = useCallback(() => setStatement(null), []);
@@ -18,8 +21,20 @@ export function ProvidersView() {
           const observed = p.health?.successRate ?? p.observed.successRate;
           const catalogue = p.catalogue.baseSuccessRate;
           const below = observed !== null && catalogue !== null && observed < catalogue - 0.02;
+          const st = status.find((s) => s.providerId === p.providerId);
           return (
-            <section key={p.providerId} className="card">
+            <section key={p.providerId} className={`card${st?.outage || st?.breaker?.state === 'open' ? ' card-alert' : ''}`}>
+              {st && (st.breaker || st.outage) && (
+                <div className="badges">
+                  {st.breaker && (
+                    <span className={`badge tone-${st.tone}`} title={breakerSentence(st.breaker)}>
+                      Breaker {BREAKER_LABEL[st.breaker.state].toLowerCase()}
+                    </span>
+                  )}
+                  {st.outage && <span className="badge tone-bad">Outage · {st.outage.mode}</span>}
+                  <span className="badge-reason">{st.outage ? outageSentence(st.outage) : breakerSentence(st.breaker)}</span>
+                </div>
+              )}
               <div className="card-head">
                 <h2>{p.name}</h2>
                 <span className="tl-meta">
