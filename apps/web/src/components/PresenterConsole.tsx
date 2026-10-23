@@ -107,6 +107,15 @@ export function PresenterConsole({ live, onOpenPayment }: Props) {
       let health = null;
       try {
         health = await fetchHealth(AbortSignal.timeout(1500));
+        // The gateway restarts in ~2 s but the ledger and orchestrator take longer: only call the system
+        // "back" once those answer too, so the presenter can't start a scenario on a half-started system.
+        if (health.replayed) {
+          const [ledgerOk, orchOk] = await Promise.all([
+            fetch('/api/ledger/health', { signal: AbortSignal.timeout(1500) }).then((r) => r.ok, () => false),
+            fetch('/api/control/orchestrator/health', { signal: AbortSignal.timeout(1500) }).then((r) => r.ok, () => false),
+          ]);
+          if (!ledgerOk || !orchOk) health = { ...health, replayed: false };
+        }
       } catch {
         health = null;
       }
@@ -122,6 +131,22 @@ export function PresenterConsole({ live, onOpenPayment }: Props) {
   }, [resetting]);
 
   const back = reset.phase === 'back';
+  // A fresh ledger reading taken after the reset (the 2 s poll may still hold the pre-reset figures).
+  const [freshLedger, setFreshLedger] = useState<{ balanced: boolean; journals: number } | 'error' | null>(null);
+  useEffect(() => {
+    if (!back) {
+      setFreshLedger(null);
+      return;
+    }
+    let disposed = false;
+    fetchTrialBalance(AbortSignal.timeout(3000)).then(
+      (tb) => !disposed && setFreshLedger({ balanced: tb.balanced, journals: tb.journals }),
+      () => !disposed && setFreshLedger('error'),
+    );
+    return () => {
+      disposed = true;
+    };
+  }, [back]);
   const { refreshControl } = live;
   const { refresh: refreshLedger } = ledger;
   useEffect(() => {
@@ -349,11 +374,11 @@ export function PresenterConsole({ live, onOpenPayment }: Props) {
             <h2>✓ System is back</h2>
             <p>
               Reset took {formatDuration(reset.tookMs)}. Ledger:{' '}
-              {ledger.data
-                ? ledger.data.balanced
-                  ? `balanced (${formatCount(ledger.data.journals)} journals)`
+              {freshLedger && freshLedger !== 'error'
+                ? freshLedger.balanced
+                  ? `balanced (${formatCount(freshLedger.journals)} journals)`
                   : 'UNBALANCED'
-                : ledger.error
+                : freshLedger === 'error'
                   ? 'unavailable'
                   : 'checking…'}
             </p>

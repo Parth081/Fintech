@@ -116,7 +116,7 @@ export const PROVIDER_DEGRADED: ScenarioScript = {
   id: 'provider-degraded',
   title: 'Partial failure: Orion gets unreliable',
   description:
-    'Orion does not go down completely; it starts refusing about four in ten payments. The circuit breaker handles partial failure the same way as a full outage.',
+    'Orion does not go down completely; it starts refusing about six in ten payments. The circuit breaker handles partial failure the same way as a full outage.',
   durationMs: 48_000,
   steps: [
     {
