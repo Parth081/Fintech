@@ -1,15 +1,20 @@
-import type { AnyEvent } from '@ct/contracts';
+import type { AnyEvent, BusEvent } from '@ct/contracts';
 import type { DeliveryMeta, EventBus, EventHandler, SubscribeOptions, Subscription } from './types';
 
 /** Single-process bus for unit tests. Same delivery semantics as the real buses, no persistence. */
 export class InMemoryBus implements EventBus {
-  private readonly log: AnyEvent[] = [];
+  private readonly log: BusEvent[] = [];
   private readonly committed = new Map<string, number>();
   private readonly consumers = new Set<Consumer>();
   private closed = false;
 
-  get events(): readonly AnyEvent[] {
+  get events(): readonly BusEvent[] {
     return this.log;
+  }
+
+  /** Payment events only (control events filtered out). Test helper. */
+  get paymentEvents(): AnyEvent[] {
+    return this.log.filter((e): e is AnyEvent => !e.type.startsWith('control.'));
   }
 
   private readonly offsetsById = new Map<string, number>();
@@ -18,7 +23,7 @@ export class InMemoryBus implements EventBus {
     return this.log.length;
   }
 
-  async publish(event: AnyEvent): Promise<DeliveryMeta> {
+  async publish(event: BusEvent): Promise<DeliveryMeta> {
     if (this.closed) throw new Error('bus closed');
     const existing = this.offsetsById.get(event.eventId);
     if (existing !== undefined) return { offset: existing };
@@ -61,7 +66,7 @@ export class InMemoryBus implements EventBus {
   }
 
   /** @internal */
-  read(offset: number): AnyEvent | undefined {
+  read(offset: number): BusEvent | undefined {
     const e = this.log[offset];
     return e === undefined ? undefined : structuredClone(e);
   }

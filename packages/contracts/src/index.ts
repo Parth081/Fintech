@@ -6,3 +6,5 @@ export * from './ids';
 export * from './corridors';
 export * from './lifecycle';
 export * from './ledger-api';
+export * from './control';
+export * from './orchestrator-api';

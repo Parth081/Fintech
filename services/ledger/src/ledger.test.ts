@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { isBalanced } from '@ct/contracts';
+import { INITIAL_CONTROL_STATE } from '@ct/contracts';
 import { STAGE_STEPS } from '@ct/stages';
 import { classifyAccount } from './chart';
 import { CORRIDOR_CASES, settledPayment } from './fixtures';
@@ -80,7 +81,7 @@ describe('ledger step', () => {
   });
 
   const step = STAGE_STEPS.ledger[0]!;
-  const ctx = (services: object) => ({ now: new Date().toISOString(), services, view: { states: new Map() } });
+  const ctx = (services: object) => ({ now: new Date().toISOString(), services, view: { states: new Map() }, control: INITIAL_CONTROL_STATE });
 
   it('posts through the store and is idempotent on redelivery', async () => {
     const fx = settledPayment(CORRIDOR_CASES[2]!);

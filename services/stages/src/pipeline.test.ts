@@ -60,7 +60,7 @@ async function send(body: unknown = {}, path = '/payments/sample'): Promise<stri
   return ((await res.json()) as { paymentId: string }).paymentId;
 }
 
-const eventsOf = (paymentId: string) => bus.events.filter((e) => e.paymentId === paymentId);
+const eventsOf = (paymentId: string) => bus.paymentEvents.filter((e) => e.paymentId === paymentId);
 const stateOf = (paymentId: string): PaymentState | undefined => project(bus.events).states.get(paymentId);
 
 async function waitForStatus(paymentId: string, status: string, timeoutMs = 10_000): Promise<PaymentState> {

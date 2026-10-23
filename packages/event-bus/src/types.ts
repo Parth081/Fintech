@@ -1,11 +1,11 @@
-import type { AnyEvent } from '@ct/contracts';
+import type { BusEvent } from '@ct/contracts';
 
 export interface DeliveryMeta {
   /** Position of the event in the log (0-based, monotonically increasing). */
   offset: number;
 }
 
-export type EventHandler = (event: AnyEvent, meta: DeliveryMeta) => Promise<void> | void;
+export type EventHandler = (event: BusEvent, meta: DeliveryMeta) => Promise<void> | void;
 
 export interface SubscribeOptions {
   /** Consumer group name. Each group keeps its own committed offset. One active consumer per group in M1. */
@@ -35,7 +35,8 @@ export interface Subscription {
  *   offset (idempotent append), so retried publishes never create duplicates. (M2)
  */
 export interface EventBus {
-  publish(event: AnyEvent): Promise<DeliveryMeta>;
+  /** Payment events and (M3) control events share one ordered log. */
+  publish(event: BusEvent): Promise<DeliveryMeta>;
   /**
    * The offset the next published event will get (= number of events in the log). A consumer that has
    * processed every offset below head() has seen everything published before the call. (M2)

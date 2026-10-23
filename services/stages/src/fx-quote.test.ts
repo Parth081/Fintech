@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AnyEvent, PaymentState } from '@ct/contracts';
+import { INITIAL_CONTROL_STATE } from '@ct/contracts';
 import { quote } from '@ct/market';
 import { buildEvents, buildState } from '@ct/market/src/testing';
 import { buildEvent } from './runner';
@@ -8,7 +9,7 @@ import type { StepContext } from './steps';
 
 const T = Date.parse('2026-10-22T12:00:00.000Z');
 const step = fxSteps[0]!;
-const ctx = (now: string, seed?: string): StepContext => ({ now, services: seed ? { sim: { seed, providerFailureScale: 1 } } : {}, view: { states: new Map() } });
+const ctx = (now: string, seed?: string): StepContext => ({ now, services: seed ? { sim: { seed, providerFailureScale: 1 } } : {}, view: { states: new Map() }, control: INITIAL_CONTROL_STATE });
 
 function scoredFixture(corridorId: string, amountMinor: number): { trigger: AnyEvent; state: PaymentState } {
   const spec = { paymentId: `fx-${corridorId}-${amountMinor}`, corridorId, amountMinor, startMs: T, truncateAfter: 'payment.scored' as const };

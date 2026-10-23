@@ -10,6 +10,8 @@ import { performance } from 'node:perf_hooks';
 import {
   canApply,
   deterministicId,
+  isControlEvent,
+  type BusEvent,
   SCHEMA_VERSION,
   type AnyEvent,
   type PaymentState,
@@ -86,11 +88,12 @@ export async function startStage(name: PipelineStage, options: StageOptions): Pr
 
   /** The event this step would produce now, if (and only if) it is a valid, not-yet-done transition. */
   const services = options.services ?? {};
-  const plan = async (step: Step, trigger: AnyEvent, state: PaymentState | undefined) => {
+  const plan = async (step: Step, trigger: AnyEvent, offset: number, state: PaymentState | undefined) => {
     if (!state || !state.history.some((h) => h.eventId === trigger.eventId)) return null; // trigger itself was invalid
     const now = new Date().toISOString();
     const t0 = performance.now();
-    const outcome = await step.produce(trigger, state, { now, services, view: { states: projection.states } });
+    const control = projection.control.at(offset); // only control events before the trigger
+    const outcome = await step.produce(trigger, state, { now, services, view: { states: projection.states }, control });
     if (!outcome) return null;
     const latencyMs = Math.round((performance.now() - t0) * 1000) / 1000;
     const event = buildEvent(name, trigger, outcome, now, latencyMs);
@@ -100,18 +103,27 @@ export async function startStage(name: PipelineStage, options: StageOptions): Pr
     return event;
   };
 
-  const handle = async (trigger: AnyEvent, meta: DeliveryMeta) => {
+  /** Presenter pause (control.demo.paused): hold before acting; never changes what is decided. */
+  const waitWhilePaused = async () => {
+    while (projection.control.current().paused) await abortableSleep(100, abort.signal);
+  };
+
+  const handle = async (event: BusEvent, meta: DeliveryMeta) => {
+    if (isControlEvent(event)) return; // control events are read through the projection
+    const trigger = event;
     const relevant = steps.filter((s) => s.trigger === trigger.type);
     if (relevant.length === 0) return;
     await projection.waitFor(meta.offset);
     for (const step of relevant) {
-      if (!(await plan(step, trigger, projection.states.get(trigger.paymentId)))) continue; // idempotent by contract
-      const delay = step.delay === 'settlement' ? settlementDelayMs : stageDelayMs;
+      if (!(await plan(step, trigger, meta.offset, projection.states.get(trigger.paymentId)))) continue; // idempotent by contract
+      const speed = projection.control.current().speed; // presenter pacing overrides the process defaults
+      const delay = step.delay === 'settlement' ? speed?.settlementDelayMs ?? settlementDelayMs : speed?.stageDelayMs ?? stageDelayMs;
       const triggeredAt = Date.parse(trigger.occurredAt);
       const wait = Number.isFinite(triggeredAt) ? Math.min(delay, triggeredAt + delay - Date.now()) : delay;
       await abortableSleep(wait, abort.signal);
       if (abort.signal.aborted) throw new StoppedError();
-      const event = await plan(step, trigger, projection.states.get(trigger.paymentId)); // re-check after the delay
+      await waitWhilePaused();
+      const event = await plan(step, trigger, meta.offset, projection.states.get(trigger.paymentId)); // re-check after the delay
       if (!event) continue;
       await options.bus.publish(event);
       published.add(event.eventId);

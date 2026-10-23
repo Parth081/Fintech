@@ -8,6 +8,8 @@ export const PORTS = {
   paymentApi: 7071, // PAYMENT_API_PORT
   gateway: 7072, // GATEWAY_PORT
   ledger: 7073, // LEDGER_PORT
+  orchestrator: 7074, // ORCHESTRATOR_PORT (scenarios, ambient traffic, presenter API)
+  launcherControl: 7079, // LAUNCHER_CONTROL_PORT (reset; only when started by the launcher)
   webDev: 5173, // vite dev server (proxies /api and /ws to the gateway)
 } as const;
 
@@ -29,12 +31,16 @@ export function serviceConfig() {
   const paymentApiPort = envInt('PAYMENT_API_PORT', PORTS.paymentApi);
   const gatewayPort = envInt('GATEWAY_PORT', PORTS.gateway);
   const ledgerPort = envInt('LEDGER_PORT', PORTS.ledger);
+  const orchestratorPort = envInt('ORCHESTRATOR_PORT', PORTS.orchestrator);
+  const launcherControlPort = envInt('LAUNCHER_CONTROL_PORT', PORTS.launcherControl);
   return {
     host,
     brokerPort,
     paymentApiPort,
     gatewayPort,
     ledgerPort,
+    orchestratorPort,
+    launcherControlPort,
     /** 'local' (built-in broker, default), 'memory' (tests only, single process), 'kafka' (Redpanda/Kafka) */
     bus: env('BUS', 'local') as 'local' | 'memory' | 'kafka',
     brokerUrl: env('BROKER_URL', `ws://${host}:${brokerPort}`),
@@ -42,6 +48,11 @@ export function serviceConfig() {
     paymentApiUrl: env('PAYMENT_API_URL', `http://${host}:${paymentApiPort}`),
     gatewayUrl: env('GATEWAY_URL', `http://${host}:${gatewayPort}`),
     ledgerUrl: env('LEDGER_URL', `http://${host}:${ledgerPort}`),
+    orchestratorUrl: env('ORCHESTRATOR_URL', `http://${host}:${orchestratorPort}`),
+    /** Empty when not started by the launcher (e.g. Docker): reset is then unavailable. */
+    launcherControlUrl: env('LAUNCHER_CONTROL_URL', ''),
+    /** Ambient payments per second the orchestrator generates when idle (0 = none). */
+    ambientRate: Number(env('AMBIENT_RATE', '0')),
     /** Postgres connection string. Empty = embedded PGlite stored under `${dataDir}/ledger` (offline default). */
     databaseUrl: env('DATABASE_URL', ''),
     /** Seed for simulated markets and provider behaviour; same seed = same rates and outcomes. */

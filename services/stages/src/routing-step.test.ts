@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { applyEvent, canApply, type AnyEvent, type PaymentState } from '@ct/contracts';
+import { INITIAL_CONTROL_STATE } from '@ct/contracts';
 import { buildEvents, buildState, type PaymentSpec } from '@ct/market/src/testing';
 import { buildEvent } from './runner';
 import { HEALTH_LAG_MS, MAX_ROUTING_ATTEMPTS, routingSteps } from './steps/routing';
@@ -8,7 +9,7 @@ import type { Step, StepContext } from './steps';
 const T = Date.parse('2026-10-22T12:00:00.000Z');
 const onQuoted = routingSteps[0] as Step;
 const onFailed = routingSteps[1] as Step;
-const ctx = (states: ReadonlyMap<string, PaymentState> = new Map(), now = '2030-01-01T00:00:00.000Z'): StepContext => ({ now, services: {}, view: { states } });
+const ctx = (states: ReadonlyMap<string, PaymentState> = new Map(), now = '2030-01-01T00:00:00.000Z'): StepContext => ({ now, services: {}, view: { states }, control: INITIAL_CONTROL_STATE });
 
 function fixture(spec: PaymentSpec): { trigger: AnyEvent; state: PaymentState } {
   const events = buildEvents(spec);

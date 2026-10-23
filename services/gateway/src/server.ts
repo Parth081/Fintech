@@ -5,7 +5,7 @@ import { stat } from 'node:fs/promises';
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
-import type { AnyEvent, EventType, PaymentStatus } from '@ct/contracts';
+import { isControlEvent, type AnyEvent, type EventType, type PaymentStatus } from '@ct/contracts';
 import type { EventBus } from '@ct/event-bus';
 import { ALL_STATUSES, Projection, type PaymentFilter } from './projection';
 import { camt053For, defaultIso, defaultMarket, fxRates, providerViews, type IsoPort, type MarketPort } from './views';
@@ -295,6 +295,7 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
 
   const subscription = await bus.subscribe({ group: 'gateway', from: 'earliest', ephemeral: true }, (event, meta) => {
     // Never throw: a throwing handler would be retried forever.
+    if (isControlEvent(event)) return; // M3: control events are projected separately (gateway agent)
     try {
       const result = projection.apply(event);
       if (result.kind === 'applied') enqueue(result.event, result.summary);

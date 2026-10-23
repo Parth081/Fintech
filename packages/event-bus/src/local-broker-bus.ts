@@ -1,6 +1,6 @@
 // EventBus client for the local broker (services/broker). Protocol: services/broker/README.md.
 import WebSocket from 'ws';
-import type { AnyEvent } from '@ct/contracts';
+import type { BusEvent } from '@ct/contracts';
 import type { DeliveryMeta, EventBus, EventHandler, SubscribeOptions, Subscription } from './types';
 
 const PROTOCOL_VERSION = 2;
@@ -10,8 +10,8 @@ type BrokerMessage =
   | { op: 'ack'; reqId: number; offset: number; duplicate?: boolean }
   | { op: 'subscribed'; reqId: number; subId: number; start: number }
   | { op: 'unsubscribed'; reqId: number; subId: number }
-  | { op: 'deliver'; subId: number; offset: number; event: AnyEvent }
-  | { op: 'deliver-batch'; subId: number; offset: number; events: AnyEvent[] }
+  | { op: 'deliver'; subId: number; offset: number; event: BusEvent }
+  | { op: 'deliver-batch'; subId: number; offset: number; events: BusEvent[] }
   | { op: 'head'; reqId: number; length: number }
   | { op: 'error'; reqId?: number; message: string };
 
@@ -30,7 +30,7 @@ export interface LocalBrokerBusOptions {
 }
 
 interface PendingPublish {
-  event: AnyEvent;
+  event: BusEvent;
   sentOnce: boolean;
   resolve: (m: DeliveryMeta) => void;
   reject: (e: Error) => void;
@@ -191,7 +191,7 @@ export class LocalBrokerBus implements EventBus {
    * Publish frame with `event` as the last key, so the broker can store the event's JSON as sent instead of
    * re-serializing it (see rawEventText in services/broker). The broker deduplicates by eventId either way.
    */
-  private sendPublish(reqId: number, event: AnyEvent, retry: boolean): boolean {
+  private sendPublish(reqId: number, event: BusEvent, retry: boolean): boolean {
     return this.sendRaw(`{"op":"publish","reqId":${reqId}${retry ? ',"retry":true' : ''},"event":${JSON.stringify(event)}}`);
   }
 
@@ -270,7 +270,7 @@ export class LocalBrokerBus implements EventBus {
 
   // ---------------------------------------------------------------- EventBus
 
-  publish(event: AnyEvent): Promise<DeliveryMeta> {
+  publish(event: BusEvent): Promise<DeliveryMeta> {
     if (this.closed) return Promise.reject(new Error('bus closed'));
     return new Promise<DeliveryMeta>((resolve, reject) => {
       const reqId = ++this.reqSeq;
@@ -398,7 +398,7 @@ interface SubTransport {
 
 interface Item {
   offset: number;
-  event: AnyEvent;
+  event: BusEvent;
   gen: number;
 }
 
@@ -463,7 +463,7 @@ class ClientSub {
     }
   }
 
-  onDeliver(offset: number, event: AnyEvent): void {
+  onDeliver(offset: number, event: BusEvent): void {
     if (this.stopped) return;
     this.buffer.push({ offset, event, gen: this.gen });
     this.wakeUp?.();

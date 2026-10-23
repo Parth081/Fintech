@@ -1,5 +1,5 @@
 // Shared types for pipeline steps. Each stage lives in its own file in this folder.
-import { deterministicId, type AnyEvent, type EventType, type PayloadMap, type PaymentState, type StageName } from '@ct/contracts';
+import { deterministicId, type AnyEvent, type ControlState, type EventType, type PayloadMap, type PaymentState, type StageName } from '@ct/contracts';
 
 export const RULE_VERSION = 'stub-v1';
 
@@ -54,6 +54,11 @@ export interface StepContext {
   services: StageServices;
   /** Read-only view of every projected payment (e.g. for provider health). Do not mutate. */
   view: { states: ReadonlyMap<string, PaymentState> };
+  /**
+   * Control state (provider outages, scenario) as of the trigger's position in the log: only control
+   * events published BEFORE the trigger count, so live runs and replays decide identically. (M3)
+   */
+  control: ControlState;
 }
 
 export interface Step {

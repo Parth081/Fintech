@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { project, type AnyEvent, type PaymentState } from '@ct/contracts';
+import { INITIAL_CONTROL_STATE } from '@ct/contracts';
 import { makeEvent, sampleInitiatedPayload } from '@ct/contracts/testing';
 import { parseAndValidate, uetrFor } from '@ct/iso20022';
 import { providerProfile } from '@ct/market';
@@ -28,6 +29,7 @@ const ctx = (sim?: StageServices['sim'], states: Map<string, PaymentState> = new
   now: '2026-10-22T10:00:05.000Z',
   services: sim ? { sim } : {},
   view: { states },
+  control: INITIAL_CONTROL_STATE,
 });
 
 async function run(events: AnyEvent[], sim?: StageServices['sim']) {

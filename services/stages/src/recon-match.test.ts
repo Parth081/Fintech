@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { project, type AnyEvent, type LedgerEntry, type PayloadMap } from '@ct/contracts';
+import { INITIAL_CONTROL_STATE } from '@ct/contracts';
 import { happyPath, makeEvent } from '@ct/contracts/testing';
 import { buildEvent } from './runner';
 import type { Outcome } from './steps/common';
@@ -37,7 +38,7 @@ const entryFor = (paymentId: string, amountMinor = INR.amountMinor) => ({
 });
 
 async function reconcile(s: ReturnType<typeof scenario>) {
-  const outcome = (await step.produce(s.posted, s.state, { now: '2026-10-22T10:00:05Z', services: {}, view: { states: new Map() } })) as Outcome;
+  const outcome = (await step.produce(s.posted, s.state, { now: '2026-10-22T10:00:05Z', services: {}, view: { states: new Map() }, control: INITIAL_CONTROL_STATE })) as Outcome;
   const ev = buildEvent('reconciliation', s.posted, outcome, '2026-10-22T10:00:05Z', 0);
   expect(project([...s.events, ev]).rejected).toEqual([]);
   if (ev.type !== 'payment.reconciled') throw new Error('expected reconciled');

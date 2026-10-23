@@ -125,13 +125,16 @@ export function applyEvent(state: PaymentState | undefined, event: AnyEvent): Pa
 }
 
 /** Fold a sequence of events (any order of payments) into a map of states. Invalid events are reported, not thrown. */
+/** Fold events into payment states. Control events (M3) on the same log are skipped, never rejected. */
 export function project(
-  events: Iterable<AnyEvent>,
+  events: Iterable<AnyEvent | { type: `control.${string}`; paymentId: string }>,
   initial: Map<string, PaymentState> = new Map(),
 ): { states: Map<string, PaymentState>; rejected: { event: AnyEvent; error: string }[] } {
   const states = new Map(initial);
   const rejected: { event: AnyEvent; error: string }[] = [];
-  for (const event of events) {
+  for (const e of events) {
+    if (e.type.startsWith('control.')) continue;
+    const event = e as AnyEvent;
     try {
       states.set(event.paymentId, applyEvent(states.get(event.paymentId), event));
     } catch (err) {

@@ -1,7 +1,7 @@
 // EventBus over Kafka/Redpanda (Docker profile, BUS=kafka). The kafkajs client is injected so the
 // adapter logic can be unit-tested with a fake (see kafka-bus.test.ts).
 import { randomUUID } from 'node:crypto';
-import { PAYMENTS_TOPIC, type AnyEvent } from '@ct/contracts';
+import { PAYMENTS_TOPIC, type BusEvent } from '@ct/contracts';
 import type { DeliveryMeta, EventBus, EventHandler, SubscribeOptions, Subscription } from './types';
 
 // ---- the slice of kafkajs this adapter uses (structurally compatible with kafkajs' Kafka) ----
@@ -157,7 +157,7 @@ export class KafkaBus implements EventBus {
     return this.started;
   }
 
-  publish(event: AnyEvent): Promise<DeliveryMeta> {
+  publish(event: BusEvent): Promise<DeliveryMeta> {
     if (this.closed) return Promise.reject(new Error('bus closed'));
     const known = this.published.get(event.eventId);
     if (known) return known;
@@ -170,7 +170,7 @@ export class KafkaBus implements EventBus {
     return p;
   }
 
-  private async send(event: AnyEvent): Promise<DeliveryMeta> {
+  private async send(event: BusEvent): Promise<DeliveryMeta> {
     await this.start();
     const result = await this.producer.send({
       topic: this.topic,
@@ -289,10 +289,10 @@ class KafkaSub {
   async onMessage({ topic, partition, message }: EachMessagePayloadLike): Promise<void> {
     if (this.stopped) return;
     const offset = Number(message.offset);
-    let event: AnyEvent | null = null;
+    let event: BusEvent | null = null;
     try {
       const text = typeof message.value === 'string' ? message.value : message.value?.toString('utf8');
-      event = text ? (JSON.parse(text) as AnyEvent) : null;
+      event = text ? (JSON.parse(text) as BusEvent) : null;
     } catch {
       event = null;
     }

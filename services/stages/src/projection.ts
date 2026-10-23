@@ -1,4 +1,4 @@
-import { applyEvent, type AnyEvent, type PaymentState } from '@ct/contracts';
+import { applyEvent, ControlTimeline, isControlEvent, type BusEvent, type PaymentState } from '@ct/contracts';
 
 export class StoppedError extends Error {
   constructor() {
@@ -13,17 +13,23 @@ export class StoppedError extends Error {
  */
 export class Projection {
   readonly states = new Map<string, PaymentState>();
+  /** Control events (outages, scenario, pacing) with their offsets. */
+  readonly control = new ControlTimeline();
   applied = -1;
   rejected = 0;
   private lastActivity = Date.now();
   private waiters: { offset: number; resolve: () => void; reject: (e: Error) => void }[] = [];
   private stopped = false;
 
-  apply(event: AnyEvent, offset: number): void {
-    try {
-      this.states.set(event.paymentId, applyEvent(this.states.get(event.paymentId), event));
-    } catch {
-      this.rejected += 1; // invalid events are ignored by the projection (they never change state)
+  apply(event: BusEvent, offset: number): void {
+    if (isControlEvent(event)) {
+      this.control.apply(event, offset);
+    } else {
+      try {
+        this.states.set(event.paymentId, applyEvent(this.states.get(event.paymentId), event));
+      } catch {
+        this.rejected += 1; // invalid events are ignored by the projection (they never change state)
+      }
     }
     if (offset > this.applied) this.applied = offset;
     this.lastActivity = Date.now();
