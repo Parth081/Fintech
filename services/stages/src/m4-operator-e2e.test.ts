@@ -197,16 +197,15 @@ describe('M4 risk chain and operator actions end to end', () => {
     const trace = eventsOf(id).find((e) => e.type === 'payment.routed')!.trace!;
     expect(trace.reasonCodes).toEqual(expect.arrayContaining(['PROVIDER_DISABLED_BY_OPERATOR', 'CIRCUIT_FORCED_OPEN_REROUTED']));
     expect(trace.inputs).toMatchObject({ weights: { success: 0, cost: 1, speed: 0 } });
-    // nothing left: never fall back to an operator-excluded provider. Routing decides payment.failed
-    // NO_ELIGIBLE_PROVIDER, but the contract only allows payment.failed from 'retrying', so on a FIRST attempt
-    // the payment waits at 'quoted' (reported as a contract change: allow payment.failed from 'quoted').
+    // nothing left: never fall back to an operator-excluded provider. On a FIRST attempt routing ends the
+    // payment as failed (NO_ELIGIBLE_PROVIDER) — the contract allows payment.failed from 'quoted' since M4 —
+    // instead of leaving it stuck; an operator can retry it once a provider is back.
     await config('provider.enabled', { orion: false, lyra: true, vega: false });
     const none = await pay();
-    await waitFor(none, 'quoted');
-    await new Promise((r) => setTimeout(r, 150));
+    await waitFor(none, 'failed');
     await bus.drain();
-    expect(stateOf(none)!.status).toBe('quoted');
     expect(eventsOf(none).some((e) => e.type === 'payment.routed')).toBe(false);
+    expect(stateOf(none)!.facts['payment.failed']).toMatchObject({ atStage: 'routing' });
     // the payment before the config change was routed normally
     expect(stateOf(before)!.facts['payment.routed']!.scoring!.every((p) => p.excludedReason !== 'PROVIDER_DISABLED')).toBe(true);
     await bus.drain();
