@@ -43,6 +43,11 @@ export interface StageServices {
       journalId: string;
       entries: PayloadMap['ledger.posted']['entries'];
     }>;
+    /** M4: post the refund (reversal) journal for a refund_requested payment, idempotent per payment. */
+    postRefund?(input: { paymentId: string; causationEventId: string; state: PaymentState }): Promise<{
+      journalId: string;
+      entries: PayloadMap['payment.refunded']['entries'];
+    }>;
   };
   /** Simulation seed and failure scaling (from serviceConfig). */
   sim?: { seed: string; providerFailureScale: number };
@@ -53,12 +58,26 @@ export interface StepContext {
   now: string;
   services: StageServices;
   /** Read-only view of every projected payment (e.g. for provider health). Do not mutate. */
-  view: { states: ReadonlyMap<string, PaymentState> };
+  view: {
+    states: ReadonlyMap<string, PaymentState>;
+    /**
+     * M4: log offset of a payment event the projection applied (undefined if unknown). Lets a step bound
+     * "history before the trigger" by log position, which is identical on every replay. Optional so unit
+     * tests can build a context by hand.
+     */
+    offsetOf?(eventId: string): number | undefined;
+  };
   /**
    * Control state (provider outages, scenario) as of the trigger's position in the log: only control
    * events published BEFORE the trigger count, so live runs and replays decide identically. (M3)
    */
   control: ControlState;
+  /**
+   * M4: control state as of an arbitrary earlier log offset (control events strictly before it). Used by
+   * multi-event decisions (the risk stage's alert chain) to keep reading the configuration as of the
+   * FIRST trigger of the chain. Optional (falls back to `control`).
+   */
+  controlAt?(offset: number): ControlState;
 }
 
 export interface Step {

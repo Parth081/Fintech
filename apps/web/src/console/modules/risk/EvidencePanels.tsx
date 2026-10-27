@@ -1,8 +1,10 @@
 // Investigator explanations per alert kind: sanctions name comparison, fraud score contributions, AML network.
+import { useEffect, useState } from 'react';
 import type { AlertView } from '@ct/contracts/browser';
+import { gatewayApi } from '../../api';
 import { links } from '../../route';
 import { formatPercent } from '../../lib/format';
-import { amlPattern, compareNames, contributions, humanizeCode, nameSimilarity, networkLayout, parseRelatedPayments, parseSanctions, scoreBand, type TokenCompare } from './lib/evidence';
+import { amlPattern, compareNames, contributions, enrichRelated, humanizeCode, nameSimilarity, networkLayout, parseRelatedPayments, parseSanctions, scoreBand, type TokenCompare } from './lib/evidence';
 import { KIND_LABEL } from './lib/queue';
 import { Badge, DateTime, EmptyState, KeyValueList, Money, StatusBadge } from './kit';
 
@@ -179,8 +181,38 @@ export function FraudPanel({ alert, thresholds }: { alert: AlertView; thresholds
 
 // ---------------------------------------------------------------------------------------------- AML
 
+type RelatedDetail = Parameters<typeof enrichRelated>[1] extends ReadonlyMap<string, infer V> ? V : never;
+
+/** Look up sender/beneficiary/amount for related payments the alert lists by id only. */
+function useRelatedDetails(ids: string[]): ReadonlyMap<string, RelatedDetail> {
+  const [details, setDetails] = useState<ReadonlyMap<string, RelatedDetail>>(new Map());
+  const key = ids.join(',');
+  useEffect(() => {
+    if (ids.length === 0) return;
+    const ctrl = new AbortController();
+    void Promise.all(
+      ids.slice(0, 25).map((id) =>
+        gatewayApi.payment(id, ctrl.signal).then(
+          (d) => {
+            const init = d.state.initiated;
+            return [id, { debtorName: init.debtor.name, creditorName: init.creditor.name, amount: init.amount, corridor: init.corridor, status: d.state.status, at: d.state.createdAt }] as const;
+          },
+          () => null,
+        ),
+      ),
+    ).then((rows) => {
+      if (!ctrl.signal.aborted) setDetails(new Map(rows.filter((r): r is NonNullable<typeof r> => r !== null)));
+    });
+    return () => ctrl.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key]);
+  return details;
+}
+
 export function AmlPanel({ alert }: { alert: AlertView }) {
-  const related = parseRelatedPayments(alert);
+  const parsed = parseRelatedPayments(alert);
+  const details = useRelatedDetails(parsed.filter((r) => r.debtorName === '—' || r.creditorName === '—').map((r) => r.paymentId));
+  const related = enrichRelated(parsed, details);
   const net = networkLayout(related);
   const byId = new Map(net.nodes.map((n) => [n.id, n]));
   return (

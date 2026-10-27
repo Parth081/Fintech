@@ -101,6 +101,26 @@ CREATE TRIGGER journals_no_truncate BEFORE TRUNCATE ON journals FOR EACH STATEME
 CREATE TRIGGER entries_no_truncate  BEFORE TRUNCATE ON entries  FOR EACH STATEMENT EXECUTE FUNCTION ledger_reject_mutation();
 `,
   },
+  {
+    version: 2,
+    name: 'M4 refunds: at most one refund journal per payment, only after its settlement journal',
+    sql: `
+CREATE UNIQUE INDEX journals_one_refund_per_payment ON journals (payment_id) WHERE kind = 'refund';
+
+CREATE FUNCTION ledger_check_refund() RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM journals WHERE payment_id = NEW.payment_id AND kind = 'settlement') THEN
+    RAISE EXCEPTION 'ledger: refund journal % for payment % has no settlement journal', NEW.journal_id, NEW.payment_id
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END
+$fn$;
+
+CREATE TRIGGER journals_refund_after_settlement BEFORE INSERT ON journals
+  FOR EACH ROW WHEN (NEW.kind = 'refund') EXECUTE FUNCTION ledger_check_refund();
+`,
+  },
 ];
 
 /** Apply pending migrations. Safe to call from several processes at once (advisory lock). */

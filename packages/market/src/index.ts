@@ -18,6 +18,8 @@ export {
   setVolatilityShocks,
   getVolatilityShocks,
   clearVolatilityShocks,
+  shocksFromControl,
+  type ControlFxShock,
   type NoiseOctave,
   type VolatilityShock,
 } from './rates';
@@ -56,6 +58,8 @@ export {
   EXCLUDED_FAILED_THIS_PAYMENT,
   EXCLUDED_CIRCUIT_OPEN,
   EXCLUDED_CIRCUIT_HALF_OPEN,
+  EXCLUDED_PROVIDER_DISABLED,
+  EXCLUDED_CIRCUIT_FORCED_OPEN,
   compareScores,
   scoreProviders,
   type RoutingWeights,

@@ -93,7 +93,13 @@ export async function startStage(name: PipelineStage, options: StageOptions): Pr
     const now = new Date().toISOString();
     const t0 = performance.now();
     const control = projection.control.at(offset); // only control events before the trigger
-    const outcome = await step.produce(trigger, state, { now, services, view: { states: projection.states }, control });
+    const outcome = await step.produce(trigger, state, {
+      now,
+      services,
+      view: { states: projection.states, offsetOf: (eventId) => projection.offsets.get(eventId) },
+      control,
+      controlAt: (at) => projection.control.at(at),
+    });
     if (!outcome) return null;
     const latencyMs = Math.round((performance.now() - t0) * 1000) / 1000;
     const event = buildEvent(name, trigger, outcome, now, latencyMs);

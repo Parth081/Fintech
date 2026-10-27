@@ -16,7 +16,7 @@ import {
   sortAlerts,
   validateReason,
 } from './queue';
-import { amlPattern, auditToHistory, compareNames, contributions, editDistance, mergeHistory, nameSimilarity, networkLayout, parseRelatedPayments, parseSanctions, scoreBand } from './evidence';
+import { amlPattern, auditToHistory, compareNames, contributions, editDistance, enrichRelated, mergeHistory, nameSimilarity, networkLayout, parseRelatedPayments, parseSanctions, scoreBand } from './evidence';
 
 const maya: Actor = { userId: 'u-maya', name: 'Maya', role: 'compliance_analyst' };
 const omar: Actor = { userId: 'u-omar', name: 'Omar', role: 'compliance_manager' };
@@ -251,5 +251,34 @@ describe('alert query params and assignable users', () => {
     ];
     expect(usersWith(users, 'cases.work', ROLE_PERMISSIONS).map((u) => u.id)).toEqual(['a', 'c']);
     expect(usersWith(users, 'cases.approve', ROLE_PERMISSIONS).map((u) => u.id)).toEqual(['c']);
+  });
+});
+
+describe('risk engine evidence shape (M4 integration)', () => {
+  it('reads relatedPaymentIds and fills names from payment details', () => {
+    const alert = {
+      paymentId: 'p-4',
+      evidence: { relatedPaymentIds: ['p-1', 'p-2', 'p-3'], rulesVersion: 'aml-typologies-v1' },
+      payment: { status: 'held', corridor: 'US-IN', amount: { amountMinor: 990_000, currency: 'USD' }, debtorName: 'Mule 4', creditorName: 'Collector Ltd' },
+    } as unknown as AlertView;
+    const parsed = parseRelatedPayments(alert);
+    expect(parsed.map((r) => r.paymentId)).toEqual(['p-4', 'p-1', 'p-2', 'p-3']);
+    expect(parsed.find((r) => r.paymentId === 'p-1')?.debtorName).toBe('—');
+    const details = new Map([['p-1', { debtorName: 'Mule 1', creditorName: 'Collector Ltd', amount: { amountMinor: 980_000, currency: 'USD' } }]]);
+    const enriched = enrichRelated(parsed, details);
+    expect(enriched.find((r) => r.paymentId === 'p-1')).toMatchObject({ debtorName: 'Mule 1', creditorName: 'Collector Ltd' });
+    expect(enriched.find((r) => r.paymentId === 'p-4')?.debtorName).toBe('Mule 4'); // untouched
+    expect(networkLayout(enriched).nodes.some((n) => n.label === 'Collector Ltd')).toBe(true);
+  });
+
+  it('reads the sanctions evidence as the screening stage emits it', () => {
+    const alert = {
+      paymentId: 'p-9', kind: 'sanctions', score: 0.98, reasons: [],
+      evidence: { listName: 'FICTIONAL CONSOLIDATED LIST', field: 'creditor', score: 0.98, matchedName: 'Volkhov Maritime Holding', entry: { id: 'FCL-0001', name: 'VOLKOV MARITIME HOLDINGS', type: 'entity', program: 'X', countries: ['XR'], listedOn: '2024-01-01' } },
+      payment: { status: 'held', corridor: 'US-IN', amount: { amountMinor: 1, currency: 'USD' }, debtorName: 'A', creditorName: 'Volkhov Maritime Holding' },
+    } as unknown as AlertView;
+    const s = parseSanctions(alert);
+    expect(JSON.stringify(s)).toContain('VOLKOV MARITIME HOLDINGS');
+    expect(JSON.stringify(s)).toContain('0.98');
   });
 });

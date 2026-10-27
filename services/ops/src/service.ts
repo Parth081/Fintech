@@ -238,7 +238,7 @@ export async function startOps(options: OpsOptions): Promise<OpsHandle> {
             const c = await store.case(caseId);
             if (c && c.status !== 'closed') {
               const decision: CaseDecision = e.type === 'payment.released' ? 'release' : 'reject';
-              const approvedBy = e.type === 'payment.released' ? e.payload.approvedBy : undefined;
+              const approvedBy = e.type === 'payment.released' || e.type === 'payment.rejected' ? e.payload.approvedBy : undefined;
               await store.updateCase(caseId, { status: 'closed', eventId: e.eventId, decision: { decision, reason: e.payload.reason, by: actor, ...(approvedBy ? { approvedBy } : {}), at: e.occurredAt, closedAtOffset: offset } }, e.occurredAt);
               await store.audit({ at: e.occurredAt, actor: SYSTEM_ACTOR, action: 'case.reconciled', target: { type: 'case', id: caseId }, paymentId: e.paymentId, details: { decision }, eventId: e.eventId, dedupeKey: `case-repair:${e.eventId}` });
             }
@@ -405,7 +405,7 @@ export async function startOps(options: OpsOptions): Promise<OpsHandle> {
     const offset =
       decision === 'release'
         ? await publishPaymentEvent('payment.released', state, { actor: by, reason, caseId: c.caseId, ...(approvedBy ? { approvedBy } : {}) }, eventId, trace)
-        : await publishPaymentEvent('payment.rejected', state, { reason, atStage: 'ops', actor: by, caseId: c.caseId }, eventId, trace);
+        : await publishPaymentEvent('payment.rejected', state, { reason, atStage: 'ops', actor: by, caseId: c.caseId, ...(approvedBy ? { approvedBy } : {}) }, eventId, trace);
     await store.updateCase(c.caseId, { status: 'closed', eventId, decision: { decision, reason, by, ...(approvedBy ? { approvedBy } : {}), at: ctx.now, closedAtOffset: offset } }, ctx.now);
     await audit(ctx, { action: decision === 'release' ? 'payment.released' : 'payment.rejected', target: { type: 'payment', id: c.paymentId }, paymentId: c.paymentId, eventId, details: { caseId: c.caseId, decision, reason, by: by.userId, ...(approvedBy ? { approvedBy: approvedBy.userId } : {}) } });
     await audit(ctx, { action: 'case.closed', target: { type: 'case', id: c.caseId }, paymentId: c.paymentId, eventId, details: { decision } });

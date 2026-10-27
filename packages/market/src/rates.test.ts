@@ -7,6 +7,7 @@ import {
   rateAt,
   rateSeries,
   setVolatilityShocks,
+  shocksFromControl,
 } from './index';
 
 const T = Date.parse('2026-10-22T12:00:00.000Z');
@@ -119,5 +120,25 @@ describe('volatility shock hook (M3)', () => {
     expect(rateAt('US-IN', mid).mid).toBe(rateAt('US-IN', mid, undefined, [shock]).mid);
     clearVolatilityShocks();
     expect(rateAt('US-IN', mid).mid).toBe(calm);
+  });
+});
+
+describe('control-state shock hook (M4)', () => {
+  const since = new Date(T).toISOString();
+  const ctl = { s1: { shockId: 's1', corridorId: 'GB-PH', driftBps: 250, noiseMultiplier: 4, rampMs: 5_000, since } };
+
+  it('maps active control shocks to open-ended ramped VolatilityShocks', () => {
+    expect(shocksFromControl(ctl)).toEqual([{ id: 's1', corridorId: 'GB-PH', fromMs: T, toMs: Number.POSITIVE_INFINITY, driftBps: 250, noiseMultiplier: 4, rampInMs: 5_000 }]);
+    expect(shocksFromControl({})).toEqual([]);
+  });
+
+  it('ramps in over rampMs, then holds the full drift until the shock is removed', () => {
+    const shocks = shocksFromControl(ctl);
+    expect(rateAt('GB-PH', T - 1000, undefined, shocks).mid).toBe(rateAt('GB-PH', T - 1000).mid);
+    const half = bps(rateAt('GB-PH', T + 2_500, undefined, shocks).mid, rateAt('GB-PH', T + 2_500).mid);
+    const full = bps(rateAt('GB-PH', T + 3_600_000, undefined, shocks).mid, rateAt('GB-PH', T + 3_600_000).mid);
+    expect(Math.abs(half)).toBeLessThan(Math.abs(full));
+    expect(Math.abs(full)).toBeGreaterThan(150);
+    expect(rateAt('US-IN', T + 60_000, undefined, shocks).mid).toBe(rateAt('US-IN', T + 60_000).mid);
   });
 });

@@ -122,7 +122,7 @@ describe('persistence (PGlite directory)', () => {
       expect(await store.journalCount()).toBe(1);
       expect(await store.postSettlement(input)).toEqual({ ...first, created: false });
       expect(await store.journalCount()).toBe(1);
-      expect(await store.driver.query('SELECT version FROM schema_migrations')).toEqual([{ version: 1 }]);
+      expect(await store.driver.query('SELECT version FROM schema_migrations')).toEqual([{ version: 1 }, { version: 2 }]);
       expect((await store.invariants()).ok).toBe(true);
       await expect(store.driver.query('DELETE FROM entries')).rejects.toThrow(/append-only/);
     } finally {

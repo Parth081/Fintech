@@ -62,6 +62,31 @@ export function settlementEntries(state: PaymentState): LedgerEntry[] {
   return entries;
 }
 
+/**
+ * Refund (reversal) journal for a refunded payment (M4, ledger-v1 refund rule): the settlement journal
+ * mirrored line for line, every direction swapped, same accounts, same amounts, same order.
+ *
+ *   Cr customer:<debtor>:<SRC>        amount + fee   (customer made whole)
+ *   Dr fx-position:<SRC>              amount         (source currency bought back)
+ *   Dr fee-revenue:<SRC>              fee            (fee refunded; omitted when the settlement had none)
+ *   Cr fx-position:<TGT>              target         (target currency position unwound)
+ *   Dr provider:<id>:payable:<TGT>    target         (payout recalled from the provider)
+ *
+ * Fee policy: an operator refund is a full reversal, so the transfer fee is refunded too. FX is unwound at
+ * the ORIGINAL quoted rate (no new FX exposure is booked; any market move since is treasury's, not the
+ * customer's). Balanced by construction because the settlement journal was.
+ */
+export function refundEntries(settlement: LedgerEntry[]): LedgerEntry[] {
+  if (settlement.length === 0) throw new Error('ledger: cannot refund a payment without a settlement journal');
+  const entries = settlement.map((e): LedgerEntry => ({
+    account: e.account,
+    direction: e.direction === 'debit' ? 'credit' : 'debit',
+    amount: { amountMinor: e.amount.amountMinor, currency: e.amount.currency },
+  }));
+  assertPostable(entries);
+  return entries;
+}
+
 /** Code-level journal checks (the database re-checks the same rules at commit). */
 export function assertPostable(entries: LedgerEntry[]): void {
   if (!isBalanced(entries)) throw new Error('ledger: journal is not balanced (debits must equal credits per currency, amounts > 0)');

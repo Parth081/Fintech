@@ -8,7 +8,9 @@ import { ledgerSteps } from './ledger';
 import { reconciliationSteps } from './reconciliation';
 
 export * from './common';
-export { SANCTIONS_LIST_VERSION } from './screening';
+export { SANCTIONS_LIST_VERSION, SCREENING_RULE_VERSION } from './screening';
+export { planFor as riskPlanFor } from './risk';
+export { MAX_ROUTING_ATTEMPTS, budgetStart } from './routing';
 export { FX_SPREAD_BPS, QUOTE_TTL_MS } from './fx';
 export { ROUTING_FEE_BPS, ROUTING_FEE_MIN_MINOR } from './routing';
 

@@ -172,7 +172,8 @@ function moneyFrom(v: unknown, currency?: unknown): Money | null {
 }
 
 export function parseRelatedPayments(a: Pick<AlertView, 'evidence' | 'paymentId' | 'payment'>): RelatedPayment[] {
-  const raw = pick(a.evidence, 'relatedPayments', 'related', 'payments', 'cluster');
+  // The risk engine emits relatedPaymentIds (ids only); details are filled in by enrichRelated().
+  const raw = pick(a.evidence, 'relatedPayments', 'relatedPaymentIds', 'related', 'payments', 'cluster');
   const out: RelatedPayment[] = [];
   if (Array.isArray(raw)) {
     for (const r of raw) {
@@ -201,6 +202,18 @@ export function parseRelatedPayments(a: Pick<AlertView, 'evidence' | 'paymentId'
     out.unshift({ paymentId: a.paymentId, debtorName: a.payment.debtorName, creditorName: a.payment.creditorName, amount: a.payment.amount, corridor: a.payment.corridor, status: a.payment.status, current: true });
   }
   return out;
+}
+
+/** Fill in names/amount/status for related payments that arrived as bare ids. */
+export function enrichRelated(
+  related: RelatedPayment[],
+  details: ReadonlyMap<string, { debtorName: string; creditorName: string; amount: Money | null; corridor?: string; status?: string; at?: string }>,
+): RelatedPayment[] {
+  return related.map((r) => {
+    const d = details.get(r.paymentId);
+    if (!d || (r.debtorName !== '—' && r.creditorName !== '—')) return r;
+    return { ...r, debtorName: d.debtorName, creditorName: d.creditorName, amount: r.amount ?? d.amount, corridor: r.corridor ?? d.corridor, status: r.status ?? d.status, at: r.at ?? d.at };
+  });
 }
 
 export interface NetNode {

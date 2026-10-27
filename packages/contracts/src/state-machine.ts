@@ -30,7 +30,8 @@ export const TRANSITIONS: Record<EventType, { from: (PaymentStatus | null)[]; to
   'payment.routed': { from: ['quoted', 'retrying'], to: 'routed' },
   'payment.sent': { from: ['routed'], to: 'sent' },
   'payment.send_failed': { from: ['sent'], to: 'retrying' },
-  'payment.failed': { from: ['retrying'], to: 'failed' },
+  // 'quoted': every provider switched off or forced open by an operator on the FIRST attempt (M4)
+  'payment.failed': { from: ['retrying', 'quoted'], to: 'failed' },
   'payment.settled': { from: ['sent'], to: 'settled' },
   'ledger.posted': { from: ['settled'], to: null },
   'payment.reconciled': { from: ['settled'], to: 'reconciled' },

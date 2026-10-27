@@ -15,6 +15,8 @@ export class Projection {
   readonly states = new Map<string, PaymentState>();
   /** Control events (outages, scenario, pacing) with their offsets. */
   readonly control = new ControlTimeline();
+  /** M4: log offset of every payment event that applied cleanly (eventId -> offset). */
+  readonly offsets = new Map<string, number>();
   applied = -1;
   rejected = 0;
   private lastActivity = Date.now();
@@ -27,6 +29,7 @@ export class Projection {
     } else {
       try {
         this.states.set(event.paymentId, applyEvent(this.states.get(event.paymentId), event));
+        if (!this.offsets.has(event.eventId)) this.offsets.set(event.eventId, offset);
       } catch {
         this.rejected += 1; // invalid events are ignored by the projection (they never change state)
       }
