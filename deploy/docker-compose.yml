@@ -7,7 +7,7 @@
 #   docker compose -f deploy/docker-compose.yml down -v               # stop + delete volumes
 #
 # Ports published on 127.0.0.1 only: broker 7070, payment-api 7071, gateway 7072, ledger 7073,
-# orchestrator 7074 (scenarios, ambient traffic, presenter API).
+# orchestrator 7074 (scenarios, ambient traffic, presenter API), ops 7075 (operations console back office).
 # Unlike `npm start` (embedded PGlite under DATA_DIR/ledger), the ledger here uses the `postgres`
 # service through DATABASE_URL (ADR 0005).
 #
@@ -17,6 +17,11 @@
 # To start from a clean slate in Docker, recreate the stack:
 #   docker compose -f deploy/docker-compose.yml down -v && docker compose -f deploy/docker-compose.yml up -d --wait
 # Ambient payments per second while no scenario runs: AMBIENT_RATE (default 3; 0 = off).
+#
+# M4: the operations console (http://127.0.0.1:7072/#/console) talks to the `ops` service through the
+# gateway (/api/ops/* -> OPS_URL). Ops keeps cases, change requests and the audit trail in the same
+# Postgres database as the ledger but in its own schema `ops` (the ledger's tables are untouched).
+#   npm run verify:m4 -- --url http://127.0.0.1:7072      # optional: prove the M4 workflows
 #
 # Redpanda / Kafka profile:
 #   BUS=kafka docker compose -f deploy/docker-compose.yml --profile redpanda up --build
@@ -42,6 +47,7 @@ x-service: &service
     GATEWAY_PORT: "7072"
     LEDGER_PORT: "7073"
     ORCHESTRATOR_PORT: "7074"
+    OPS_PORT: "7075"
     BUS: ${BUS:-local}
     BROKER_URL: ws://broker:7070
     KAFKA_BROKERS: redpanda:9092
@@ -49,6 +55,7 @@ x-service: &service
     GATEWAY_URL: http://gateway:7072
     LEDGER_URL: http://ledger:7073
     ORCHESTRATOR_URL: http://orchestrator:7074
+    OPS_URL: http://ops:7075
     # No launcher in Docker: reset is unavailable (the gateway answers 503).
     LAUNCHER_CONTROL_URL: ""
     AMBIENT_RATE: ${AMBIENT_RATE:-3}
@@ -194,10 +201,48 @@ services:
       retries: 20
       start_period: 10s
 
+  # M4: operations back office (users/roles, alerts & cases, operator actions, maker-checker config,
+  # audit). Projects the payment log into Postgres schema `ops`; publishes operator events (producer ops).
+  ops:
+    <<: *service
+    command: ["services/ops/src/index.ts"]
+    environment:
+      HOST: 0.0.0.0
+      OPS_PORT: "7075"
+      BUS: ${BUS:-local}
+      BROKER_URL: ws://broker:7070
+      KAFKA_BROKERS: redpanda:9092
+      LEDGER_URL: http://ledger:7073
+      PAYMENT_API_URL: http://payment-api:7071
+      DATA_DIR: /data
+      # Same database as the ledger, separate schema "ops" (created by the ops migrations).
+      DATABASE_URL: postgres://ct:ct-local-only@postgres:5432/ledger
+      SIM_SEED: ${SIM_SEED:-control-tower}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+        required: false
+      ledger:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:7075:7075"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7075/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+
   gateway:
     <<: *service
     command: ["services/gateway/src/index.ts"]
     depends_on:
+      ops:
+        condition: service_healthy
       payment-api:
         condition: service_healthy
       ledger:

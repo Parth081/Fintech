@@ -93,7 +93,7 @@ describe('scenario scripts', () => {
     for (const s of SCENARIOS) expect(() => validateScript(s)).not.toThrow();
     expect(PROVIDER_OUTAGE.durationMs).toBeGreaterThanOrEqual(60_000);
     expect(PROVIDER_OUTAGE.durationMs).toBeLessThanOrEqual(75_000);
-    expect(SCENARIOS.map((s) => s.id)).toEqual(['provider-outage', 'provider-degraded']);
+    expect(SCENARIOS.map((s) => s.id)).toEqual(['provider-outage', 'provider-degraded', 'fraud-ring', 'fx-spike', 'sanctions-hit']);
     expect(() => validateScript({ ...PROVIDER_OUTAGE, steps: PROVIDER_OUTAGE.steps.filter((s) => s.id !== 'orion-recovers') })).toThrow(/left open/);
   });
 });
@@ -107,7 +107,7 @@ describe('orchestrator HTTP API', () => {
     expect(st.status).toBe(200);
     const state = st.body as unknown as OrchestratorState;
     expect(state).toMatchObject({ ambient: { rate: 0, running: false, sent: 0 }, pace: 'normal', paused: false, activeRun: null });
-    expect(state.scenarios.map((s) => s.id)).toEqual(['provider-outage', 'provider-degraded']);
+    expect(state.scenarios.map((s) => s.id)).toEqual(['provider-outage', 'provider-degraded', 'fraud-ring', 'fx-spike', 'sanctions-hit']);
     expect(state.scenarios[0]!.steps[1]).toMatchObject({ id: 'orion-down', atMs: 10_000, narration: expect.stringContaining('Orion just failed') });
     expect(state.scenarios[0]!.steps[0]).not.toHaveProperty('actions');
 

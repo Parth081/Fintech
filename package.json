@@ -20,6 +20,7 @@
     "verify:m2:quick": "tsx tools/verify/index.ts --count 500",
     "verify:m3": "tsx tools/verify/m3.ts",
     "verify:m3:quick": "tsx tools/verify/m3.ts --runs 2",
+    "verify:m4": "tsx tools/verify/m4.ts",
     "bench:broker": "tsx tools/bench/broker-bench.ts",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run --exclude \"tests/e2e/**\"",

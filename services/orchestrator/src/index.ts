@@ -6,7 +6,8 @@ import { createBus } from '@ct/event-bus';
 import { startOrchestrator } from './orchestrator';
 
 export { startOrchestrator, PACE_PRESETS, type OrchestratorOptions, type OrchestratorHandle } from './orchestrator';
-export { SCENARIOS, PROVIDER_OUTAGE, PROVIDER_DEGRADED, SCENARIO_AMBIENT_RATE, scenarioInfo, validateScript, type ScenarioScript, type ScenarioStep, type ScenarioAction } from './scenarios';
+export { SCENARIOS, PROVIDER_OUTAGE, PROVIDER_DEGRADED, SCENARIO_AMBIENT_RATE, scenarioInfo, validateScript, craftedKey, craftedRequest, runTag, type ScenarioScript, type ScenarioStep, type ScenarioAction, type CraftedPayment } from './scenarios';
+export { FRAUD_RING, FX_SPIKE, SANCTIONS_HIT, FX_SPIKE_SHOCK, SANCTIONS_PARTIES } from './scenarios-m4';
 export { ambientPayment, ambientKeyPrefix, ambientIndexOf, MAX_AMBIENT_RATE } from './ambient';
 export { systemClock, FakeClock, type Clock } from './clock';
 

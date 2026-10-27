@@ -13,6 +13,8 @@ export interface LauncherArgs {
   gatewayPort: number;
   ledgerPort: number;
   orchestratorPort: number;
+  /** M4: operations service (back office API behind the console). */
+  opsPort: number;
   /** Launcher control API port (GET /status, POST /reset); null = --no-control. */
   controlPort: number | null;
   /** Ambient payments per second from the orchestrator. */
@@ -26,7 +28,7 @@ export interface LauncherArgs {
 export const LAUNCHER_USAGE = `Usage: npm start [-- options]
 
 Starts the whole Control Tower on this machine (broker, payment-api, 6 stages, ledger, orchestrator,
-gateway + UI) and the launcher control API (reset) on 127.0.0.1.
+ops, gateway + UI) and the launcher control API (reset) on 127.0.0.1.
 
 Options:
   --reset                    Delete the data directory (event log) before starting
@@ -38,6 +40,7 @@ Options:
   --gateway-port <n>         (env GATEWAY_PORT, default 7072)
   --ledger-port <n>          (env LEDGER_PORT, default 7073)
   --orchestrator-port <n>    (env ORCHESTRATOR_PORT, default 7074)
+  --ops-port <n>             Operations service behind the console (env OPS_PORT, default 7075)
   --control-port <n>         Launcher control API: GET /status, POST /reset (env LAUNCHER_CONTROL_PORT, default 7079)
   --no-control               Do not start the control API (the UI's Reset button then answers 503)
   --ambient <n>              Ambient payments per second while no scenario runs (env AMBIENT_RATE, default 3; 0 = off)
@@ -74,6 +77,7 @@ export function parseLauncherArgs(argv: readonly string[], defaults = serviceCon
     gatewayPort: defaults.gatewayPort,
     ledgerPort: defaults.ledgerPort,
     orchestratorPort: defaults.orchestratorPort ?? 7074,
+    opsPort: defaults.opsPort ?? 7075,
     controlPort: defaults.launcherControlPort ?? 7079,
     // npm start shows a living system by default; tests and verify tools pass their own rate.
     ambientRate: process.env.AMBIENT_RATE ? Number(process.env.AMBIENT_RATE) : 3,
@@ -131,6 +135,9 @@ export function parseLauncherArgs(argv: readonly string[], defaults = serviceCon
       case '--orchestrator-port':
         args.orchestratorPort = toPort(flag, next());
         break;
+      case '--ops-port':
+        args.opsPort = toPort(flag, next());
+        break;
       case '--control-port':
         args.controlPort = toPort(flag, next());
         break;
@@ -165,6 +172,7 @@ export function parseLauncherArgs(argv: readonly string[], defaults = serviceCon
     ['gateway', args.gatewayPort],
     ['ledger', args.ledgerPort],
     ['orchestrator', args.orchestratorPort],
+    ['ops', args.opsPort],
     ...(args.controlPort !== null ? ([['control', args.controlPort]] as [string, number][]) : []),
   ];
   if (new Set(named.map(([, p]) => p)).size !== named.length) {

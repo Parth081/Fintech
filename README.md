@@ -349,3 +349,111 @@ It prints a table with one row per run, plus a summary, writes `<data dir>/repor
 | orchestrator | 7074 | scenarios, ambient traffic, pace (`ORCHESTRATOR_PORT`) |
 | launcher control | 7079 | `GET /status`, `POST /reset` (`LAUNCHER_CONTROL_PORT`; only with `npm start`) |
 | verify:m3 | 27170-27174, 27179 | its own system (`--base-port`) |
+
+## M4 - Operations Console + Risk & Compliance
+
+The control tower now works like the back office of an enterprise payment platform. Payments are screened
+against a **fictional** sanctions list and scored by a fraud model and AML typologies. Suspicious payments
+are **held** with explainable alerts that roll up into **cases**. Investigators work the cases in the
+**operations console**, and every risky decision needs **four eyes**. Operators retry failed payments and
+refund completed ones (maker-checker). Admins change risk and routing configuration through change
+requests that a second admin approves. Every action is an event on the payment log, and the audit trail
+cannot be changed.
+See [ADR 0010](docs/adr/0010-operator-actions-as-events.md) (operator actions as events),
+[ADR 0011](docs/adr/0011-maker-checker-and-rbac.md) (maker-checker + roles) and
+[ADR 0012](docs/adr/0012-explainable-risk-decisions.md) (explainable risk decisions).
+
+### Running it
+
+```bash
+npm start            # now 12 processes: + ops (operations back office, port 7075)
+```
+
+- **Operations console:** http://127.0.0.1:7072/#/console. Pick a demo user on the sign-in screen. There
+  is no password: this is a simulation with fictional people.
+- The console talks to the ops service through the gateway (`/api/ops/*` → `OPS_URL`). The ops API is in
+  `packages/contracts/src/ops-api.ts`.
+- Ops data (cases, change requests, refund requests, audit trail, sessions) is stored in PGlite under
+  `DATA_DIR/ops`. **Reset** wipes it together with the event log and the ledger. In Docker it uses the
+  Postgres database the ledger also uses, in a separate schema `ops`.
+
+### Demo users and roles
+
+| User | Role | Typical actions |
+| --- | --- | --- |
+| Maya Chen | Payment Operations Analyst (`ops_analyst`) | search payments, retry failed, request refunds |
+| Daniel Okafor, Amara Nwosu | Compliance Analyst (`compliance_analyst`) | work alerts and cases, propose release/reject |
+| Priya Raman, Tomas Lindqvist | Compliance Manager (`compliance_manager`) | approve high/critical decisions and refunds, read audit |
+| Lucas Meyer | Treasury Manager (`treasury`) | FX, provider statements, reconciliation breaks |
+| Sofia Alvarez, Ken Adeyemi | Administrator (`admin`) | request and approve configuration changes |
+| Hiro Tanaka | Internal Auditor (`auditor`) | read everything, including the audit trail; change nothing |
+
+There are two analysts, two managers and two admins, so four-eyes can always be shown live.
+
+### Investigator walkthrough (about 5 minutes)
+
+1. Presenter console (`#/presenter`): start **Fraud ring**.
+2. Console as **Daniel** (compliance analyst): **Alerts** fill up with AML (fan-in, fan-out, structuring)
+   and fraud alerts. Open the newest high-priority **case**: you see each reason with its weight, the
+   linked payments and accounts, and the SLA clock. Assign it to yourself and add a note.
+3. **Decide → Release** with a reason. Because the case is high priority, this becomes a *proposal*
+   (pending approval). Try **Approve** as Daniel: refused, because a second person must approve.
+4. Sign in as **Priya** (compliance manager) and **Approve**. The payment is released (`payment.released`
+   with actor Daniel and approver Priya). It continues from FX quoting and ends reconciled.
+5. Start **Sanctions hit**. The two payments are held with a sanctions alert that names the list entry and
+   how close the match is. As Priya, propose **Reject**. Tomas approves. `payment.rejected` (at stage
+   `ops`): no money moves and no ledger journal is posted.
+6. As **Maya**: open a reconciled payment and **Request refund**. Priya approves → `payment.refunded`, and
+   the ledger posts a mirror reversal journal.
+7. As **Sofia** (admin): **Configuration → Provider Lyra off**, with a reason. Ken approves →
+   `control.config.updated`, and new payments stop routing to Lyra.
+8. As **Hiro** (auditor): **Audit** shows every step above with who did it, when, and the event it
+   produced. Export it as CSV.
+
+### Scenarios (M4)
+
+All three send ordinary-looking payments through the real Payment API. Nothing in them tells the risk
+engine what to decide. Every scenario uses brand-new accounts on each run, and the event ids are
+deterministic.
+
+| Scenario | Length | What happens (presenter narration, short) |
+| --- | --- | --- |
+| `fraud-ring` | 60 s | Eight accounts opened minutes ago each send just under 10,000 USD to one company in India (fan-in, structuring). Then a collector account splits money out to six new recipients (fan-out). The suspicious payments are held, and the alerts roll up into cases. "Held payments have not moved a cent." |
+| `fx-spike` | 60 s | GBP/PHP: `control.fx_shock.started` (+250 bps drift, 4× volatility, 5 s ramp) and later `control.fx_shock.ended`. UK → Philippines remittances are sent before, during and after the shock. Quotes widen their spread during the shock and tighten again afterwards. |
+| `sanctions-hit` | 42 s | A payment to "Volkhov Maritime Holding" and one from "Darius Kael Morvane". Both are close (not exact) to entries on the fictional list. Screening holds both and opens high-priority cases. "For a sanctions case a manager has to approve." |
+
+Risky ambient traffic for longer demos: `npm run traffic -- --count 500 --risk-mix sanctions=0.5%,fraud=1%`.
+The draw is deterministic per seed and index. Without `--risk-mix` the traffic is unchanged.
+
+### Proving it: `npm run verify:m4`
+
+```bash
+npm run verify:m4                                  # launches its own system (ports 28170-28175, temp dir, PGlite)
+npm run verify:m4 -- --url http://127.0.0.1:7072   # a running system (e.g. Docker); add --broker-url if not 7070
+npm run verify:m4 -- --help
+```
+
+It drives the real workflows through the gateway as different demo users, then checks:
+
+| | check |
+| --- | --- |
+| a | `sanctions-hit`: both payments held, each with a sanctions alert and a case |
+| b | `fraud-ring`: AML and fraud alerts raised, suspicious payments held, every alert in a case |
+| c | the analyst proposes release on a high/critical case; the analyst (and another analyst) cannot approve; a manager approves → `payment.released` (actor + approvedBy) → reconciled |
+| d | reject with four-eyes (the proposing manager gets 403, a second manager approves) → `payment.rejected` atStage `ops`, no journal |
+| e | a payment that failed on every provider (outage on Orion + Vega for DE-BR) is retried by operations → completes; an auditor cannot retry |
+| f | refund maker-checker (requester and analyst refused) → `payment.refunded`, two journals, the reversal mirrors the original, trial balance and invariants ok |
+| g | admin disables Lyra, the same admin and a non-admin cannot approve, a second admin approves → `control.config.updated` → no first-attempt routing to Lyra; Lyra re-enabled afterwards |
+| h | `fx-spike`: shock started/ended on the log; spreads during the shock are wider than before and narrower again after |
+| i | every successful mutating call has an audit row with the acting user; rows that cite an event match the log; operator events carry an actor; no API changes or deletes audit rows; rows stay unchanged; the auditor is read-only |
+| j | every payment terminal, zero duplicate events, valid state-machine walks, ≤ 3 attempts per retry budget, trial balance balanced, invariants ok, journals per payment, gateway `rejectedEvents = 0` |
+
+It writes `<data dir>/reports/verify-m4-<time>.json` (or `--report-dir`) and exits non-zero if any check
+fails. It takes about 4 minutes, because the scenarios run in real time.
+
+### M4 ports
+
+| Service | Port | Notes |
+| --- | --- | --- |
+| ops | 7075 | operations back office (`OPS_PORT`, `--ops-port`); the gateway proxies `/api/ops/*` to `OPS_URL` |
+| verify:m4 | 28170-28175 | its own system (`--base-port`) |

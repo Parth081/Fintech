@@ -2,6 +2,8 @@
 // again without leaving orphans. Used by `npm start` (index.ts), the end-to-end tests and verify:*.
 // M3: also starts the orchestrator, serves the launcher control API (control.ts) and can reset the
 // whole system (stop everything, delete the data dir, start again) in a few seconds.
+// M4: also starts the operations service (services/ops, the back office behind the console) once the
+// broker is up; its PGlite store lives in DATA_DIR/ops and is wiped with the rest of the data on reset.
 import type { ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
@@ -25,7 +27,7 @@ export const STAGES = ['screening', 'risk', 'fx', 'routing', 'settlement', 'reco
 export type Stage = (typeof STAGES)[number];
 
 /** Every process the launcher manages, in start order. Names accepted by restart()/kill(). */
-export const SERVICE_NAMES = ['broker', 'payment-api', ...STAGES, 'ledger', 'orchestrator', 'gateway'] as const;
+export const SERVICE_NAMES = ['broker', 'payment-api', ...STAGES, 'ledger', 'orchestrator', 'ops', 'gateway'] as const;
 export type ServiceName = (typeof SERVICE_NAMES)[number];
 
 export const DEFAULT_ROOT_DIR = path.resolve(fileURLToPath(new URL('../../', import.meta.url)));
@@ -38,10 +40,10 @@ export interface LaunchOptions {
   rootDir?: string;
   host?: string;
   /**
-   * Ports; `ledger` defaults to gateway + 1 and `orchestrator` to gateway + 2 (7073 / 7074 with the
-   * default gateway port).
+   * Ports; `ledger` defaults to gateway + 1, `orchestrator` to gateway + 2 and `ops` to gateway + 3
+   * (7073 / 7074 / 7075 with the default gateway port).
    */
-  ports?: { broker?: number; paymentApi?: number; gateway?: number; ledger?: number; orchestrator?: number };
+  ports?: { broker?: number; paymentApi?: number; gateway?: number; ledger?: number; orchestrator?: number; ops?: number };
   /**
    * Port of the launcher control API (GET /status, POST /reset). Undefined = no control server and
    * LAUNCHER_CONTROL_URL is empty (the gateway then answers reset with 503). 0 = any free port.
@@ -57,6 +59,8 @@ export interface LaunchOptions {
   ambientRate?: number;
   /** Start the orchestrator (default true). */
   orchestrator?: boolean;
+  /** M4: start the operations service (default true). The gateway's /api/ops/* answers 502 without it. */
+  ops?: boolean;
   /** Postgres URL for the ledger; empty/undefined = embedded PGlite under dataDir/ledger (env DATABASE_URL). */
   databaseUrl?: string;
   /** Simulation seed for markets and providers (env SIM_SEED). */
@@ -86,7 +90,7 @@ export interface StartupTiming {
 
 export interface LaunchedSystem {
   /** `control` is present only when the control API runs (controlPort set). */
-  urls: { gateway: string; paymentApi: string; broker: string; ledger: string; orchestrator: string; control?: string };
+  urls: { gateway: string; paymentApi: string; broker: string; ledger: string; orchestrator: string; ops: string; control?: string };
   /** Names of the processes this launch manages (broker omitted with BUS=kafka). */
   services: readonly ServiceName[];
   /** How long the initial start took and when each service became ready. */
@@ -125,6 +129,7 @@ const COLORS: Record<string, number> = {
   ledger: 96,
   reconciliation: 93,
   orchestrator: 94,
+  ops: 91,
   gateway: 92,
   'build:web': 90,
   launcher: 97,
@@ -152,7 +157,7 @@ interface ServiceSpec {
   name: ServiceName;
   script: string;
   args?: string[];
-  /** Readiness: HTTP GET healthUrl returns 200, or a stdout line matches readyLine. */
+  /** Readiness: HTTP GET healthUrl returns 200 and/or a stdout line matches readyLine (both when both are set). */
   healthUrl?: string;
   readyLine?: RegExp;
 }
@@ -195,7 +200,9 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
   const gatewayPort = options.ports?.gateway ?? 7072;
   const ledgerPort = options.ports?.ledger ?? gatewayPort + 1;
   const orchestratorPort = options.ports?.orchestrator ?? gatewayPort + 2;
+  const opsPort = options.ports?.ops ?? gatewayPort + 3;
   const withOrchestrator = options.orchestrator ?? true;
+  const withOps = options.ops ?? true;
   const controlPort = options.controlPort;
   const dataDir = path.resolve(rootDir, options.dataDir ?? '.data');
   const timeoutMs = options.startupTimeoutMs ?? 30_000;
@@ -212,6 +219,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     { name: 'gateway', port: gatewayPort },
     { name: 'ledger', port: ledgerPort },
     ...(withOrchestrator ? [{ name: 'orchestrator', port: orchestratorPort }] : []),
+    ...(withOps ? [{ name: 'ops', port: opsPort }] : []),
     ...(controlPort ? [{ name: 'launcher control', port: controlPort }] : []),
   ];
   if (new Set(wanted.map((w) => w.port)).size !== wanted.length) {
@@ -250,6 +258,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     gateway: `http://${probeHost}:${gatewayPort}`,
     ledger: `http://${probeHost}:${ledgerPort}`,
     orchestrator: `http://${probeHost}:${orchestratorPort}`,
+    ops: `http://${probeHost}:${opsPort}`,
     ...(control ? { control: control.url } : {}),
   };
 
@@ -263,6 +272,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     GATEWAY_PORT: String(gatewayPort),
     LEDGER_PORT: String(ledgerPort),
     ORCHESTRATOR_PORT: String(orchestratorPort),
+    OPS_PORT: String(opsPort),
     ...(control ? { LAUNCHER_CONTROL_PORT: String(control.port) } : {}),
     BUS: bus,
     BROKER_URL: urls.broker,
@@ -270,6 +280,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     GATEWAY_URL: urls.gateway,
     LEDGER_URL: urls.ledger,
     ORCHESTRATOR_URL: urls.orchestrator,
+    OPS_URL: urls.ops,
     LAUNCHER_CONTROL_URL: urls.control ?? '',
     AMBIENT_RATE: String(ambientRate),
     DATA_DIR: dataDir,
@@ -309,7 +320,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
         // Stop in reverse dependency order (gateway + orchestrator, then api + stages + ledger, then
         // broker) so consumers do not log broker-disconnect noise. Each tier is killed in parallel.
         const tier = (r: Running): number =>
-          r.spec.name === 'gateway' || r.spec.name === 'orchestrator' ? 0 : r.spec.name === 'broker' ? 2 : 1;
+          r.spec.name === 'gateway' || r.spec.name === 'orchestrator' || r.spec.name === 'ops' ? 0 : r.spec.name === 'broker' ? 2 : 1;
         await Promise.allSettled(restarting);
         for (const t of [0, 1, 2]) await killAll([...alive].filter((r) => tier(r) === t));
         // A reset that was starting services has seen `stopping` and spawns nothing more; kill whatever
@@ -384,13 +395,19 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
   const waitReady = async (r: Running): Promise<void> => {
     const deadline = Date.now() + timeoutMs;
     const exited = (): boolean => stopping || !isRunning(r.child) || startupCrash !== undefined;
+    let healthy = !r.spec.healthUrl;
     if (r.spec.healthUrl) {
       while (Date.now() < deadline) {
         if (exited()) break;
-        if (await httpOk(r.spec.healthUrl)) return;
+        if (await httpOk(r.spec.healthUrl)) {
+          healthy = true;
+          break;
+        }
         await sleep(HEALTH_POLL_MS);
       }
-    } else if (r.spec.readyLine) {
+    }
+    if (healthy && !r.spec.readyLine) return;
+    if (healthy && r.spec.readyLine) {
       if (r.sawReadyLine) return;
       await new Promise<void>((resolve) => {
         const timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
@@ -417,7 +434,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     const why = !isRunning(r.child)
       ? `Service [${r.spec.name}] exited during startup (code ${r.child.exitCode}).`
       : `Service [${r.spec.name}] did not become ready within ${timeoutMs} ms ` +
-        (r.spec.healthUrl ? `(GET ${r.spec.healthUrl} never returned 200).` : `(no stdout line matching ${r.spec.readyLine}).`);
+        (!healthy ? `(GET ${r.spec.healthUrl} never returned 200).` : `(no stdout line matching ${r.spec.readyLine}).`);
     throw new StartupError(describeFailure(r, why));
   };
 
@@ -427,6 +444,8 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     ledger: { name: 'ledger', script: 'services/ledger/src/index.ts', healthUrl: `${urls.ledger}/health` },
     orchestrator: { name: 'orchestrator', script: 'services/orchestrator/src/index.ts', healthUrl: `${urls.orchestrator}/health` },
     gateway: { name: 'gateway', script: 'services/gateway/src/index.ts', healthUrl: `${urls.gateway}/health` },
+    // Health answers as soon as it listens; "ready" is printed once the store is open and the log replayed.
+    ops: { name: 'ops', script: 'services/ops/src/index.ts', healthUrl: `${urls.ops}/health`, readyLine: /\bready\b/i },
   } satisfies Partial<Record<ServiceName, ServiceSpec>>;
   const stageSpec = (s: Stage): ServiceSpec => ({ name: s, script: 'services/stages/src/index.ts', args: ['--stage', s], readyLine: /\bready\b/i });
 
@@ -435,6 +454,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
    *   t0      broker + ledger (the ledger opens PGlite first, the slowest step, and only then the bus)
    *   broker  payment-api, 6 stages, gateway (all connect to the bus; their clients retry anyway)
    *   api     orchestrator (it posts ambient payments to the payment API)
+   *   broker  ops (projects the log into its store; the gateway proxies /api/ops/* to it)
    */
   const bootAll = async (): Promise<StartupTiming> => {
     const t0 = Date.now();
@@ -460,6 +480,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     const api = start(SPEC['payment-api']);
     const apiReady = add(track(api));
     for (const s of STAGES) add(track(start(stageSpec(s))));
+    if (withOps) add(track(start(SPEC.ops)));
     add(track(start(SPEC.gateway)));
     if (withOrchestrator) {
       add(
@@ -630,6 +651,7 @@ export function banner(gatewayUrl: string, extra: string[] = []): string {
     '',
     `  Open ${gatewayUrl}`,
     `  Presenter console: ${gatewayUrl}/#/presenter`,
+    `  Operations console: ${gatewayUrl}/#/console`,
     '  Then click "Send test payment", or run: npm run traffic -- --count 10',
     ...extra,
     '',
