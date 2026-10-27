@@ -59,6 +59,12 @@ export interface GatewayOptions {
   orchestratorUrl?: string;
   /** Launcher control URL (POST /reset). Empty = reset unavailable (503). Default ''. */
   launcherControlUrl?: string;
+  /** M5 AI explainer base URL (/api/assistant/<rest> is proxied to {assistantUrl}/<rest>). Default http://127.0.0.1:7076. */
+  assistantUrl?: string;
+  /** M5 booth service base URL (/api/booth/<rest> is proxied to {boothUrl}/<rest>, X-Booth-Staff passed through). Default http://127.0.0.1:7077. */
+  boothUrl?: string;
+  /** Timeout of a proxied assistant call (an LLM-phrased answer can take a while). Default 30 s. */
+  assistantTimeoutMs?: number;
   /** Breaker engine (tests). Default @ct/market breakerStates. */
   breakers?: BreakerFn;
   /** Control-plane push tick: changes are pushed at most this often, and at least every 2 s while a scenario runs. Default 1000 ms; 0 disables. */
@@ -167,6 +173,9 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
   const breakerFn: BreakerFn = options.breakers ?? breakerStates;
   const controlIntervalMs = options.controlIntervalMs ?? 1000;
   const resetTimeoutMs = options.resetTimeoutMs ?? 20_000;
+  const assistantUrl = (options.assistantUrl ?? 'http://127.0.0.1:7076').replace(/\/$/, '');
+  const boothUrl = (options.boothUrl ?? 'http://127.0.0.1:7077').replace(/\/$/, '');
+  const assistantTimeoutMs = options.assistantTimeoutMs ?? 30_000;
   const instanceId = randomUUID();
   const startedAt = new Date(now()).toISOString();
 
@@ -610,6 +619,57 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
     }
   };
 
+  /**
+   * M5: /api/assistant/<rest> -> {assistantUrl}/<rest> and /api/booth/<rest> -> {boothUrl}/<rest>. Method, query,
+   * body, content type and the booth staff PIN header (X-Booth-Staff) are passed through; the upstream status,
+   * content type and content disposition (CSV export) come back. 502 JSON when the service is down.
+   */
+  const proxyService = async (
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+    method: string,
+    prefix: string,
+    base: string,
+    name: string,
+    timeoutMs: number,
+  ) => {
+    const rest = url.pathname.slice(prefix.length) || '/';
+    let body: Buffer;
+    try {
+      body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
+    } catch (err) {
+      sendJson(res, 413, { error: (err as Error).message });
+      return;
+    }
+    const headers: Record<string, string> = {
+      'content-type': req.headers['content-type'] ?? 'application/json',
+      accept: typeof req.headers.accept === 'string' ? req.headers.accept : 'application/json',
+    };
+    const staff = req.headers['x-booth-staff'];
+    if (typeof staff === 'string' && staff !== '') headers['x-booth-staff'] = staff;
+    try {
+      const upstream = await fetch(`${base}${rest}${url.search}`, {
+        method,
+        headers,
+        body: body.length > 0 ? new Uint8Array(body) : undefined,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      const data = Buffer.from(await upstream.arrayBuffer());
+      const out: Record<string, string> = {
+        'content-type': upstream.headers.get('content-type') ?? 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+      };
+      const disposition = upstream.headers.get('content-disposition');
+      if (disposition) out['content-disposition'] = disposition;
+      res.writeHead(upstream.status, out);
+      res.end(method === 'HEAD' ? undefined : data);
+    } catch (err) {
+      if (res.headersSent) return void res.destroy();
+      sendJson(res, 502, { error: `${name} unavailable`, detail: (err as Error).message });
+    }
+  };
+
   /** POST /api/control/reset -> {launcherControlUrl}/reset. The launcher restarts this process too. */
   const reset = async (res: ServerResponse) => {
     if (!launcherControlUrl) {
@@ -664,6 +724,12 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
   const handleApi = async (req: IncomingMessage, res: ServerResponse, url: URL, method: string) => {
     const path = url.pathname;
     if (path === '/api/control/orchestrator' || path.startsWith('/api/control/orchestrator/')) return proxyOrchestrator(req, res, url, method);
+    if (path === '/api/assistant' || path.startsWith('/api/assistant/')) {
+      return proxyService(req, res, url, method, '/api/assistant', assistantUrl, 'assistant', assistantTimeoutMs);
+    }
+    if (path === '/api/booth' || path.startsWith('/api/booth/')) {
+      return proxyService(req, res, url, method, '/api/booth', boothUrl, 'booth', 10_000);
+    }
     if (path === '/api/control/reset') {
       if (method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' });
       return reset(res);

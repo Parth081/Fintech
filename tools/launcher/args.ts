@@ -13,6 +13,12 @@ export interface LauncherArgs {
   gatewayPort: number;
   ledgerPort: number;
   orchestratorPort: number;
+  /** M5 AI explainer port (env ASSISTANT_PORT, default 7076). */
+  assistantPort: number;
+  /** M5 booth service port (env BOOTH_PORT, default 7077). */
+  boothPort: number;
+  /** ASSISTANT_LLM: 'auto' (Claude when credentials work, else grounded) or 'off' (fully offline). npm start: auto. */
+  assistantLlm: 'auto' | 'off';
   /** Launcher control API port (GET /status, POST /reset); null = --no-control. */
   controlPort: number | null;
   /** Ambient payments per second from the orchestrator. */
@@ -26,7 +32,8 @@ export interface LauncherArgs {
 export const LAUNCHER_USAGE = `Usage: npm start [-- options]
 
 Starts the whole Control Tower on this machine (broker, payment-api, 6 stages, ledger, orchestrator,
-gateway + UI) and the launcher control API (reset) on 127.0.0.1.
+gateway + UI, AI explainer, booth) and the launcher control API (reset) on 127.0.0.1.
+A reset never deletes DATA_DIR/booth (visitor leads); clear them with npm run booth:clear-leads.
 
 Options:
   --reset                    Delete the data directory (event log) before starting
@@ -38,6 +45,11 @@ Options:
   --gateway-port <n>         (env GATEWAY_PORT, default 7072)
   --ledger-port <n>          (env LEDGER_PORT, default 7073)
   --orchestrator-port <n>    (env ORCHESTRATOR_PORT, default 7074)
+  --assistant-port <n>       AI explainer (env ASSISTANT_PORT, default 7076)
+  --booth-port <n>           Booth: leads + analytics (env BOOTH_PORT, default 7077)
+  --llm <auto|off>           AI explainer mode (env ASSISTANT_LLM, default auto): auto = Claude phrases answers
+                             when ANTHROPIC_API_KEY (or other SDK credentials) work, else grounded answers;
+                             off = grounded answers only, never contacts the network
   --control-port <n>         Launcher control API: GET /status, POST /reset (env LAUNCHER_CONTROL_PORT, default 7079)
   --no-control               Do not start the control API (the UI's Reset button then answers 503)
   --ambient <n>              Ambient payments per second while no scenario runs (env AMBIENT_RATE, default 3; 0 = off)
@@ -74,6 +86,9 @@ export function parseLauncherArgs(argv: readonly string[], defaults = serviceCon
     gatewayPort: defaults.gatewayPort,
     ledgerPort: defaults.ledgerPort,
     orchestratorPort: defaults.orchestratorPort ?? 7074,
+    assistantPort: defaults.assistantPort ?? 7076,
+    boothPort: defaults.boothPort ?? 7077,
+    assistantLlm: defaults.assistantLlm === 'off' ? 'off' : 'auto',
     controlPort: defaults.launcherControlPort ?? 7079,
     // npm start shows a living system by default; tests and verify tools pass their own rate.
     ambientRate: process.env.AMBIENT_RATE ? Number(process.env.AMBIENT_RATE) : 3,
@@ -131,6 +146,18 @@ export function parseLauncherArgs(argv: readonly string[], defaults = serviceCon
       case '--orchestrator-port':
         args.orchestratorPort = toPort(flag, next());
         break;
+      case '--assistant-port':
+        args.assistantPort = toPort(flag, next());
+        break;
+      case '--booth-port':
+        args.boothPort = toPort(flag, next());
+        break;
+      case '--llm': {
+        const v = next();
+        if (v !== 'auto' && v !== 'off') throw new Error(`--llm must be "auto" or "off", got "${v ?? ''}"`);
+        args.assistantLlm = v;
+        break;
+      }
       case '--control-port':
         args.controlPort = toPort(flag, next());
         break;
@@ -165,6 +192,8 @@ export function parseLauncherArgs(argv: readonly string[], defaults = serviceCon
     ['gateway', args.gatewayPort],
     ['ledger', args.ledgerPort],
     ['orchestrator', args.orchestratorPort],
+    ['assistant', args.assistantPort],
+    ['booth', args.boothPort],
     ...(args.controlPort !== null ? ([['control', args.controlPort]] as [string, number][]) : []),
   ];
   if (new Set(named.map(([, p]) => p)).size !== named.length) {

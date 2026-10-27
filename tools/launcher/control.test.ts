@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -158,5 +158,19 @@ describe('launcher control server', () => {
     expect(() => wipeDataDir(path.parse(box.rootDir).root, box.rootDir)).toThrow(/Refusing/);
     // A data dir that does not exist (yet) is fine.
     expect(() => wipeDataDir(path.join(box.rootDir, 'never-created'), box.rootDir)).not.toThrow();
+  });
+
+  it('M5: a reset keeps DATA_DIR/booth (visitor leads) and deletes everything else', async () => {
+    const box = sandbox();
+    mkdirSync(path.join(box.dataDir, 'booth'), { recursive: true });
+    writeFileSync(path.join(box.dataDir, 'booth', 'leads'), 'lead');
+    const fake = fakeSystem(box);
+    server = await startControlServer({ port: 0, controller: fake.controller });
+    expect((await post(`${server.url}/reset`)).status).toBe(200);
+    expect(readdirSync(box.dataDir)).toEqual(['booth']);
+    expect(readFileSync(path.join(box.dataDir, 'booth', 'leads'), 'utf8')).toBe('lead');
+    // An explicit empty keep list deletes the whole directory (used by nothing but tests).
+    wipeDataDir(box.dataDir, box.rootDir, []);
+    expect(existsSync(box.dataDir)).toBe(false);
   });
 });

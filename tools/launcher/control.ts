@@ -7,7 +7,7 @@
 //   POST /reset?wait=0    -> 202 { ok: true, accepted: true } at once; the reset runs in the background
 //                            (for callers that are themselves restarted by the reset, e.g. the gateway)
 //   409 while a reset is already running; 500 { ok: false, error } if the reset failed.
-import { rmSync } from 'node:fs';
+import { existsSync, readdirSync, rmSync } from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 
@@ -60,12 +60,29 @@ export function assertSafeToDelete(dir: string, rootDir: string): void {
 }
 
 /**
- * Delete the data directory (event log, ledger). Windows may keep a file handle for a moment after a
- * process was killed, so retry briefly instead of failing the reset.
+ * Entries of the data directory a reset never deletes. `booth` holds visitor leads and anonymous booth
+ * analytics (services/booth): a demo reset must not lose the leads collected during the day. Delete them
+ * on purpose with `npm run booth:clear-leads` (tools/launcher/clear-leads.ts).
  */
-export function wipeDataDir(dataDir: string, rootDir: string): void {
+export const PRESERVED_DATA_ENTRIES: readonly string[] = ['booth'];
+
+/**
+ * Delete the data directory (event log, ledger), except the entries in `keep` (default
+ * PRESERVED_DATA_ENTRIES). Windows may keep a file handle for a moment after a process was killed, so
+ * retry briefly instead of failing the reset.
+ */
+export function wipeDataDir(dataDir: string, rootDir: string, keep: readonly string[] = PRESERVED_DATA_ENTRIES): void {
   assertSafeToDelete(dataDir, rootDir);
-  rmSync(dataDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+  if (!existsSync(dataDir)) return;
+  const kept = new Set(keep.map((k) => k.toLowerCase()));
+  if (!readdirSync(dataDir).some((e) => kept.has(e.toLowerCase()))) {
+    rmSync(dataDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    return;
+  }
+  for (const entry of readdirSync(dataDir)) {
+    if (kept.has(entry.toLowerCase())) continue;
+    rmSync(path.join(dataDir, entry), { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+  }
 }
 
 export interface ControlServerOptions {

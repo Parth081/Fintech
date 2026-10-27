@@ -71,6 +71,30 @@ jobs:
           name: verify-m3-report
           path: verify-report/
 
+  verify-m5:
+    name: M5 - AI explainer (grounded, offline) and booth (verify:m5)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # Launches the whole system on 127.0.0.1:37070-37079 with ASSISTANT_LLM=off and no credentials, runs
+      # every scripted scenario with ambient traffic, asks >= 100 questions per scenario through the gateway
+      # and re-derives every cited fact from the broker log; plus off-topic / prompt-injection probes, booth
+      # consent / staff PIN / analytics privacy, leads surviving resets, and a static no-outbound check.
+      - run: npm run verify:m5 -- --report-dir verify-report
+        env:
+          ASSISTANT_LLM: "off"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verify-m5-report
+          path: verify-report/
+
   compose:
     name: Validate docker compose file
     runs-on: ubuntu-latest

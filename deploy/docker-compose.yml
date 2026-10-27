@@ -7,7 +7,7 @@
 #   docker compose -f deploy/docker-compose.yml down -v               # stop + delete volumes
 #
 # Ports published on 127.0.0.1 only: broker 7070, payment-api 7071, gateway 7072, ledger 7073,
-# orchestrator 7074 (scenarios, ambient traffic, presenter API).
+# orchestrator 7074 (scenarios, ambient traffic, presenter API), assistant 7076, booth 7077.
 # Unlike `npm start` (embedded PGlite under DATA_DIR/ledger), the ledger here uses the `postgres`
 # service through DATABASE_URL (ADR 0005).
 #
@@ -17,6 +17,13 @@
 # To start from a clean slate in Docker, recreate the stack:
 #   docker compose -f deploy/docker-compose.yml down -v && docker compose -f deploy/docker-compose.yml up -d --wait
 # Ambient payments per second while no scenario runs: AMBIENT_RATE (default 3; 0 = off).
+#
+# M5: AI explainer (assistant, 7076) and booth (7077: kiosk leads + anonymous analytics).
+# In Docker the explainer is OFFLINE by default (ASSISTANT_LLM=off: grounded answers built from the event
+# log, no network). To let Claude phrase the answers (every number is still verified against the log):
+#   ASSISTANT_LLM=auto ANTHROPIC_API_KEY=... docker compose -f deploy/docker-compose.yml up -d
+# The key is passed to the assistant container only. Booth leads live in the booth-data volume; set
+# BOOTH_STAFF_PIN for a real event (default demo PIN 2468). `down -v` deletes the leads too.
 #
 # Redpanda / Kafka profile:
 #   BUS=kafka docker compose -f deploy/docker-compose.yml --profile redpanda up --build
@@ -42,6 +49,8 @@ x-service: &service
     GATEWAY_PORT: "7072"
     LEDGER_PORT: "7073"
     ORCHESTRATOR_PORT: "7074"
+    ASSISTANT_PORT: "7076"
+    BOOTH_PORT: "7077"
     BUS: ${BUS:-local}
     BROKER_URL: ws://broker:7070
     KAFKA_BROKERS: redpanda:9092
@@ -49,6 +58,8 @@ x-service: &service
     GATEWAY_URL: http://gateway:7072
     LEDGER_URL: http://ledger:7073
     ORCHESTRATOR_URL: http://orchestrator:7074
+    ASSISTANT_URL: http://assistant:7076
+    BOOTH_URL: http://booth:7077
     # No launcher in Docker: reset is unavailable (the gateway answers 503).
     LAUNCHER_CONTROL_URL: ""
     AMBIENT_RATE: ${AMBIENT_RATE:-3}
@@ -194,6 +205,53 @@ services:
       retries: 20
       start_period: 10s
 
+  # M5: AI explainer. Reads the event log; narrates recorded facts only. Offline unless ASSISTANT_LLM=auto
+  # and credentials are provided.
+  assistant:
+    <<: *service
+    command: ["services/assistant/src/index.ts"]
+    environment:
+      HOST: 0.0.0.0
+      ASSISTANT_PORT: "7076"
+      BUS: ${BUS:-local}
+      BROKER_URL: ws://broker:7070
+      KAFKA_BROKERS: redpanda:9092
+      ORCHESTRATOR_URL: http://orchestrator:7074
+      LEDGER_URL: http://ledger:7073
+      DATA_DIR: /data
+      ASSISTANT_LLM: ${ASSISTANT_LLM:-off}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    depends_on: *after-bus
+    ports:
+      - "127.0.0.1:7076:7076"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7076/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  # M5: booth back end (visitor leads with explicit consent, anonymous analytics). No bus, no outbound
+  # requests; data in the booth-data volume (/data/booth).
+  booth:
+    <<: *service
+    command: ["services/booth/src/index.ts"]
+    environment:
+      HOST: 0.0.0.0
+      BOOTH_PORT: "7077"
+      DATA_DIR: /data
+      BOOTH_STAFF_PIN: ${BOOTH_STAFF_PIN:-2468}
+    volumes:
+      - booth-data:/data
+    ports:
+      - "127.0.0.1:7077:7077"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7077/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
   gateway:
     <<: *service
     command: ["services/gateway/src/index.ts"]
@@ -236,6 +294,7 @@ services:
       start_period: 15s
 
 volumes:
+  booth-data:
   broker-data:
   redpanda-data:
   ledger-pg:

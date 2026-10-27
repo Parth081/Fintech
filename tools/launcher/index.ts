@@ -45,7 +45,10 @@ async function main(): Promise<void> {
         gateway: args.gatewayPort,
         ledger: args.ledgerPort,
         orchestrator: args.orchestratorPort,
+        assistant: args.assistantPort,
+        booth: args.boothPort,
       },
+      assistantLlm: args.assistantLlm,
       controlPort: args.controlPort ?? undefined,
       ambientRate: args.ambientRate,
       dataDir: args.dataDir,
@@ -69,6 +72,8 @@ async function main(): Promise<void> {
   }
   const extra = [
     `  Ambient traffic ${args.ambientRate}/s` + (system.urls.control ? ` · reset: POST ${system.urls.control}/reset` : ''),
+    `  Booth: big screen ${system.urls.gateway}/#/stage · kiosk ${system.urls.gateway}/#/kiosk`,
+    `  AI explainer: ${args.assistantLlm === 'off' ? 'grounded answers only (--llm off, offline)' : 'Claude when credentials work, else grounded (--llm off for fully offline)'}`,
     `  Started in ${(system.startup.totalMs / 1000).toFixed(1)} s`,
   ];
   console.log(`\n${banner(system.urls.gateway, extra)}\n`);

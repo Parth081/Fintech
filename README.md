@@ -74,6 +74,9 @@ Stop everything with **Ctrl+C** (all child processes are stopped, none are left 
 | `npm run verify:m2:quick` | Same with 500 payments (~30 s). |
 | `npm run verify:m3 -- [opts]` | M3 Gate 2: runs the provider-outage scenario 10 times in a row (offline), checks breaker, failover, recovery, ledger and a < 10 s reset after each run; JSON report. See [M3](#m3---first-scenario-live). |
 | `npm run verify:m3:quick` | Same with 2 runs (~3 min, what CI runs). |
+| `npm run verify:m5 -- [opts]` | M5: AI explainer + booth. Runs every scripted scenario offline (`ASSISTANT_LLM=off`), asks ≥ 100 questions per scenario through the gateway and re-derives every cited fact from the event log; booth privacy checks; JSON report. See [M5](#m5---ai-explainer-and-booth-mode). |
+| `npm run verify:m5:quick` | Same, one scenario (provider-degraded). |
+| `npm run booth:clear-leads` | Deletes the visitor leads and booth analytics (`DATA_DIR/booth`) after typing `DELETE` (`--yes` to skip). A reset never does. |
 | `npm run bench:broker` | Broker benchmark: publish / catch-up throughput, reload time, memory for 120k events. |
 | `npm run typecheck` | `tsc` over all packages, services, apps, tools and tests. |
 | `npm test` | Unit tests (vitest), excluding e2e. |
@@ -82,7 +85,8 @@ Stop everything with **Ctrl+C** (all child processes are stopped, none are left 
 | `npm run ci` | typecheck + test + build:web + test:e2e, as CI does. |
 
 Launcher options: `--reset`, `--no-build`, `--quiet`, `--host`, `--broker-port`, `--api-port`,
-`--gateway-port`, `--ledger-port`, `--orchestrator-port`, `--control-port`, `--no-control`, `--ambient`,
+`--gateway-port`, `--ledger-port`, `--orchestrator-port`, `--assistant-port`, `--booth-port`, `--llm auto|off`,
+`--control-port`, `--no-control`, `--ambient`,
 `--data-dir`, `--stage-delay`, `--settlement-delay`, `--timeout`.
 
 ## Ports and environment
@@ -98,6 +102,12 @@ All defaults live in [`packages/contracts/src/config.ts`](packages/contracts/src
 | `GATEWAY_PORT` | `7072` | gateway | UI, API for the browser, live updates, `GET /health` |
 | `LEDGER_PORT` | `7073` | ledger | `GET /health`, `/ledger/trial-balance`, `/ledger/accounts`, `/ledger/journals?paymentId=`, `/ledger/invariants` |
 | `ORCHESTRATOR_PORT` | `7074` | orchestrator | Scenarios, ambient traffic, pace (`packages/contracts/src/orchestrator-api.ts`) |
+| `ASSISTANT_PORT` | `7076` | assistant | AI explainer (`packages/contracts/src/assistant-api.ts`; browser: `/api/assistant/*`) |
+| `BOOTH_PORT` | `7077` | booth | Leads + anonymous analytics (`packages/contracts/src/booth-api.ts`; browser: `/api/booth/*`) |
+| `ASSISTANT_LLM` | `auto` (launch for tests/verify: `off`; Docker: `off`) | assistant | `auto` = Claude phrases answers when credentials work, else grounded; `off` = grounded only, never uses the network |
+| `ANTHROPIC_API_KEY` | (empty) | assistant | Credentials for `ASSISTANT_LLM=auto` (read from the environment only; never stored or logged) |
+| `BOOTH_STAFF_PIN` | `2468` | booth | PIN for staff routes (header `X-Booth-Staff`); change it per event |
+| `ASSISTANT_URL` / `BOOTH_URL` | `http://HOST:7076` / `:7077` | gateway | Where the gateway proxies `/api/assistant/*` and `/api/booth/*` (502 JSON when down) |
 | `LAUNCHER_CONTROL_PORT` | `7079` | launcher | `GET /status`, `POST /reset` (only when started by `npm start`; `--control-port`) |
 | (vite dev) | `5173` | apps/web | `npm run dev -w @ct/web`, proxies `/api` and `/ws` to the gateway |
 | `BUS` | `local` | all | `local` (built-in broker), `memory` (single-process tests), `kafka` (Redpanda/Kafka) |
@@ -349,3 +359,80 @@ It prints a table with one row per run, plus a summary, writes `<data dir>/repor
 | orchestrator | 7074 | scenarios, ambient traffic, pace (`ORCHESTRATOR_PORT`) |
 | launcher control | 7079 | `GET /status`, `POST /reset` (`LAUNCHER_CONTROL_PORT`; only with `npm start`) |
 | verify:m3 | 27170-27174, 27179 | its own system (`--base-port`) |
+
+## M5 - AI explainer and booth mode
+
+M5 turns the Control Tower into a trade-show booth: a big screen that runs itself, a touch kiosk where
+visitors send a payment and ask "why?", and an AI explainer that answers **only from what the system
+recorded**. Decisions (ADRs): [0013 grounded-first AI explainer](docs/adr/0013-grounded-first-ai-explainer.md),
+[0014 booth privacy](docs/adr/0014-booth-privacy.md).
+
+### Booth setup
+
+```bash
+npm start                         # 13 processes + launcher control API; explainer in auto mode
+npm start -- --llm off            # fully offline explainer (grounded answers only)
+BOOTH_STAFF_PIN=8131 npm start    # your own staff PIN for the event (default 2468)
+```
+
+| Screen | URL | What it is |
+| --- | --- | --- |
+| Big screen | http://127.0.0.1:7072/#/stage | the live map; when nobody touches anything it runs the **attract loop** (orchestrator `POST /attract {enabled}`; a touch, `POST /attract/touch`, hands control back) |
+| Kiosk | http://127.0.0.1:7072/#/kiosk | visitor flow: pick a corridor, send a payment, watch it, ask the explainer, optional contact form with explicit consent; resets itself when idle |
+| Presenter | http://127.0.0.1:7072/#/presenter | scenarios, pace, ambient traffic, reset, and (with the staff PIN) leads, CSV export and booth summary |
+
+A **reset never deletes visitor leads**: the booth keeps running through it and `DATA_DIR/booth` is left in
+place (also with `npm start -- --reset`). Export them from the presenter console (or
+`curl -H "X-Booth-Staff: <PIN>" http://127.0.0.1:7072/api/booth/leads/export.csv`), then clear them on
+purpose with `npm run booth:clear-leads` (stop the system first; asks you to type `DELETE`).
+
+### AI explainer: grounded vs Claude
+
+- **Grounded (default offline mode, `ASSISTANT_LLM=off`).** Answers are built deterministically from the
+  event log: every number comes from a recorded field and is shown with a citation (event id + field). No
+  network, no credentials; this is what `verify:m5` and CI prove.
+- **Claude (`ASSISTANT_LLM=auto`, the `npm start` default).** When credentials work (environment only:
+  `ANTHROPIC_API_KEY`, or the other credentials the Anthropic SDK reads), Claude phrases the answer from the
+  same facts via read-only tools. Every number in its answer is verified against the citations; if that
+  fails, or the model is unreachable, the grounded (or a cached verified) answer is served instead. Visitors
+  never see an unverified answer.
+- The explainer narrates; it never makes, changes or recommends a payment decision, declines off-topic
+  questions, and ignores instructions embedded in questions.
+- Docker: `ASSISTANT_LLM=off` by default; `ASSISTANT_LLM=auto ANTHROPIC_API_KEY=... docker compose -f deploy/docker-compose.yml up -d`
+  to enable Claude.
+
+### Lead privacy
+
+Leads are stored only on this laptop (embedded PGlite under `DATA_DIR/booth`); the booth service makes no
+outbound requests. A lead needs explicit consent (`consent: true` plus the exact consent sentence shown) and
+a valid email, or it is rejected with 400. Listing, exporting, summarising and deleting leads (right to
+erasure) need the staff PIN (`X-Booth-Staff`). Kiosk analytics are anonymous: a random per-visit session id,
+and any event that looks like personal data (names, emails, phone numbers) is refused.
+
+### Proving it: `npm run verify:m5`
+
+```bash
+npm run verify:m5                                   # every scripted scenario (ports 37070-37079)
+npm run verify:m5 -- --scenario provider-outage     # one scenario (repeatable)
+npm run verify:m5 -- --help
+```
+
+It launches the system with a temp data dir, `ASSISTANT_LLM=off` and **no credentials**, then:
+
+| | check |
+| --- | --- |
+| static | `services/booth/src` contains no outbound HTTP/socket client and no non-local URL |
+| booth | consent required (missing/false/invalid email → 400), staff routes refuse a missing or wrong PIN, PIN works (list, CSV, summary), analytics refuse personal data, leads survive every reset, staff can erase a lead |
+| bank | per scenario, run with ambient traffic, then ambient stopped and drained: ≥ 100 questions from the assistant's `generateQuestionBank(scenarioId, log)` |
+| answers | each asked through the gateway (`POST /api/assistant/ask`): `verified: true`, grounded mode; every number in the text matches a citation value (display rounding only); every citation equals the value at `eventId` + `field` on the broker `/events` log; every aggregate citation (`eventId: null`) re-derived from the log by independent code (`tools/verify/m5-aggregates.ts`); key facts for the intent cited (e.g. a why-held answer cites the hold/score event of that payment) |
+| safety | off-topic questions declined; prompt-injection questions leak nothing (keys, instructions), repeat no injected claim, and cause no events or orchestrator change |
+
+Per-scenario table, `<data dir>/reports/verify-m5-<time>.json` (`--report-dir`), non-zero exit on any failure.
+
+### M5 ports
+
+| Service | Port | Notes |
+| --- | --- | --- |
+| assistant | 7076 | AI explainer (`ASSISTANT_PORT`); browser via `/api/assistant/*` |
+| booth | 7077 | leads + analytics (`BOOTH_PORT`); browser via `/api/booth/*` |
+| verify:m5 | 37070-37074, 37076, 37077, 37079 | its own system (`--base-port`) |

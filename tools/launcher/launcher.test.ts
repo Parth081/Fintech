@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { parseLauncherArgs } from './args';
-import { assertSafeToDelete, banner, prefixLine, SERVICE_NAMES, STAGES, stripOwnTag } from './launch';
+import { assertSafeToDelete, banner, prefixLine, PRESERVED_DATA_ENTRIES, RESET_SURVIVORS, SERVICE_NAMES, STAGES, stripOwnTag } from './launch';
 import { busyPortsMessage, findBusyPorts, isPortFree } from './ports';
 
 const defaults = {
@@ -38,7 +38,8 @@ describe('parseLauncherArgs', () => {
     );
     expect(a).toEqual({
       help: false, reset: true, buildWeb: false, quiet: true, host: '0.0.0.0', brokerPort: 8070, paymentApiPort: 8071,
-      gatewayPort: 8072, ledgerPort: 8073, orchestratorPort: 8074, controlPort: 8079, ambientRate: 2.5,
+      gatewayPort: 8072, ledgerPort: 8073, orchestratorPort: 8074, assistantPort: 7076, boothPort: 7077, assistantLlm: 'auto',
+      controlPort: 8079, ambientRate: 2.5,
       dataDir: 'tmp/data', stageDelayMs: 0, settlementDelayMs: 0, startupTimeoutMs: 5000,
     });
     expect(parseLauncherArgs(['-h'], defaults).help).toBe(true);
@@ -55,6 +56,17 @@ describe('parseLauncherArgs', () => {
     expect(() => parseLauncherArgs(['--ambient', '-1'], defaults)).toThrow(/ambient/);
     expect(() => parseLauncherArgs(['--ambient', '99'], defaults)).toThrow(/ambient/);
     expect(() => parseLauncherArgs(['--ambient'], defaults)).toThrow(/ambient/);
+    expect(() => parseLauncherArgs(['--llm', 'maybe'], defaults)).toThrow(/--llm/);
+    expect(() => parseLauncherArgs(['--booth-port', '7072'], defaults)).toThrow(/different/);
+    expect(() => parseLauncherArgs(['--assistant-port', '7077'], defaults)).toThrow(/different/);
+  });
+
+  it('M5: assistant and booth ports, --llm (npm start defaults to auto, env ASSISTANT_LLM=off wins)', () => {
+    const a = parseLauncherArgs(['--assistant-port', '8076', '--booth-port=8077', '--llm', 'off'], defaults);
+    expect(a).toMatchObject({ assistantPort: 8076, boothPort: 8077, assistantLlm: 'off' });
+    expect(parseLauncherArgs([], defaults).assistantLlm).toBe('auto');
+    expect(parseLauncherArgs([], { ...defaults, assistantLlm: 'off' } as typeof defaults).assistantLlm).toBe('off');
+    expect(parseLauncherArgs(['--llm=auto'], { ...defaults, assistantLlm: 'off' } as typeof defaults).assistantLlm).toBe('auto');
   });
 });
 
@@ -102,11 +114,17 @@ describe('stripOwnTag', () => {
   });
 });
 
-describe('service list (M2, M3)', () => {
-  it('runs the ledger and the orchestrator as their own services, not as stage processes', () => {
+describe('service list (M2, M3, M5)', () => {
+  it('runs the ledger, orchestrator, assistant and booth as their own services, not as stage processes', () => {
     expect(STAGES).not.toContain('ledger');
     expect(SERVICE_NAMES).toEqual([
-      'broker', 'payment-api', 'screening', 'risk', 'fx', 'routing', 'settlement', 'reconciliation', 'ledger', 'orchestrator', 'gateway',
+      'broker', 'payment-api', 'screening', 'risk', 'fx', 'routing', 'settlement', 'reconciliation', 'ledger', 'orchestrator',
+      'assistant', 'booth', 'gateway',
     ]);
+  });
+
+  it('keeps the booth (visitor leads) through a reset', () => {
+    expect(RESET_SURVIVORS).toEqual(['booth']);
+    expect(PRESERVED_DATA_ENTRIES).toContain('booth');
   });
 });

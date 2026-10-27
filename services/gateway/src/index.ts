@@ -26,9 +26,11 @@ async function main(): Promise<void> {
     webDist,
     orchestratorUrl: config.orchestratorUrl,
     launcherControlUrl: config.launcherControlUrl,
+    assistantUrl: config.assistantUrl,
+    boothUrl: config.boothUrl,
   });
   console.log(
-    `[gateway] listening on http://${config.host}:${gateway.port} (ws://${config.host}:${gateway.port}/ws), bus=${config.bus}, payment API ${config.paymentApiUrl}, ledger ${config.ledgerUrl}, orchestrator ${config.orchestratorUrl}, reset ${config.launcherControlUrl || 'unavailable'}, UI from ${webDist}`,
+    `[gateway] listening on http://${config.host}:${gateway.port} (ws://${config.host}:${gateway.port}/ws), bus=${config.bus}, payment API ${config.paymentApiUrl}, ledger ${config.ledgerUrl}, orchestrator ${config.orchestratorUrl}, reset ${config.launcherControlUrl || 'unavailable'}, assistant ${config.assistantUrl}, booth ${config.boothUrl}, UI from ${webDist}`,
   );
 
   let stopping = false;

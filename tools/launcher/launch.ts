@@ -2,6 +2,8 @@
 // again without leaving orphans. Used by `npm start` (index.ts), the end-to-end tests and verify:*.
 // M3: also starts the orchestrator, serves the launcher control API (control.ts) and can reset the
 // whole system (stop everything, delete the data dir, start again) in a few seconds.
+// M5: also starts the AI explainer (assistant) and the booth service. The booth keeps running through a
+// reset and its data (DATA_DIR/booth: visitor leads) is never deleted by a reset; see clear-leads.ts.
 import type { ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
@@ -11,6 +13,7 @@ import {
   ResetBusyError,
   startControlServer,
   wipeDataDir,
+  PRESERVED_DATA_ENTRIES,
   type ControlServerHandle,
   type LauncherStatus,
   type ResetResult,
@@ -18,17 +21,20 @@ import {
 import { busyPortsMessage, findBusyPorts } from './ports';
 import { isRunning, killTree, spawnShell, spawnTs, waitForExit } from './process';
 
-export { assertSafeToDelete } from './control';
+export { assertSafeToDelete, PRESERVED_DATA_ENTRIES } from './control';
 
 /** Stage processes (services/stages). Since M2 the ledger is its own service (services/ledger), not a stage. */
 export const STAGES = ['screening', 'risk', 'fx', 'routing', 'settlement', 'reconciliation'] as const;
 export type Stage = (typeof STAGES)[number];
 
 /** Every process the launcher manages, in start order. Names accepted by restart()/kill(). */
-export const SERVICE_NAMES = ['broker', 'payment-api', ...STAGES, 'ledger', 'orchestrator', 'gateway'] as const;
+export const SERVICE_NAMES = ['broker', 'payment-api', ...STAGES, 'ledger', 'orchestrator', 'assistant', 'booth', 'gateway'] as const;
 export type ServiceName = (typeof SERVICE_NAMES)[number];
 
 export const DEFAULT_ROOT_DIR = path.resolve(fileURLToPath(new URL('../../', import.meta.url)));
+
+/** Services that survive a reset (not stopped, not restarted): the booth keeps visitor leads across demo resets. */
+export const RESET_SURVIVORS: readonly ServiceName[] = ['booth'];
 
 /** Readiness polling interval for health URLs (kept tight: it is on the reset's critical path). */
 export const HEALTH_POLL_MS = 40;
@@ -41,7 +47,17 @@ export interface LaunchOptions {
    * Ports; `ledger` defaults to gateway + 1 and `orchestrator` to gateway + 2 (7073 / 7074 with the
    * default gateway port).
    */
-  ports?: { broker?: number; paymentApi?: number; gateway?: number; ledger?: number; orchestrator?: number };
+  ports?: {
+    broker?: number;
+    paymentApi?: number;
+    gateway?: number;
+    ledger?: number;
+    orchestrator?: number;
+    /** AI explainer; default gateway + 4 (7076). */
+    assistant?: number;
+    /** Booth (leads + analytics); default gateway + 5 (7077). */
+    booth?: number;
+  };
   /**
    * Port of the launcher control API (GET /status, POST /reset). Undefined = no control server and
    * LAUNCHER_CONTROL_URL is empty (the gateway then answers reset with 503). 0 = any free port.
@@ -57,6 +73,18 @@ export interface LaunchOptions {
   ambientRate?: number;
   /** Start the orchestrator (default true). */
   orchestrator?: boolean;
+  /** Start the AI explainer (default true). */
+  assistant?: boolean;
+  /** Start the booth service (default true). */
+  booth?: boolean;
+  /**
+   * ASSISTANT_LLM for the assistant: 'auto' = phrase answers with Claude when credentials work, 'off' =
+   * grounded/cached answers only (fully offline). Default: env ASSISTANT_LLM, else 'off' (tests and verify
+   * tools must never depend on the network; `npm start` passes 'auto').
+   */
+  assistantLlm?: 'auto' | 'off';
+  /** Booth staff PIN (X-Booth-Staff). Default env BOOTH_STAFF_PIN, else the demo default 2468. */
+  boothStaffPin?: string;
   /** Postgres URL for the ledger; empty/undefined = embedded PGlite under dataDir/ledger (env DATABASE_URL). */
   databaseUrl?: string;
   /** Simulation seed for markets and providers (env SIM_SEED). */
@@ -86,7 +114,18 @@ export interface StartupTiming {
 
 export interface LaunchedSystem {
   /** `control` is present only when the control API runs (controlPort set). */
-  urls: { gateway: string; paymentApi: string; broker: string; ledger: string; orchestrator: string; control?: string };
+  urls: {
+    gateway: string;
+    paymentApi: string;
+    broker: string;
+    ledger: string;
+    orchestrator: string;
+    /** Present when the assistant was started. */
+    assistant?: string;
+    /** Present when the booth was started. */
+    booth?: string;
+    control?: string;
+  };
   /** Names of the processes this launch manages (broker omitted with BUS=kafka). */
   services: readonly ServiceName[];
   /** How long the initial start took and when each service became ready. */
@@ -125,6 +164,8 @@ const COLORS: Record<string, number> = {
   ledger: 96,
   reconciliation: 93,
   orchestrator: 94,
+  assistant: 91,
+  booth: 32,
   gateway: 92,
   'build:web': 90,
   launcher: 97,
@@ -196,6 +237,12 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
   const ledgerPort = options.ports?.ledger ?? gatewayPort + 1;
   const orchestratorPort = options.ports?.orchestrator ?? gatewayPort + 2;
   const withOrchestrator = options.orchestrator ?? true;
+  const assistantPort = options.ports?.assistant ?? gatewayPort + 4;
+  const boothPort = options.ports?.booth ?? gatewayPort + 5;
+  const withAssistant = options.assistant ?? true;
+  const withBooth = options.booth ?? true;
+  const assistantLlm = options.assistantLlm ?? (process.env.ASSISTANT_LLM === 'auto' ? 'auto' : 'off');
+  const boothStaffPin = options.boothStaffPin ?? (process.env.BOOTH_STAFF_PIN || '2468');
   const controlPort = options.controlPort;
   const dataDir = path.resolve(rootDir, options.dataDir ?? '.data');
   const timeoutMs = options.startupTimeoutMs ?? 30_000;
@@ -212,6 +259,8 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     { name: 'gateway', port: gatewayPort },
     { name: 'ledger', port: ledgerPort },
     ...(withOrchestrator ? [{ name: 'orchestrator', port: orchestratorPort }] : []),
+    ...(withAssistant ? [{ name: 'assistant', port: assistantPort }] : []),
+    ...(withBooth ? [{ name: 'booth', port: boothPort }] : []),
     ...(controlPort ? [{ name: 'launcher control', port: controlPort }] : []),
   ];
   if (new Set(wanted.map((w) => w.port)).size !== wanted.length) {
@@ -224,7 +273,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
   assertSafeToDelete(dataDir, rootDir);
   if (options.reset) {
     wipeDataDir(dataDir, rootDir);
-    say(`reset: deleted ${dataDir}`);
+    say(`reset: deleted ${dataDir} (kept ${PRESERVED_DATA_ENTRIES.join(', ')}: visitor leads survive resets; npm run booth:clear-leads)`);
   }
 
   // 3. Control server (before the services, so the gateway gets its URL).
@@ -250,6 +299,8 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     gateway: `http://${probeHost}:${gatewayPort}`,
     ledger: `http://${probeHost}:${ledgerPort}`,
     orchestrator: `http://${probeHost}:${orchestratorPort}`,
+    ...(withAssistant ? { assistant: `http://${probeHost}:${assistantPort}` } : {}),
+    ...(withBooth ? { booth: `http://${probeHost}:${boothPort}` } : {}),
     ...(control ? { control: control.url } : {}),
   };
 
@@ -263,6 +314,8 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     GATEWAY_PORT: String(gatewayPort),
     LEDGER_PORT: String(ledgerPort),
     ORCHESTRATOR_PORT: String(orchestratorPort),
+    ASSISTANT_PORT: String(assistantPort),
+    BOOTH_PORT: String(boothPort),
     ...(control ? { LAUNCHER_CONTROL_PORT: String(control.port) } : {}),
     BUS: bus,
     BROKER_URL: urls.broker,
@@ -270,6 +323,11 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     GATEWAY_URL: urls.gateway,
     LEDGER_URL: urls.ledger,
     ORCHESTRATOR_URL: urls.orchestrator,
+    // Always set, even when not started: the gateway then answers /api/assistant|booth/* with 502.
+    ASSISTANT_URL: urls.assistant ?? `http://${probeHost}:${assistantPort}`,
+    BOOTH_URL: urls.booth ?? `http://${probeHost}:${boothPort}`,
+    ASSISTANT_LLM: assistantLlm,
+    BOOTH_STAFF_PIN: boothStaffPin,
     LAUNCHER_CONTROL_URL: urls.control ?? '',
     AMBIENT_RATE: String(ambientRate),
     DATA_DIR: dataDir,
@@ -309,8 +367,11 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
         // Stop in reverse dependency order (gateway + orchestrator, then api + stages + ledger, then
         // broker) so consumers do not log broker-disconnect noise. Each tier is killed in parallel.
         const tier = (r: Running): number =>
-          r.spec.name === 'gateway' || r.spec.name === 'orchestrator' ? 0 : r.spec.name === 'broker' ? 2 : 1;
+          r.spec.name === 'gateway' || r.spec.name === 'orchestrator' || r.spec.name === 'assistant' ? 0 : r.spec.name === 'broker' ? 2 : 1;
         await Promise.allSettled(restarting);
+        // The booth holds visitor leads: ask it to close its database cleanly first (closing stdin
+        // triggers exitWithSupervisor), and only then kill whatever is left.
+        await Promise.all([...alive].filter((r) => r.spec.name === 'booth').map((r) => gracefulStop(r, 4000)));
         for (const t of [0, 1, 2]) await killAll([...alive].filter((r) => tier(r) === t));
         // A reset that was starting services has seen `stopping` and spawns nothing more; kill whatever
         // it spawned meanwhile, then let it settle.
@@ -321,6 +382,18 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
       })();
     }
     return stopPromise;
+  };
+
+  /** Close the child's stdin (the supervised service shuts down cleanly) and wait; kill the tree after graceMs. */
+  const gracefulStop = async (r: Running, graceMs: number): Promise<void> => {
+    r.intentional = true;
+    try {
+      r.child.stdin?.end();
+    } catch {
+      /* already closed */
+    }
+    await waitForExit(r.child, graceMs);
+    await killTree(r.child);
   };
 
   const describeFailure = (r: Running, why: string): string => {
@@ -427,6 +500,8 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     ledger: { name: 'ledger', script: 'services/ledger/src/index.ts', healthUrl: `${urls.ledger}/health` },
     orchestrator: { name: 'orchestrator', script: 'services/orchestrator/src/index.ts', healthUrl: `${urls.orchestrator}/health` },
     gateway: { name: 'gateway', script: 'services/gateway/src/index.ts', healthUrl: `${urls.gateway}/health` },
+    assistant: { name: 'assistant', script: 'services/assistant/src/index.ts', healthUrl: `http://${probeHost}:${assistantPort}/health` },
+    booth: { name: 'booth', script: 'services/booth/src/index.ts', healthUrl: `http://${probeHost}:${boothPort}/health` },
   } satisfies Partial<Record<ServiceName, ServiceSpec>>;
   const stageSpec = (s: Stage): ServiceSpec => ({ name: s, script: 'services/stages/src/index.ts', args: ['--stage', s], readyLine: /\bready\b/i });
 
@@ -435,6 +510,8 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
    *   t0      broker + ledger (the ledger opens PGlite first, the slowest step, and only then the bus)
    *   broker  payment-api, 6 stages, gateway (all connect to the bus; their clients retry anyway)
    *   api     orchestrator (it posts ambient payments to the payment API)
+   *   M5: booth at t0 (own PGlite, no bus) unless it is still running (a reset keeps it); assistant once
+   *   the broker is up (it reads the event log).
    */
   const bootAll = async (): Promise<StartupTiming> => {
     const t0 = Date.now();
@@ -450,6 +527,14 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
       waits.push(p);
       return p;
     };
+    if (withBooth) {
+      const kept = [...alive].find((r) => r.spec.name === 'booth' && isRunning(r.child));
+      if (kept) {
+        if (!running.includes(kept)) running.push(kept);
+      } else {
+        add(track(start(SPEC.booth)));
+      }
+    }
     if (bus !== 'kafka') {
       const broker = start(SPEC.broker);
       add(track(start(SPEC.ledger)));
@@ -461,6 +546,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     const apiReady = add(track(api));
     for (const s of STAGES) add(track(start(stageSpec(s))));
     add(track(start(SPEC.gateway)));
+    if (withAssistant) add(track(start(SPEC.assistant)));
     if (withOrchestrator) {
       add(
         apiReady.then(async () => {
@@ -543,18 +629,19 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
       const t0 = Date.now();
       say('reset: stopping every service...');
       await Promise.allSettled(restarting);
-      // Everything at once: nothing needs a graceful goodbye, the data is deleted next.
+      // Everything at once: nothing needs a graceful goodbye, the data is deleted next. The booth
+      // (visitor leads) keeps running and keeps its data.
       started = false;
-      await killAll(alive);
+      await killAll([...alive].filter((r) => !RESET_SURVIVORS.includes(r.spec.name) || !isRunning(r.child)));
       const stopMs = Date.now() - t0;
       if (stopping) throw new Error('the launcher is stopping');
 
       const w0 = Date.now();
       wipeDataDir(dataDir, rootDir);
       const wipeMs = Date.now() - w0;
-      say(`reset: deleted ${dataDir}; starting every service...`);
+      say(`reset: deleted ${dataDir} (kept ${PRESERVED_DATA_ENTRIES.join(', ')}); starting every service...`);
 
-      running = [];
+      running = running.filter((r) => RESET_SURVIVORS.includes(r.spec.name) && isRunning(r.child));
       startupCrash = undefined;
       crashWaiters = [];
       reportedCrash = false;
