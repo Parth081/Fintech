@@ -243,3 +243,62 @@
   .ms-hero, .ms-side, .ms-pipe { transition: none; }
   .ms-route, .ms-prov-bar span { transition: none; }
 }
+
+/* ---------- M5 attract loop: story caption, call to action, "Explained" card ---------- */
+.ms-attract { cursor: pointer; }
+.ms-story {
+  --ms-story-tone: var(--accent);
+  justify-self: center; min-width: 0; max-width: 100%; width: min(100%, 52em);
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: 'kicker dots' 'text text';
+  align-items: center; gap: 0.25em 1.2em; padding: 0.55em 1.6em 0.7em; border-radius: 0.9em;
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--ms-story-tone) 16%, transparent), transparent 70%),
+    color-mix(in srgb, var(--bg-elev) 88%, transparent);
+  border: 0.12em solid color-mix(in srgb, var(--ms-story-tone) 55%, var(--border));
+  box-shadow: 0 0.5em 2.2em color-mix(in srgb, var(--ms-story-tone) 18%, rgba(0, 0, 0, 0.35));
+  transition: border-color 0.9s ease, box-shadow 0.9s ease, background 0.9s ease;
+}
+.ms-story-alert { --ms-story-tone: var(--bad); }
+.ms-story-recover { --ms-story-tone: var(--warn); }
+.ms-story-ok { --ms-story-tone: var(--ok); }
+.ms-story-invite { --ms-story-tone: var(--sim); }
+.ms-story-kicker {
+  grid-area: kicker; display: inline-flex; align-items: center; gap: 0.5em;
+  font-size: 0.85em; font-weight: 800; letter-spacing: 0.12em; text-transform: uppercase; color: var(--text-dim);
+}
+.ms-story-kicker i { width: 0.6em; height: 0.6em; border-radius: 50%; background: var(--ms-story-tone); animation: ms-breathe 2.4s ease-in-out infinite; }
+.ms-story-text { grid-area: text; min-width: 0; animation: ms-story-in 0.9s cubic-bezier(0.2, 0.7, 0.2, 1) both; }
+.ms-story-headline {
+  margin: 0; font-size: 2.55em; font-weight: 850; line-height: 1.08; letter-spacing: -0.01em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text);
+}
+.ms-story-alert .ms-story-headline { color: color-mix(in srgb, var(--bad) 70%, var(--text)); }
+.ms-story-sub { margin: 0.2em 0 0; font-size: 1.15em; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ms-story-dots { grid-area: dots; display: flex; gap: 0.4em; margin: 0; padding: 0; list-style: none; }
+.ms-story-dots li { width: 0.55em; height: 0.55em; border-radius: 999px; background: var(--border); transition: width 0.6s ease, background 0.6s ease; }
+.ms-story-dots li.ms-dot-done { background: color-mix(in srgb, var(--ms-story-tone) 55%, var(--border)); }
+.ms-story-dots li.ms-dot-now { width: 1.6em; background: var(--ms-story-tone); }
+@keyframes ms-story-in { from { opacity: 0; transform: translateY(0.35em); filter: blur(0.06em); } to { opacity: 1; transform: none; filter: none; } }
+@keyframes ms-breathe { 0%, 100% { opacity: 0.45; } 50% { opacity: 1; } }
+
+.ms-hero { position: relative; }
+.ms-cta {
+  position: absolute; right: 0.8em; bottom: 0.6em; z-index: 3;
+  font: inherit; font-size: 1.25em; font-weight: 700; letter-spacing: 0.01em; color: var(--text);
+  padding: 0.5em 1.1em; border-radius: 999px; border: 0.08em solid color-mix(in srgb, var(--sim) 45%, var(--border));
+  background: color-mix(in srgb, var(--bg-elev) 85%, transparent); box-shadow: 0 0.4em 1.4em rgba(0, 0, 0, 0.3);
+  animation: ms-cta-float 3.2s ease-in-out infinite;
+}
+.ms-cta span { display: inline-block; margin-left: 0.25em; color: var(--sim); }
+.ms-cta-strong { font-size: 1.55em; border-color: var(--sim); background: color-mix(in srgb, var(--sim) 16%, var(--bg-elev)); }
+@keyframes ms-cta-float { 0%, 100% { transform: translateY(0); opacity: 0.88; } 50% { transform: translateY(-0.18em); opacity: 1; } }
+
+.ms-explained { flex: 1; min-height: 0; overflow: hidden; animation: ms-story-in 0.8s ease-out both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .ms-story, .ms-story-dots li { transition: none; }
+  /* no movement: a plain, slow cross-fade between beats */
+  .ms-story-text, .ms-explained { animation: ms-fade 0.6s ease both; }
+  .ms-story-kicker i, .ms-cta { animation: none; }
+}
+@keyframes ms-fade { from { opacity: 0; } to { opacity: 1; } }

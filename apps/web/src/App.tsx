@@ -14,11 +14,38 @@ import { ProvidersView } from './components/ProvidersView';
 import { PresenterConsole } from './components/PresenterConsole';
 import { ResetNotice, ScenarioBanner } from './components/ScenarioBanner';
 import { hashFor, NAV_VIEWS } from './lib/route';
+import { isKioskHash, loadKiosk } from './attract/kiosk';
 
 // The world-map main stage (owned by apps/web/src/stage) loads on demand: the other views stay light.
 const MainStage = lazy(() => import('./stage/MainStage').then((m) => ({ default: m.MainStage })));
+// M5 visitor kiosk (#/kiosk): its own lazy chunk; guarded, so a build without the kiosk still works.
+const Kiosk = loadKiosk ? lazy(loadKiosk) : null;
+
+function useKioskRoute(): boolean {
+  const [kiosk, setKiosk] = useState(() => isKioskHash(window.location.hash));
+  useEffect(() => {
+    const on = () => setKiosk(isKioskHash(window.location.hash));
+    window.addEventListener('hashchange', on);
+    return () => window.removeEventListener('hashchange', on);
+  }, []);
+  return kiosk;
+}
 
 export function App() {
+  // The kiosk runs its own feeds: the main app (and its live socket) is not mounted under it.
+  if (useKioskRoute()) {
+    return Kiosk ? (
+      <Suspense fallback={<div className="stage-loading">Loading…</div>}>
+        <Kiosk />
+      </Suspense>
+    ) : (
+      <div className="stage-loading">The visitor kiosk is not part of this build.</div>
+    );
+  }
+  return <MainApp />;
+}
+
+function MainApp() {
   const live = useLiveFeed();
   const { feed, connection, control } = live;
   const view = useHashRoute('stage');

@@ -1,0 +1,84 @@
+/* AI "Ask why" panel. Console variant sized in rem (tablet); stage variant in em off the stage font size. */
+.ask {
+  --ask-accent: var(--info, #8f9bff);
+  display: flex; flex-direction: column; gap: 0.75rem;
+  background: linear-gradient(160deg, color-mix(in srgb, var(--ask-accent) 9%, var(--bg-elev)), var(--bg-elev) 60%);
+  border: 2px solid color-mix(in srgb, var(--ask-accent) 35%, var(--border));
+  border-radius: 16px; padding: 1rem 1.1rem 1.1rem; color: var(--text);
+}
+.ask-head { display: flex; align-items: center; gap: 0.6rem; }
+.ask-spark { color: var(--ask-accent); font-size: 1.3em; line-height: 1; }
+.ask-head-text { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.ask-title { margin: 0; font-size: 1.2rem; line-height: 1.15; }
+.ask-sub { font-size: 0.85rem; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ask-mode {
+  flex: none; font-size: 0.72rem; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase;
+  padding: 0.2em 0.6em; border-radius: 999px; border: 1px solid var(--border); color: var(--text-dim); cursor: help;
+}
+.ask-mode-llm { color: var(--ask-accent); border-color: color-mix(in srgb, var(--ask-accent) 50%, transparent); }
+.ask-mode-grounded { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+
+.ask-body { display: flex; flex-direction: column; gap: 0.55rem; animation: ask-in 0.35s ease-out; }
+.ask-q { margin: 0; color: var(--text-dim); font-style: italic; font-size: 0.95rem; }
+.ask-answer { margin: 0; font-size: 1.05rem; line-height: 1.45; }
+.ask-error { margin: 0; color: var(--warn); font-weight: 600; font-size: 0.95rem; }
+
+.ask-loading { display: flex; flex-direction: column; gap: 0.4rem; }
+.ask-shimmer {
+  display: block; height: 0.8em; border-radius: 999px;
+  background: linear-gradient(90deg, var(--bg-elev-2) 0%, color-mix(in srgb, var(--ask-accent) 25%, var(--bg-elev-2)) 50%, var(--bg-elev-2) 100%);
+  background-size: 200% 100%; animation: ask-shimmer 1.4s linear infinite;
+}
+.ask-shimmer-short { width: 60%; }
+.ask-loading-text { font-size: 0.85rem; color: var(--text-dim); }
+
+.ask-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem 0.6rem; }
+.ask-facts-label { font-size: 0.72rem; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-dim); }
+.ask-chips { display: flex; flex-wrap: wrap; gap: 0.45rem; margin: 0; padding: 0; list-style: none; }
+.ask-cite {
+  font-size: 0.85rem; font-weight: 600; padding: 0.22em 0.65em; border-radius: 999px; cursor: help;
+  background: color-mix(in srgb, var(--ok) 10%, var(--bg-elev-2)); border: 1px solid color-mix(in srgb, var(--ok) 35%, var(--border));
+  font-variant-numeric: tabular-nums;
+}
+.ask-chip {
+  font: inherit; font-size: 0.92rem; font-weight: 600; color: var(--text); text-align: left;
+  padding: 0.5em 0.85em; min-height: 44px; border-radius: 999px; cursor: pointer;
+  background: var(--bg-elev-2); border: 1px solid var(--border); transition: border-color 0.2s, background 0.2s;
+}
+.ask-chip:hover:not(:disabled) { border-color: var(--ask-accent); background: color-mix(in srgb, var(--ask-accent) 12%, var(--bg-elev-2)); }
+.ask-chip:disabled { opacity: 0.5; cursor: progress; }
+.ask-chip:focus-visible, .ask-send:focus-visible, .ask-input:focus-visible { outline: 3px solid var(--ask-accent); outline-offset: 2px; }
+
+.ask-form { display: flex; gap: 0.5rem; }
+.ask-input {
+  flex: 1; min-width: 0; font: inherit; font-size: 1rem; color: var(--text); min-height: 44px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 0 0.8em;
+}
+.ask-send {
+  font: inherit; font-weight: 800; padding: 0 1.1em; min-height: 44px; border-radius: 10px; cursor: pointer;
+  background: var(--ask-accent); color: #0b1020; border: none;
+}
+.ask-send:disabled { opacity: 0.45; cursor: not-allowed; }
+.ask-visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+/* ---- stage variant: big screen, read-only "Explained" card ---- */
+.ask-stage { font-size: 1em; gap: 0.55em; padding: 0.8em 1em 0.9em; border-radius: 0.7em; border-width: 0.12em; box-shadow: 0 0.6em 2em rgba(0, 0, 0, 0.3); }
+.ask-stage .ask-title { font-size: 1.3em; }
+.ask-stage .ask-sub { font-size: 0.9em; }
+.ask-stage .ask-mode { font-size: 0.75em; }
+.ask-stage .ask-q { font-size: 1em; }
+.ask-stage .ask-answer { font-size: 1.2em; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 5; -webkit-box-orient: vertical; overflow: hidden; }
+.ask-stage .ask-facts-label { font-size: 0.75em; }
+.ask-stage .ask-cite { font-size: 0.95em; }
+.ask-stage .ask-loading-text { font-size: 0.9em; }
+.ask-stage .ask-chip { font-size: 0.95em; min-height: 0; }
+.ask-stage .ask-error { font-size: 1em; }
+
+@keyframes ask-in { from { opacity: 0; transform: translateY(0.3em); } to { opacity: 1; transform: none; } }
+@keyframes ask-shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .ask-body { animation: none; }
+  .ask-shimmer { animation: none; }
+  .ask-chip { transition: none; }
+}

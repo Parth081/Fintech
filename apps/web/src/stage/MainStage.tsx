@@ -18,6 +18,11 @@ import { kpiTiles, ledgerBadge } from './panels';
 import type { StageResetState } from './reset';
 import { usePrefersReducedMotion, useStageFeed } from './useStageFeed';
 import { ROUTES, WorldMap } from './WorldMap';
+import { parseAttract, showCta, storyCard, touchAttract, type StoryCard } from '../attract/attract';
+import { KIOSK_AVAILABLE, KIOSK_HASH } from '../attract/kiosk';
+import { AskPanel } from '../assistant/AskPanel';
+import type { SuggestedQuestion } from '@ct/contracts/browser';
+import { StoryCaption, TouchCta } from './AttractStory';
 import './stage.css';
 
 const PROVIDER_IDS = PROVIDERS.map((p) => p.id);
@@ -27,6 +32,11 @@ const SHORT_PROVIDERS = PROVIDERS.map((p) => ({ id: p.id, name: shortName(p.name
 const NOW_WINDOW_MS = 15_000;
 /** A presenter focus callout disappears on its own after this long. */
 const FOCUS_MS = 20_000;
+/** Attract-loop beats where the side panel shows the AI "Explained" card instead of provider health. */
+const EXPLAINED_BEATS = new Set(['recovered', 'ledger', 'invite']);
+const SCENARIO_CONTEXT = { kind: 'scenario' } as const;
+/** The "Explained" card asks the outage-story question if the assistant offers one, else its first suggestion. */
+const pickStoryQuestion = (qs: SuggestedQuestion[]) => (qs.find((q) => q.intent === 'outage_story') ?? qs[0])?.text ?? null;
 
 function toFeedMessage(m: ServerMessage): FeedMessage {
   if (m.kind === 'snapshot') return { kind: 'snapshot', payments: m.payments };
@@ -132,15 +142,41 @@ export function MainStage({ embedded = false }: MainStageProps = {}) {
   }, [reset.phase, refreshLedger]);
   const badge = ledgerBadge(ledger.data);
 
+  // ---- M5 attract loop: story card, call to action, "Explained" card ------------------------
+  const attract = useMemo(() => parseAttract(ctl.orchestrator), [ctl.orchestrator]);
+  const story = reset.phase === 'idle' ? storyCard(ctl.control, attract) : null;
+  const explained = story !== null && EXPLAINED_BEATS.has(story.stepId);
+  // Someone touched the big screen: stop the loop and, when this build has one, open the kiosk.
+  const onTouch = useCallback(() => {
+    void touchAttract();
+    if (KIOSK_AVAILABLE) window.location.hash = KIOSK_HASH;
+  }, []);
+
   return (
-    <div className={`ms-root${embedded ? ' ms-embedded' : ''}${reset.phase === 'resetting' ? ' ms-is-resetting' : ''}`}>
-      <StageHeader connection={connection} control={ctlState} />
+    <div
+      className={`ms-root${embedded ? ' ms-embedded' : ''}${reset.phase === 'resetting' ? ' ms-is-resetting' : ''}${story ? ' ms-attract' : ''}`}
+      onPointerDown={story ? onTouch : undefined}
+    >
+      <StageHeader connection={connection} control={ctlState} story={story} />
       <div className="ms-hero">
         <WorldMap hubStyles={hubStyles} shares={tick.map} ingest={ingest} config={config} alert={reset.phase === 'idle' ? alert : null} focusId={focusId} />
+        {showCta(story) && <TouchCta strong={story?.tone === 'invite'} />}
       </div>
       <aside className="ms-side">
         <StageKpis stats={feed.stats} badge={badge} />
-        <ProviderPanel shares={tick.panel} hubStyles={hubStyles} hasBreakers={ctl.available && ctl.breakers.length > 0} />
+        {explained ? (
+          <AskPanel
+            className="ms-explained"
+            variant="stage"
+            title="Explained"
+            subtitle="What just happened, from the record"
+            context={SCENARIO_CONTEXT}
+            maxChips={0}
+            autoAsk={pickStoryQuestion}
+          />
+        ) : (
+          <ProviderPanel shares={tick.panel} hubStyles={hubStyles} hasBreakers={ctl.available && ctl.breakers.length > 0} />
+        )}
       </aside>
       <div className="ms-pipe">
         <PipelineStrip stats={feed.stats} pulses={feed.pulses} />
@@ -159,7 +195,7 @@ const CONN_LABEL: Record<ConnectionStatus, string> = {
   offline: 'Offline',
 };
 
-function StageHeader({ connection, control }: { connection: ConnectionStatus; control: StageControl | null }) {
+function StageHeader({ connection, control, story }: { connection: ConnectionStatus; control: StageControl | null; story: StoryCard | null }) {
   // Audience caption: scenario title + current step title (never the presenter narration).
   const banner = bannerFor(control);
   const paused = control?.orchestrator?.paused ?? control?.control.paused ?? false;
@@ -169,6 +205,9 @@ function StageHeader({ connection, control }: { connection: ConnectionStatus; co
         <h1>Global Fintech Control Tower</h1>
         <span className="ms-brand-sub">Cross-border payments · US→IN · DE→BR · GB→PH</span>
       </div>
+      {story ? (
+        <StoryCaption card={story} />
+      ) : (
       <div className={`ms-caption${banner ? ' ms-caption-active' : ''}`} aria-live="polite">
         {banner ? (
           <>
@@ -187,6 +226,7 @@ function StageHeader({ connection, control }: { connection: ConnectionStatus; co
           </>
         )}
       </div>
+      )}
       <div className="ms-head-right">
         <span className={`ms-conn ms-conn-${connection}`}>
           <i aria-hidden="true" />

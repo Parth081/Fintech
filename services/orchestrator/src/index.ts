@@ -4,11 +4,20 @@ import { fileURLToPath } from 'node:url';
 import { exitWithSupervisor, serviceConfig } from '@ct/contracts';
 import { createBus } from '@ct/event-bus';
 import { startOrchestrator } from './orchestrator';
+import { attractIdleFromEnv } from './attract';
 
 export { startOrchestrator, PACE_PRESETS, type OrchestratorOptions, type OrchestratorHandle } from './orchestrator';
 export { SCENARIOS, PROVIDER_OUTAGE, PROVIDER_DEGRADED, SCENARIO_AMBIENT_RATE, scenarioInfo, validateScript, type ScenarioScript, type ScenarioStep, type ScenarioAction } from './scenarios';
 export { ambientPayment, ambientKeyPrefix, ambientIndexOf, MAX_AMBIENT_RATE } from './ambient';
 export { systemClock, FakeClock, type Clock } from './clock';
+export {
+  ATTRACT_LOOP,
+  ATTRACT_SCENARIO_ID,
+  DEFAULT_ATTRACT_IDLE_MS,
+  attractIdleFromEnv,
+  type AttractState,
+  type OrchestratorStateWithAttract,
+} from './attract';
 
 async function main(): Promise<void> {
   const config = serviceConfig();
@@ -20,10 +29,11 @@ async function main(): Promise<void> {
     paymentApiUrl: config.paymentApiUrl,
     seed: config.simSeed,
     ambientRate: config.ambientRate,
+    attract: { idleMs: attractIdleFromEnv(process.env.ATTRACT_IDLE_MS) },
     log: (line) => console.log(line),
   });
   console.log(
-    `[orchestrator] ready on http://${config.host}:${orchestrator.port} (bus=${config.bus}, ambient=${config.ambientRate}/s, payment-api=${config.paymentApiUrl})`,
+    `[orchestrator] ready on http://${config.host}:${orchestrator.port} (bus=${config.bus}, ambient=${config.ambientRate}/s, payment-api=${config.paymentApiUrl}, attract idle=${orchestrator.state().attract.idleMs} ms)`,
   );
 
   let shuttingDown = false;

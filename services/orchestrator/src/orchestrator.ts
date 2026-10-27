@@ -12,13 +12,13 @@ import {
   type ControlEvent,
   type ControlEventType,
   type ControlPayloadMap,
-  type OrchestratorState,
   type PacePreset,
 } from '@ct/contracts';
 import type { EventBus, Subscription } from '@ct/event-bus';
 import { AmbientTraffic, ambientIndexOf, MAX_AMBIENT_RATE, type PaymentSender } from './ambient';
 import { systemClock, type Clock, type TimerHandle } from './clock';
 import { SCENARIOS, scenarioInfo, validateScript, type ScenarioAction, type ScenarioScript } from './scenarios';
+import { ATTRACT_LOOP, type AttractState, type OrchestratorStateWithAttract } from './attract';
 
 export const PACE_PRESETS: Record<PacePreset, { stageDelayMs: number | null; settlementDelayMs: number | null }> = {
   normal: { stageDelayMs: null, settlementDelayMs: null },
@@ -42,13 +42,19 @@ export interface OrchestratorOptions {
   log?: (line: string) => void;
   /** Max time to wait for the log replay on startup. */
   catchUpTimeoutMs?: number;
+  /**
+   * M5 attract loop. idleMs: start it by itself after this long without a presenter command, kiosk touch
+   * or presenter scenario (0 = never by itself; the default, so tests and tools are not surprised).
+   * enabled: initial switch (default: idleMs > 0). script: the loop (default ATTRACT_LOOP; tests).
+   */
+  attract?: { idleMs?: number; enabled?: boolean; script?: ScenarioScript };
 }
 
 export interface OrchestratorHandle {
   port: number;
   /** Stops the active run cleanly (restores outages) unless `restore: false`, then stops serving. */
   close(opts?: { restore?: boolean }): Promise<void>;
-  state(): OrchestratorState;
+  state(): OrchestratorStateWithAttract;
   /** Resolves when every queued control-event publish has completed (tests). */
   idle(): Promise<void>;
 }
@@ -67,6 +73,8 @@ interface ActiveRun {
   openOutages: Set<string>;
   ambientBefore: number;
   finishing: boolean;
+  /** A cycle of the attract loop (not a presenter scenario). */
+  attract: boolean;
 }
 
 class HttpError extends Error {
@@ -124,6 +132,10 @@ export async function startOrchestrator(options: OrchestratorOptions): Promise<O
   for (const s of scripts) validateScript(s);
   const scriptById = new Map(scripts.map((s) => [s.id, s]));
   const infos = scripts.map(scenarioInfo);
+  const attractScript = options.attract?.script ?? ATTRACT_LOOP;
+  validateScript(attractScript);
+  if (scriptById.has(attractScript.id)) throw new Error(`orchestrator: attract loop id "${attractScript.id}" clashes with a scenario`);
+  const attractInfo = scenarioInfo(attractScript);
   const iso = () => new Date(clock.now()).toISOString();
 
   // ---- log projection: control timeline + ambient progress (ephemeral, from earliest) ----
@@ -230,6 +242,7 @@ export async function startOrchestrator(options: OrchestratorOptions): Promise<O
     r.timer = undefined;
     ambient.setRate(r.ambientBefore);
     if (run === r) run = null;
+    afterRunEnded(r, 'elsewhere');
   };
 
   const elapsed = (r: ActiveRun) => r.elapsedBase + (r.resumedAt === null ? 0 : clock.now() - r.resumedAt);
@@ -269,6 +282,7 @@ export async function startOrchestrator(options: OrchestratorOptions): Promise<O
       ambient.setRate(r.ambientBefore);
       if (run === r) run = null;
       log(`[orchestrator] scenario ${r.script.id} run ${r.runId} ${outcome}`);
+      afterRunEnded(r, outcome);
     });
   };
 
@@ -311,6 +325,11 @@ export async function startOrchestrator(options: OrchestratorOptions): Promise<O
   const startRun = async (scenarioId: string, runSeed: string): Promise<string> => {
     const script = scriptById.get(scenarioId);
     if (!script) throw new HttpError(404, 'unknown_scenario', { scenarioId, available: [...scriptById.keys()] });
+    return startScript(script, runSeed, false);
+  };
+
+  const startScript = async (script: ScenarioScript, runSeed: string, isAttract: boolean): Promise<string> => {
+    const scenarioId = script.id;
     if (run) throw new HttpError(409, 'scenario_active', { runId: run.runId, scenarioId: run.script.id });
     runCounter += 1;
     const runId = `run-${runCounter}-${scenarioId}`;
@@ -327,6 +346,7 @@ export async function startOrchestrator(options: OrchestratorOptions): Promise<O
       openOutages: new Set(),
       ambientBefore: ambient.rate,
       finishing: false,
+      attract: isAttract,
     };
     run = r;
     await enqueue(() => publishNow('control.scenario.started', { runId, scenarioId, title: script.title, seed: runSeed }, deterministicId('orchestrator', runId, 'started')));
@@ -367,7 +387,113 @@ export async function startOrchestrator(options: OrchestratorOptions): Promise<O
     pace = preset;
   };
 
-  const state = (): OrchestratorState => ({
+  // ---- attract loop (M5): plays by itself when nobody is using the demo ----
+  // Each cycle is an ordinary scenario run of the attract script (same control events, deterministic ids
+  // from the run id). It starts after `idleMs` without activity, never while a presenter scenario runs or the
+  // demo is paused, and any presenter command or kiosk touch stops it (finish() closes any open outage).
+  const attract = {
+    idleMs: Math.max(0, options.attract?.idleMs ?? 0),
+    enabled: false,
+    playing: false,
+    cycle: 0,
+    lastActivity: clock.now(),
+    lastStop: null as AttractState['lastStop'],
+    timer: undefined as TimerHandle | undefined,
+  };
+  attract.enabled = options.attract?.enabled ?? attract.idleMs > 0;
+
+  const attractStartsInMs = (): number | null => {
+    if (!attract.enabled || attract.playing || run || paused || closed || attract.idleMs <= 0) return null;
+    return Math.max(0, attract.lastActivity + attract.idleMs - clock.now());
+  };
+
+  /** (Re)arm the idle timer from the current state. Safe to call any time. */
+  const armIdle = () => {
+    clock.clearTimeout(attract.timer);
+    attract.timer = undefined;
+    const due = attractStartsInMs();
+    if (due === null) return;
+    attract.timer = clock.setTimeout(() => {
+      attract.timer = undefined;
+      const left = attractStartsInMs();
+      if (left === null) return;
+      if (left > 0) return armIdle(); // activity moved the deadline
+      log('[orchestrator] attract loop: idle, starting');
+      void startAttract().catch((err: unknown) => log(`[orchestrator] attract start failed: ${(err as Error).message}`));
+    }, due);
+  };
+
+  const startAttractCycle = async () => {
+    if (!attract.playing || run || closed) return;
+    attract.cycle += 1;
+    await startScript(attractScript, seed, true);
+  };
+
+  const startAttract = async () => {
+    if (!attract.enabled || attract.playing || run || paused || closed) return;
+    clock.clearTimeout(attract.timer);
+    attract.timer = undefined;
+    attract.playing = true;
+    attract.cycle = 0;
+    attract.lastStop = null;
+    log('[orchestrator] attract loop playing');
+    await startAttractCycle();
+  };
+
+  /** Stop the loop (if playing), closing anything the current cycle opened. */
+  const stopAttract = async (reason: NonNullable<AttractState['lastStop']>) => {
+    if (attract.playing) {
+      attract.playing = false;
+      attract.lastStop = reason;
+      log(`[orchestrator] attract loop stopped (${reason})`);
+    }
+    const r = run;
+    if (r && r.attract) {
+      if (!r.finishing) await finish(r, 'stopped');
+      else await queue;
+    }
+  };
+
+  /** A presenter command or kiosk touch: someone is here. */
+  const activity = () => {
+    attract.lastActivity = clock.now();
+  };
+
+  function afterRunEnded(r: ActiveRun, outcome: 'completed' | 'stopped' | 'elsewhere'): void {
+    if (r.attract) {
+      if (outcome === 'elsewhere' && attract.playing) {
+        attract.playing = false;
+        attract.lastStop = 'ended-elsewhere';
+      }
+      if (outcome === 'completed' && attract.playing) {
+        // next cycle straight away (outside the publish queue job that is running now)
+        void Promise.resolve()
+          .then(startAttractCycle)
+          .catch((err: unknown) => log(`[orchestrator] attract cycle failed: ${(err as Error).message}`));
+        return;
+      }
+    } else {
+      activity(); // idle counts from the end of a presenter scenario
+    }
+    armIdle();
+  }
+
+  const attractState = (): AttractState => {
+    const r = run && run.attract ? run : null;
+    return {
+      enabled: attract.enabled,
+      playing: attract.playing,
+      idleMs: attract.idleMs,
+      idleForMs: Math.max(0, clock.now() - attract.lastActivity),
+      startsInMs: attractStartsInMs(),
+      cycle: attract.cycle,
+      run: r ? { runId: r.runId, startedAt: r.startedAtIso, elapsedMs: Math.round(elapsed(r)), stepId: r.stepId } : null,
+      lastStop: attract.lastStop,
+      script: attractInfo,
+    };
+  };
+
+  const state = (): OrchestratorStateWithAttract => ({
     ambient: { rate: ambient.rate, running: ambient.running, sent: ambient.sent },
     pace,
     paused,
@@ -375,7 +501,15 @@ export async function startOrchestrator(options: OrchestratorOptions): Promise<O
     activeRun: run
       ? { runId: run.runId, scenarioId: run.script.id, startedAt: run.startedAtIso, elapsedMs: Math.round(elapsed(run)), stepId: run.stepId }
       : null,
+    attract: attractState(),
   });
+
+  /** Presenter command: counts as activity and takes over from the attract loop. */
+  const presenterCommand = async () => {
+    activity();
+    await stopAttract('presenter');
+  };
+  armIdle();
 
   // ---- HTTP API ----
   const server: Server = createServer((req, res) => {
@@ -395,7 +529,38 @@ export async function startOrchestrator(options: OrchestratorOptions): Promise<O
       }
       if (path === '/scenarios/stop') {
         only('POST');
-        return send(res, 200, { stopped: await stopRun() });
+        const wasAttract = run?.attract ?? false;
+        await presenterCommand();
+        const stopped = (await stopRun()) || wasAttract;
+        armIdle();
+        return send(res, 200, { stopped });
+      }
+      if (path === '/attract') {
+        only('POST');
+        const body = await readJson(req);
+        if (typeof body.enabled !== 'boolean') throw new HttpError(400, 'validation_failed', ['enabled must be true or false']);
+        const idleMs = body.idleMs;
+        if (idleMs !== undefined && (typeof idleMs !== 'number' || !Number.isFinite(idleMs) || idleMs < 0 || idleMs > 3_600_000)) {
+          throw new HttpError(400, 'validation_failed', ['idleMs must be a number of milliseconds between 0 and 3600000']);
+        }
+        if (typeof idleMs === 'number') attract.idleMs = Math.round(idleMs);
+        attract.enabled = body.enabled;
+        if (body.enabled) {
+          await startAttract(); // plays now unless a presenter scenario runs or the demo is paused
+        } else {
+          activity();
+          await stopAttract('disabled');
+        }
+        armIdle();
+        return send(res, 200, state());
+      }
+      if (path === '/attract/touch') {
+        only('POST');
+        await readJson(req);
+        activity();
+        await stopAttract('touch');
+        armIdle();
+        return send(res, 200, state());
       }
       const m = /^\/scenarios\/([^/]+)\/start$/.exec(path);
       if (m) {
@@ -405,7 +570,10 @@ export async function startOrchestrator(options: OrchestratorOptions): Promise<O
           throw new HttpError(400, 'validation_failed', ['seed must be a string']);
         }
         const runSeed = body.seed === undefined || body.seed === '' ? seed : String(body.seed);
-        const runId = await startRun(decodeURIComponent(m[1]!), runSeed);
+        const scenarioId = decodeURIComponent(m[1]!);
+        if (!scriptById.has(scenarioId)) throw new HttpError(404, 'unknown_scenario', { scenarioId, available: [...scriptById.keys()] });
+        await presenterCommand(); // takes over from the attract loop (its outage is closed first)
+        const runId = await startRun(scenarioId, runSeed);
         return send(res, 200, { runId });
       }
       if (path === '/ambient') {
@@ -415,8 +583,10 @@ export async function startOrchestrator(options: OrchestratorOptions): Promise<O
         if (typeof rate !== 'number' || !Number.isFinite(rate) || rate < 0 || rate > MAX_AMBIENT_RATE) {
           throw new HttpError(400, 'validation_failed', [`rate must be a number between 0 and ${MAX_AMBIENT_RATE}`]);
         }
+        await presenterCommand();
         if (run && !run.finishing) run.ambientBefore = rate; // a scenario holds its own rate; this applies after it
         else ambient.setRate(rate);
+        armIdle();
         return send(res, 200, state());
       }
       if (path === '/pace') {
@@ -426,14 +596,18 @@ export async function startOrchestrator(options: OrchestratorOptions): Promise<O
         if (preset !== 'normal' && preset !== 'slow' && preset !== 'fast') {
           throw new HttpError(400, 'validation_failed', ['preset must be one of normal, slow, fast']);
         }
+        await presenterCommand();
         await setPace(preset);
+        armIdle();
         return send(res, 200, state());
       }
       if (path === '/pause') {
         only('POST');
         const body = await readJson(req);
         if (typeof body.paused !== 'boolean') throw new HttpError(400, 'validation_failed', ['paused must be true or false']);
+        await presenterCommand();
         await setPaused(body.paused);
+        armIdle();
         return send(res, 200, state());
       }
       throw new HttpError(404, 'not_found');
@@ -476,6 +650,9 @@ export async function startOrchestrator(options: OrchestratorOptions): Promise<O
     close: (opts) =>
       (closing ??= (async () => {
         closed = true;
+        attract.playing = false;
+        clock.clearTimeout(attract.timer);
+        attract.timer = undefined;
         const r = run;
         if (r && opts?.restore !== false) {
           if (!r.finishing) await finish(r, 'stopped').catch(() => {});

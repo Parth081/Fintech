@@ -1,7 +1,9 @@
 // Presenter console (#/presenter): built for a tablet in the presenter's hand. Large touch targets,
 // high contrast, portrait and landscape. Commands go to the orchestrator through the gateway.
-import { useCallback, useEffect, useReducer, useState } from 'react';
-import type { PacePreset, ScenarioInfo } from '@ct/contracts/browser';
+import { useCallback, useEffect, useMemo, useReducer, useState } from 'react';
+import type { AskContext, PacePreset, ScenarioInfo } from '@ct/contracts/browser';
+import { AskPanel } from '../assistant/AskPanel';
+import { ATTRACT_ID, attractStatus, parseAttract, setAttract } from '../attract/attract';
 import type { LiveFeed } from '../hooks/useLiveFeed';
 import { useNow } from '../hooks/useNow';
 import { usePoll } from '../hooks/usePoll';
@@ -53,8 +55,16 @@ export function PresenterConsole({ live, onOpenPayment }: Props) {
   const ledger = usePoll(fetchTrialBalance, 2000);
   const view = live.control?.view ?? null;
   const orch = view?.orchestrator ?? null;
-  const progress = view && live.control ? scenarioProgress(view, live.control.receivedAt, now) : null;
-  const running = (orch?.activeRun ?? null) !== null || view?.control.scenario != null;
+  const attract = useMemo(() => parseAttract(orch), [orch]);
+  // The attract loop's steps are not in the presenter's scenario list: add them for the progress panel.
+  const progressView = useMemo(
+    () => (view && orch && attract ? { ...view, orchestrator: { ...orch, scenarios: [...orch.scenarios, attract.script] } } : view),
+    [view, orch, attract],
+  );
+  const progress = progressView && live.control ? scenarioProgress(progressView, live.control.receivedAt, now) : null;
+  const attractRunning = progress?.scenarioId === ATTRACT_ID;
+  // A presenter scenario (the attract loop does not block the Start buttons: starting one takes over).
+  const running = !attractRunning && ((orch?.activeRun ?? null) !== null || view?.control.scenario != null);
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<{ tone: 'ok' | 'bad'; text: string } | null>(null);
   const [reset, dispatchReset] = useReducer(resetReducer, { phase: 'idle' });
@@ -165,6 +175,25 @@ export function PresenterConsole({ live, onOpenPayment }: Props) {
   const rows = providerStatusRows(view);
   const outages = Object.values(view?.control.outages ?? {});
   const orchDown = view !== null && orch === null;
+  const attractInfo = attractStatus(attract, running, paused);
+
+  // "Ask why": the payment the presenter last jumped to (else the newest re-route), the scenario, or the system.
+  const [askAbout, setAskAbout] = useState<'payment' | 'scenario' | 'system'>('payment');
+  const [focusedId, setFocusedId] = useState<string | null>(null);
+  const askPaymentId = focusedId ?? target?.paymentId ?? null;
+  const askContext: AskContext | null =
+    askAbout === 'payment' ? (askPaymentId ? { kind: 'payment', paymentId: askPaymentId } : null) : askAbout === 'scenario' ? { kind: 'scenario' } : { kind: 'system' };
+  const short = (id: string) => providerName(id).replace(/^Provider\s+/i, '');
+  const askSubtitle =
+    askAbout === 'payment'
+      ? askPaymentId
+        ? `Payment ${shortId(askPaymentId)}${focusedId ? ' · on the big screen' : target ? ` · re-routed ${short(target.fromProviderId)} → ${short(target.toProviderId)}` : ''}`
+        : undefined
+      : askAbout === 'scenario'
+        ? progress
+          ? `Running: ${progress.title}`
+          : 'The most recent scenario'
+        : 'Ledger proof, provider health, totals';
 
   return (
     <div className="pc">
@@ -205,7 +234,8 @@ export function PresenterConsole({ live, onOpenPayment }: Props) {
               paused={paused}
               busy={busy === 'stop'}
               disabled={orchDown}
-              onStop={() => void command('stop', stopScenario, 'Scenario stopped')}
+              attract={attractRunning}
+              onStop={() => void command('stop', stopScenario, attractRunning ? 'Attract loop stopped' : 'Scenario stopped')}
             />
           ) : null}
           <section className="pc-card">
@@ -225,6 +255,52 @@ export function PresenterConsole({ live, onOpenPayment }: Props) {
                 />
               ))}
             </div>
+            {attractRunning && <p className="pc-note">Starting a scenario takes over from the attract loop.</p>}
+          </section>
+
+          <section className="pc-card" aria-label="Attract loop">
+            <h2 className="pc-h2">
+              Attract loop <span className={`pc-pill tone-${attractInfo.tone === 'info' ? 'ok' : attractInfo.tone}`}>{attractInfo.label}</span>
+            </h2>
+            <div className="pc-control">
+              <span className="pc-label">Plays by itself on the big screen when the booth is idle</span>
+              <div className="pc-seg" role="group" aria-label="Attract loop">
+                {ATTRACT_SWITCH.map(([id, text, value]) => (
+                  <button
+                    key={id}
+                    type="button"
+                    className={`pc-seg-btn${attract && attract.enabled === value ? ' pc-seg-on' : ''}`}
+                    aria-pressed={attract ? attract.enabled === value : false}
+                    disabled={!attract || busy !== null}
+                    onClick={() =>
+                      void command(
+                        `attract:${id}`,
+                        () => setAttract(value),
+                        value ? (running ? 'Attract loop on: it plays once the scenario ends and the booth is idle' : 'Attract loop playing') : 'Attract loop off',
+                      )
+                    }
+                  >
+                    {text}
+                  </button>
+                ))}
+              </div>
+              <span className="tl-meta">{attractInfo.detail}</span>
+            </div>
+          </section>
+
+          <section className="pc-card pc-ask" aria-label="Ask why">
+            <div className="pc-seg" role="group" aria-label="Ask about">
+              {ASK_TABS.map(([id, text]) => (
+                <button key={id} type="button" className={`pc-seg-btn${askAbout === id ? ' pc-seg-on' : ''}`} aria-pressed={askAbout === id} onClick={() => setAskAbout(id)}>
+                  {text}
+                </button>
+              ))}
+            </div>
+            {askContext ? (
+              <AskPanel context={askContext} title="Ask why" subtitle={askSubtitle} />
+            ) : (
+              <p className="empty">No re-routed payment yet. Start a scenario, or ask about the system.</p>
+            )}
           </section>
         </div>
 
@@ -310,6 +386,8 @@ export function PresenterConsole({ live, onOpenPayment }: Props) {
                 onClick={() => {
                   if (!target) return;
                   onOpenPayment(target.paymentId);
+                  setFocusedId(target.paymentId);
+                  setAskAbout('payment');
                   focusPayment(target.paymentId).catch(() => setMessage({ tone: 'bad', text: 'Could not open it on the big screen' }));
                 }}
               >
@@ -417,13 +495,41 @@ function Kpi({ label, value, tone }: { label: string; value: string; tone: 'ok' 
   );
 }
 
-function NowPanel({ progress, paused, busy, disabled, onStop }: { progress: ScenarioProgress; paused: boolean; busy: boolean; disabled: boolean; onStop(): void }) {
+const ATTRACT_SWITCH = [
+  ['on', 'On', true],
+  ['off', 'Off', false],
+] as const;
+const ASK_TABS = [
+  ['payment', 'Payment'],
+  ['scenario', 'Scenario'],
+  ['system', 'System'],
+] as const;
+
+function NowPanel({
+  progress,
+  paused,
+  busy,
+  disabled,
+  attract = false,
+  onStop,
+}: {
+  progress: ScenarioProgress;
+  paused: boolean;
+  busy: boolean;
+  disabled: boolean;
+  /** The attract loop is playing (not a presenter scenario). */
+  attract?: boolean;
+  onStop(): void;
+}) {
   const p = progress;
   return (
     <section className="pc-card pc-now" aria-label="Running scenario">
       <div className="pc-now-head">
         <div>
-          <span className="pc-label">Running{paused ? ' · PAUSED' : ''}</span>
+          <span className="pc-label">
+            {attract ? 'Attract loop · plays by itself' : 'Running'}
+            {paused ? ' · PAUSED' : ''}
+          </span>
           <h2 className="pc-now-title">{p.title}</h2>
         </div>
         <button type="button" className="btn pc-big pc-stop" disabled={busy || disabled} onClick={onStop}>
