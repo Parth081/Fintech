@@ -65,6 +65,8 @@ export interface GatewayOptions {
   controlIntervalMs?: number;
   /** Timeout of the launcher reset call. Default 20 s. */
   resetTimeoutMs?: number;
+  /** M4 Operations service base URL (/api/ops/<rest> is proxied to {opsUrl}/<rest>). Default http://127.0.0.1:7075. */
+  opsUrl?: string;
 }
 
 export interface GatewayHandle {
@@ -167,6 +169,7 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
   const breakerFn: BreakerFn = options.breakers ?? breakerStates;
   const controlIntervalMs = options.controlIntervalMs ?? 1000;
   const resetTimeoutMs = options.resetTimeoutMs ?? 20_000;
+  const opsUrl = (options.opsUrl ?? 'http://127.0.0.1:7075').replace(/\/$/, '');
   const instanceId = randomUUID();
   const startedAt = new Date(now()).toISOString();
 
@@ -610,6 +613,60 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
     }
   };
 
+  /**
+   * /api/ops/<rest> -> {opsUrl}/<rest> (M4 operations console back office). Method, query, body and the
+   * Authorization / Idempotency-Key headers pass through; status, content type, X-Total-Count and
+   * Content-Disposition come back. 502 JSON when the ops service is down.
+   */
+  const proxyOps = async (req: IncomingMessage, res: ServerResponse, url: URL, method: string) => {
+    const rest = url.pathname.slice('/api/ops'.length) || '/';
+    let body: Buffer;
+    try {
+      body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
+    } catch (err) {
+      sendJson(res, 413, { error: (err as Error).message });
+      return;
+    }
+    const headers: Record<string, string> = { accept: req.headers.accept ?? 'application/json' };
+    if (body.length > 0) headers['content-type'] = req.headers['content-type'] ?? 'application/json';
+    const auth = req.headers.authorization;
+    if (typeof auth === 'string' && auth) headers.authorization = auth;
+    const key = req.headers['idempotency-key'];
+    if (typeof key === 'string' && key) headers['idempotency-key'] = key;
+    let upstream: Response;
+    try {
+      upstream = await fetch(`${opsUrl}${rest}${url.search}`, {
+        method,
+        headers,
+        body: body.length > 0 ? new Uint8Array(body) : undefined,
+        signal: AbortSignal.timeout(10_000),
+      });
+    } catch (err) {
+      sendJson(res, 502, { error: 'ops service unavailable', detail: (err as Error).message });
+      return;
+    }
+    let data: Buffer;
+    try {
+      data = Buffer.from(await upstream.arrayBuffer());
+    } catch (err) {
+      sendJson(res, 502, { error: 'ops service unavailable', detail: (err as Error).message });
+      return;
+    }
+    const out: Record<string, string> = {
+      'content-type': upstream.headers.get('content-type') ?? 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+    };
+    const total = upstream.headers.get('x-total-count');
+    if (total !== null) {
+      out['x-total-count'] = total;
+      out['access-control-expose-headers'] = 'x-total-count';
+    }
+    const disposition = upstream.headers.get('content-disposition');
+    if (disposition !== null) out['content-disposition'] = disposition;
+    res.writeHead(upstream.status, out);
+    res.end(method === 'HEAD' ? undefined : data);
+  };
+
   /** POST /api/control/reset -> {launcherControlUrl}/reset. The launcher restarts this process too. */
   const reset = async (res: ServerResponse) => {
     if (!launcherControlUrl) {
@@ -663,6 +720,7 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
 
   const handleApi = async (req: IncomingMessage, res: ServerResponse, url: URL, method: string) => {
     const path = url.pathname;
+    if (path === '/api/ops' || path.startsWith('/api/ops/')) return proxyOps(req, res, url, method);
     if (path === '/api/control/orchestrator' || path.startsWith('/api/control/orchestrator/')) return proxyOrchestrator(req, res, url, method);
     if (path === '/api/control/reset') {
       if (method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' });
@@ -688,10 +746,38 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
         if (corridor) filter.corridor = corridor;
         const provider = q.get('provider');
         if (provider) filter.provider = provider;
+        // M4 console filters
+        const text = q.get('q');
+        if (text && text.trim()) filter.q = text.trim().slice(0, 200);
+        const currency = q.get('currency');
+        if (currency && /^[A-Z]{3}$/.test(currency)) filter.currency = currency;
+        const num = (name: string) => {
+          const v = q.get(name);
+          if (v === null || v.trim() === '') return undefined;
+          const n = Number(v);
+          return Number.isFinite(n) ? n : undefined;
+        };
+        const minAmount = num('minAmount');
+        if (minAmount !== undefined) filter.minAmount = minAmount;
+        const maxAmount = num('maxAmount');
+        if (maxAmount !== undefined) filter.maxAmount = maxAmount;
+        const time = (name: string) => {
+          const v = q.get(name);
+          if (!v) return undefined;
+          const t = Date.parse(v);
+          return Number.isFinite(t) ? t : undefined;
+        };
+        const fromMs = time('from');
+        if (fromMs !== undefined) filter.fromMs = fromMs;
+        const toMs = time('to');
+        if (toMs !== undefined) filter.toMs = toMs;
         const page = projection.page(filter, offset, limit);
         res.setHeader('x-total-count', String(page.total));
         res.setHeader('access-control-expose-headers', 'x-total-count');
         return sendJson(res, 200, page.items);
+      }
+      if (path === '/api/payments/trend') {
+        return sendJson(res, 200, projection.trend(now(), parseIntParam(url.searchParams.get('minutes'), 30, 1, 240)));
       }
       if (path === '/api/stats') return sendJson(res, 200, projection.stats());
       if (path === '/api/rejected') return sendJson(res, 200, projection.rejected());

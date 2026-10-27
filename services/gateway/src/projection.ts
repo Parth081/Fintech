@@ -4,6 +4,7 @@
 // that payment), never O(payments), so replaying ~120k events stays fast.
 import {
   applyEvent,
+  exponentOf,
   isTerminal,
   PIPELINE,
   type AnyEvent,
@@ -16,6 +17,7 @@ import type {
   PaymentDetail,
   PaymentsPage,
   PaymentSummary,
+  PaymentTrend,
   ProviderFailure,
   QuoteStats,
   RejectedEvent,
@@ -122,6 +124,49 @@ export interface PaymentFilter {
   status?: PaymentStatus[];
   corridor?: string;
   provider?: string;
+  /** M4 console: case-insensitive substring over payment id, end-to-end/message ids, settlement ref and party names/accounts. */
+  q?: string;
+  /** Source currency (ISO 4217). */
+  currency?: string;
+  /** Source amount range in MAJOR units of the payment's own currency (inclusive). */
+  minAmount?: number;
+  maxAmount?: number;
+  /** createdAt range (inclusive, epoch ms). */
+  fromMs?: number;
+  toMs?: number;
+}
+
+/** Text a payment can be found by (console global search). Lower-cased. */
+export function searchText(state: PaymentState): string {
+  const i = state.initiated;
+  const f = state.facts;
+  return [
+    state.paymentId,
+    i.debtor.name, i.debtor.accountId, i.creditor.name, i.creditor.accountId, i.idempotencyKey,
+    f['payment.sent']?.messageId, f['payment.settled']?.settlementRef, f['payment.quoted']?.quoteId,
+    f['ledger.posted']?.journalId, f['payment.reconciled']?.statementRef,
+  ]
+    .filter((x): x is string => typeof x === 'string' && x !== '')
+    .join(' | ')
+    .toLowerCase();
+}
+
+/** True when the record matches the M4 extended filters (q, currency, amount range, date range). */
+export function matchesExtended(state: PaymentState, filter: PaymentFilter, q: string | null): boolean {
+  const amount = state.initiated.amount;
+  if (filter.currency && amount.currency !== filter.currency) return false;
+  if (filter.minAmount !== undefined || filter.maxAmount !== undefined) {
+    const major = amount.amountMinor / 10 ** exponentOf(amount.currency);
+    if (filter.minAmount !== undefined && major < filter.minAmount) return false;
+    if (filter.maxAmount !== undefined && major > filter.maxAmount) return false;
+  }
+  if (filter.fromMs !== undefined || filter.toMs !== undefined) {
+    const t = Date.parse(state.createdAt);
+    if (filter.fromMs !== undefined && !(t >= filter.fromMs)) return false;
+    if (filter.toMs !== undefined && !(t <= filter.toMs)) return false;
+  }
+  if (q && !searchText(state).includes(q)) return false;
+  return true;
 }
 
 function messageOf(event: AnyEvent): IsoMessage | null {
@@ -341,7 +386,11 @@ export class Projection {
   /** Filtered page, newest first. O(payments) worst case (a scan with early exit), no sorting. */
   page(filter: PaymentFilter, offset: number, limit: number): PaymentsPage {
     const statuses = filter.status && filter.status.length ? new Set(filter.status) : null;
-    const unfiltered = !statuses && !filter.corridor && !filter.provider;
+    const q = filter.q ? filter.q.trim().toLowerCase() : '';
+    const extended =
+      q !== '' || !!filter.currency || filter.minAmount !== undefined || filter.maxAmount !== undefined ||
+      filter.fromMs !== undefined || filter.toMs !== undefined;
+    const unfiltered = !statuses && !filter.corridor && !filter.provider && !extended;
     const items: PaymentSummary[] = [];
     let matched = 0;
     if (unfiltered) {
@@ -353,15 +402,47 @@ export class Projection {
       return { total, offset, limit, items };
     }
     for (let i = this.order.length - 1; i >= 0; i--) {
-      const s = this.records.get(this.order[i]!)?.summary;
-      if (!s) continue;
+      const rec = this.records.get(this.order[i]!);
+      const s = rec?.summary;
+      if (!rec || !s) continue;
       if (statuses && !statuses.has(s.status)) continue;
       if (filter.corridor && s.corridor !== filter.corridor) continue;
       if (filter.provider && s.providerId !== filter.provider) continue;
+      if (extended && !matchesExtended(rec.state, filter, q || null)) continue;
       if (matched >= offset && items.length < limit) items.push(s);
       matched += 1;
     }
     return { total: matched, offset, limit, items };
+  }
+
+  /**
+   * Payments initiated (and now failed/rejected) per minute over the last `minutes`, by createdAt.
+   * Walks the log order newest-first and stops once well past the window: O(payments in window).
+   */
+  trend(nowMs: number, minutes: number): PaymentTrend {
+    const bucketMs = 60_000;
+    const n = Math.max(1, Math.min(240, Math.floor(minutes)));
+    const end = Math.floor(nowMs / bucketMs) * bucketMs + bucketMs;
+    const fromMs = end - n * bucketMs;
+    const initiated = new Array<number>(n).fill(0);
+    const failed = new Array<number>(n).fill(0);
+    let older = 0;
+    for (let i = this.order.length - 1; i >= 0; i--) {
+      const s = this.records.get(this.order[i]!)?.summary;
+      if (!s) continue;
+      const t = Date.parse(s.createdAt);
+      if (!Number.isFinite(t)) continue;
+      if (t < fromMs) {
+        // order is by first appearance, which tracks createdAt closely; tolerate a little disorder
+        if (++older > 200) break;
+        continue;
+      }
+      if (t >= end) continue;
+      const b = Math.floor((t - fromMs) / bucketMs);
+      initiated[b] = (initiated[b] ?? 0) + 1;
+      if (s.status === 'failed' || s.status === 'rejected') failed[b] = (failed[b] ?? 0) + 1;
+    }
+    return { bucketMs, fromMs, initiated, failed };
   }
 
   summary(paymentId: string): PaymentSummary | undefined {

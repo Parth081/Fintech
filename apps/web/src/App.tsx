@@ -14,11 +14,38 @@ import { ProvidersView } from './components/ProvidersView';
 import { PresenterConsole } from './components/PresenterConsole';
 import { ResetNotice, ScenarioBanner } from './components/ScenarioBanner';
 import { hashFor, NAV_VIEWS } from './lib/route';
+import { isConsoleHash } from './console/lib/routing';
 
 // The world-map main stage (owned by apps/web/src/stage) loads on demand: the other views stay light.
 const MainStage = lazy(() => import('./stage/MainStage').then((m) => ({ default: m.MainStage })));
 
+// M4 Operations Console (default landing): #/console/... and an empty hash. Loaded on demand.
+const ConsoleApp = lazy(() => import('./console/ConsoleApp'));
+
+function useIsConsole(): boolean {
+  const [on, setOn] = useState(() => isConsoleHash(window.location.hash));
+  useEffect(() => {
+    const h = () => setOn(isConsoleHash(window.location.hash));
+    window.addEventListener('hashchange', h);
+    return () => window.removeEventListener('hashchange', h);
+  }, []);
+  return on;
+}
+
 export function App() {
+  const consoleView = useIsConsole();
+  if (consoleView) {
+    return (
+      <Suspense fallback={<div className="stage-loading">Loading the operations console…</div>}>
+        <ConsoleApp />
+      </Suspense>
+    );
+  }
+  return <BoothApp />;
+}
+
+/** Booth / audience views: #/stage, #/presenter, #/live, #/ledger, #/fx, #/providers. */
+function BoothApp() {
   const live = useLiveFeed();
   const { feed, connection, control } = live;
   const view = useHashRoute('stage');
