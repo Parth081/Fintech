@@ -203,6 +203,16 @@ export interface StatementGroup extends StatementRef {
   list: StatementEntry[];
 }
 
+/** GET /api/payments/trend?minutes=30 (M4 console): payments initiated / failed per minute by createdAt, oldest first. */
+export interface PaymentTrend {
+  bucketMs: number;
+  /** Start of the oldest bucket (epoch ms). */
+  fromMs: number;
+  initiated: number[];
+  failed: number[];
+  /** Source volume per bucket in USD-equivalent is not known here; counts only. */
+}
+
 export interface PaymentsPage {
   total: number;
   offset: number;

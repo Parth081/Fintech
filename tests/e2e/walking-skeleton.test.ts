@@ -136,8 +136,9 @@ describe('M1 walking skeleton (real processes)', () => {
     const { events } = await waitForStatus(r.body.paymentId, ['held']);
     await new Promise((res) => setTimeout(res, 500));
     const again = await json<{ events: AnyEvent[] }>(`/api/payments/${r.body.paymentId}`);
-    expect(again.body.events.map((e) => e.type)).toEqual(['payment.initiated', 'payment.screened', 'payment.held']);
-    expect(events.at(-1)?.producer).toBe('risk');
+    // M4: the risk engine also explains the hold with risk.alert_raised (ADR 0012); the walk is unchanged.
+    expect(again.body.events.map((e) => e.type).filter((t) => t !== 'risk.alert_raised')).toEqual(['payment.initiated', 'payment.screened', 'payment.held']);
+    expect(events.find((e) => e.type === 'payment.held')?.producer).toBe('risk');
   });
 
   it('honours idempotency keys', async () => {

@@ -33,6 +33,10 @@ export const EXCLUDED_CORRIDOR_NOT_SERVED = 'CORRIDOR_NOT_SERVED';
 export const EXCLUDED_FAILED_THIS_PAYMENT = 'FAILED_THIS_PAYMENT';
 export const EXCLUDED_CIRCUIT_OPEN = 'CIRCUIT_OPEN';
 export const EXCLUDED_CIRCUIT_HALF_OPEN = 'CIRCUIT_HALF_OPEN';
+/** M4: operator switched the provider off (config 'provider.enabled'). */
+export const EXCLUDED_PROVIDER_DISABLED = 'PROVIDER_DISABLED';
+/** M4: operator forced the breaker open (config 'provider.forcedBreaker'), overriding the automatic one. */
+export const EXCLUDED_CIRCUIT_FORCED_OPEN = 'CIRCUIT_FORCED_OPEN';
 
 export interface ScoreInput {
   corridorId: string;

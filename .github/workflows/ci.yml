@@ -71,6 +71,27 @@ jobs:
           name: verify-m3-report
           path: verify-report/
 
+  verify-m4:
+    name: M4 - operations console + risk & compliance (verify:m4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # Launches the whole system (incl. ops) on temp ports with a PGlite ledger and ops store, runs the
+      # sanctions-hit / fraud-ring / fx-spike scenarios and drives cases (four-eyes), retry, refund and a
+      # maker-checker config change through the gateway as different demo users; checks (a)-(j).
+      - run: npm run verify:m4 -- --report-dir verify-report
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verify-m4-report
+          path: verify-report/
+
   verify-m5:
     name: M5 - AI explainer (grounded, offline) and booth (verify:m5)
     runs-on: ubuntu-latest

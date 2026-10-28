@@ -45,6 +45,7 @@ async function main(): Promise<void> {
         gateway: args.gatewayPort,
         ledger: args.ledgerPort,
         orchestrator: args.orchestratorPort,
+        ops: args.opsPort,
         assistant: args.assistantPort,
         booth: args.boothPort,
       },

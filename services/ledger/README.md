@@ -73,6 +73,35 @@ minor units):
 Amounts are integer minor units, stored as `BIGINT`. They are read back as text and converted only
 when the value is a safe integer. Invariant sums use `BigInt`.
 
+## Posting rule: refund (M4, `ledger-v1`)
+
+On `payment.refund_requested` (an operator refund approved in the ops console) the ledger stage posts a
+journal of kind `refund` and emits `payment.refunded { journalId, entries }`. The refund journal is the
+settlement journal mirrored line for line: same accounts, same amounts, every direction swapped. The
+example above refunds as:
+
+| Account | Debit | Credit |
+|---|---:|---:|
+| customer:ACC-US-0001:USD | | 125,188 |
+| fx-position:USD | 125,000 | |
+| fee-revenue:USD | 188 | |
+| fx-position:INR | | 10,375,000 |
+| provider:orion:payable:INR | 10,375,000 | |
+
+Fee policy: a refund is a full reversal, so the customer also gets the transfer fee back. FX is unwound at
+the original quoted rate. No new FX exposure is booked, so a market move since settlement is a treasury
+matter, not the customer's. The provider payable is reversed, which means the payout is recalled from the
+provider.
+
+Rules:
+
+- At most one refund journal per payment. A unique partial index enforces it, and a repeat request (any
+  causation) returns the existing journal (`created: false`).
+- A refund journal can only exist after the payment's settlement journal. Code checks this, and so does a
+  `BEFORE INSERT` trigger (migration 2).
+- `invariants()` also reports refunds without a settlement journal, more than one refund per payment, and
+  any refund that does not exactly reverse its settlement per account and currency.
+
 ## Guarantees and how they are enforced
 
 | Guarantee | In code | In the database |

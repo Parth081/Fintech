@@ -2,6 +2,8 @@
 // again without leaving orphans. Used by `npm start` (index.ts), the end-to-end tests and verify:*.
 // M3: also starts the orchestrator, serves the launcher control API (control.ts) and can reset the
 // whole system (stop everything, delete the data dir, start again) in a few seconds.
+// M4: also starts the operations service (services/ops, the back office behind the console) once the
+// broker is up; its PGlite store lives in DATA_DIR/ops and is wiped with the rest of the data on reset.
 // M5: also starts the AI explainer (assistant) and the booth service. The booth keeps running through a
 // reset and its data (DATA_DIR/booth: visitor leads) is never deleted by a reset; see clear-leads.ts.
 import type { ChildProcess } from 'node:child_process';
@@ -28,7 +30,7 @@ export const STAGES = ['screening', 'risk', 'fx', 'routing', 'settlement', 'reco
 export type Stage = (typeof STAGES)[number];
 
 /** Every process the launcher manages, in start order. Names accepted by restart()/kill(). */
-export const SERVICE_NAMES = ['broker', 'payment-api', ...STAGES, 'ledger', 'orchestrator', 'assistant', 'booth', 'gateway'] as const;
+export const SERVICE_NAMES = ['broker', 'payment-api', ...STAGES, 'ledger', 'orchestrator', 'ops', 'assistant', 'booth', 'gateway'] as const;
 export type ServiceName = (typeof SERVICE_NAMES)[number];
 
 export const DEFAULT_ROOT_DIR = path.resolve(fileURLToPath(new URL('../../', import.meta.url)));
@@ -44,8 +46,8 @@ export interface LaunchOptions {
   rootDir?: string;
   host?: string;
   /**
-   * Ports; `ledger` defaults to gateway + 1 and `orchestrator` to gateway + 2 (7073 / 7074 with the
-   * default gateway port).
+   * Ports; `ledger` defaults to gateway + 1, `orchestrator` to gateway + 2 and `ops` to gateway + 3
+   * (7073 / 7074 / 7075 with the default gateway port).
    */
   ports?: {
     broker?: number;
@@ -53,6 +55,8 @@ export interface LaunchOptions {
     gateway?: number;
     ledger?: number;
     orchestrator?: number;
+    /** M4 operations service; default gateway + 3 (7075). */
+    ops?: number;
     /** AI explainer; default gateway + 4 (7076). */
     assistant?: number;
     /** Booth (leads + analytics); default gateway + 5 (7077). */
@@ -73,6 +77,8 @@ export interface LaunchOptions {
   ambientRate?: number;
   /** Start the orchestrator (default true). */
   orchestrator?: boolean;
+  /** M4: start the operations service (default true). The gateway's /api/ops/* answers 502 without it. */
+  ops?: boolean;
   /** Start the AI explainer (default true). */
   assistant?: boolean;
   /** Start the booth service (default true). */
@@ -120,6 +126,7 @@ export interface LaunchedSystem {
     broker: string;
     ledger: string;
     orchestrator: string;
+    ops: string;
     /** Present when the assistant was started. */
     assistant?: string;
     /** Present when the booth was started. */
@@ -164,6 +171,7 @@ const COLORS: Record<string, number> = {
   ledger: 96,
   reconciliation: 93,
   orchestrator: 94,
+  ops: 91,
   assistant: 91,
   booth: 32,
   gateway: 92,
@@ -193,7 +201,7 @@ interface ServiceSpec {
   name: ServiceName;
   script: string;
   args?: string[];
-  /** Readiness: HTTP GET healthUrl returns 200, or a stdout line matches readyLine. */
+  /** Readiness: HTTP GET healthUrl returns 200 and/or a stdout line matches readyLine (both when both are set). */
   healthUrl?: string;
   readyLine?: RegExp;
 }
@@ -236,7 +244,9 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
   const gatewayPort = options.ports?.gateway ?? 7072;
   const ledgerPort = options.ports?.ledger ?? gatewayPort + 1;
   const orchestratorPort = options.ports?.orchestrator ?? gatewayPort + 2;
+  const opsPort = options.ports?.ops ?? gatewayPort + 3;
   const withOrchestrator = options.orchestrator ?? true;
+  const withOps = options.ops ?? true;
   const assistantPort = options.ports?.assistant ?? gatewayPort + 4;
   const boothPort = options.ports?.booth ?? gatewayPort + 5;
   const withAssistant = options.assistant ?? true;
@@ -259,6 +269,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     { name: 'gateway', port: gatewayPort },
     { name: 'ledger', port: ledgerPort },
     ...(withOrchestrator ? [{ name: 'orchestrator', port: orchestratorPort }] : []),
+    ...(withOps ? [{ name: 'ops', port: opsPort }] : []),
     ...(withAssistant ? [{ name: 'assistant', port: assistantPort }] : []),
     ...(withBooth ? [{ name: 'booth', port: boothPort }] : []),
     ...(controlPort ? [{ name: 'launcher control', port: controlPort }] : []),
@@ -299,6 +310,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     gateway: `http://${probeHost}:${gatewayPort}`,
     ledger: `http://${probeHost}:${ledgerPort}`,
     orchestrator: `http://${probeHost}:${orchestratorPort}`,
+    ops: `http://${probeHost}:${opsPort}`,
     ...(withAssistant ? { assistant: `http://${probeHost}:${assistantPort}` } : {}),
     ...(withBooth ? { booth: `http://${probeHost}:${boothPort}` } : {}),
     ...(control ? { control: control.url } : {}),
@@ -314,6 +326,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     GATEWAY_PORT: String(gatewayPort),
     LEDGER_PORT: String(ledgerPort),
     ORCHESTRATOR_PORT: String(orchestratorPort),
+    OPS_PORT: String(opsPort),
     ASSISTANT_PORT: String(assistantPort),
     BOOTH_PORT: String(boothPort),
     ...(control ? { LAUNCHER_CONTROL_PORT: String(control.port) } : {}),
@@ -323,6 +336,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     GATEWAY_URL: urls.gateway,
     LEDGER_URL: urls.ledger,
     ORCHESTRATOR_URL: urls.orchestrator,
+    OPS_URL: urls.ops,
     // Always set, even when not started: the gateway then answers /api/assistant|booth/* with 502.
     ASSISTANT_URL: urls.assistant ?? `http://${probeHost}:${assistantPort}`,
     BOOTH_URL: urls.booth ?? `http://${probeHost}:${boothPort}`,
@@ -367,7 +381,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
         // Stop in reverse dependency order (gateway + orchestrator, then api + stages + ledger, then
         // broker) so consumers do not log broker-disconnect noise. Each tier is killed in parallel.
         const tier = (r: Running): number =>
-          r.spec.name === 'gateway' || r.spec.name === 'orchestrator' || r.spec.name === 'assistant' ? 0 : r.spec.name === 'broker' ? 2 : 1;
+          r.spec.name === 'gateway' || r.spec.name === 'orchestrator' || r.spec.name === 'ops' || r.spec.name === 'assistant' ? 0 : r.spec.name === 'broker' ? 2 : 1;
         await Promise.allSettled(restarting);
         // The booth holds visitor leads: ask it to close its database cleanly first (closing stdin
         // triggers exitWithSupervisor), and only then kill whatever is left.
@@ -457,13 +471,19 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
   const waitReady = async (r: Running): Promise<void> => {
     const deadline = Date.now() + timeoutMs;
     const exited = (): boolean => stopping || !isRunning(r.child) || startupCrash !== undefined;
+    let healthy = !r.spec.healthUrl;
     if (r.spec.healthUrl) {
       while (Date.now() < deadline) {
         if (exited()) break;
-        if (await httpOk(r.spec.healthUrl)) return;
+        if (await httpOk(r.spec.healthUrl)) {
+          healthy = true;
+          break;
+        }
         await sleep(HEALTH_POLL_MS);
       }
-    } else if (r.spec.readyLine) {
+    }
+    if (healthy && !r.spec.readyLine) return;
+    if (healthy && r.spec.readyLine) {
       if (r.sawReadyLine) return;
       await new Promise<void>((resolve) => {
         const timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
@@ -490,7 +510,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     const why = !isRunning(r.child)
       ? `Service [${r.spec.name}] exited during startup (code ${r.child.exitCode}).`
       : `Service [${r.spec.name}] did not become ready within ${timeoutMs} ms ` +
-        (r.spec.healthUrl ? `(GET ${r.spec.healthUrl} never returned 200).` : `(no stdout line matching ${r.spec.readyLine}).`);
+        (!healthy ? `(GET ${r.spec.healthUrl} never returned 200).` : `(no stdout line matching ${r.spec.readyLine}).`);
     throw new StartupError(describeFailure(r, why));
   };
 
@@ -500,6 +520,8 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     ledger: { name: 'ledger', script: 'services/ledger/src/index.ts', healthUrl: `${urls.ledger}/health` },
     orchestrator: { name: 'orchestrator', script: 'services/orchestrator/src/index.ts', healthUrl: `${urls.orchestrator}/health` },
     gateway: { name: 'gateway', script: 'services/gateway/src/index.ts', healthUrl: `${urls.gateway}/health` },
+    // Health answers as soon as it listens; "ready" is printed once the store is open and the log replayed.
+    ops: { name: 'ops', script: 'services/ops/src/index.ts', healthUrl: `${urls.ops}/health`, readyLine: /\bready\b/i },
     assistant: { name: 'assistant', script: 'services/assistant/src/index.ts', healthUrl: `http://${probeHost}:${assistantPort}/health` },
     booth: { name: 'booth', script: 'services/booth/src/index.ts', healthUrl: `http://${probeHost}:${boothPort}/health` },
   } satisfies Partial<Record<ServiceName, ServiceSpec>>;
@@ -510,6 +532,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
    *   t0      broker + ledger (the ledger opens PGlite first, the slowest step, and only then the bus)
    *   broker  payment-api, 6 stages, gateway (all connect to the bus; their clients retry anyway)
    *   api     orchestrator (it posts ambient payments to the payment API)
+   *   broker  ops (projects the log into its store; the gateway proxies /api/ops/* to it)
    *   M5: booth at t0 (own PGlite, no bus) unless it is still running (a reset keeps it); assistant once
    *   the broker is up (it reads the event log).
    */
@@ -545,6 +568,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     const api = start(SPEC['payment-api']);
     const apiReady = add(track(api));
     for (const s of STAGES) add(track(start(stageSpec(s))));
+    if (withOps) add(track(start(SPEC.ops)));
     add(track(start(SPEC.gateway)));
     if (withAssistant) add(track(start(SPEC.assistant)));
     if (withOrchestrator) {
@@ -717,6 +741,7 @@ export function banner(gatewayUrl: string, extra: string[] = []): string {
     '',
     `  Open ${gatewayUrl}`,
     `  Presenter console: ${gatewayUrl}/#/presenter`,
+    `  Operations console: ${gatewayUrl}/#/console`,
     '  Then click "Send test payment", or run: npm run traffic -- --count 10',
     ...extra,
     '',

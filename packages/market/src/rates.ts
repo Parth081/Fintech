@@ -55,6 +55,12 @@ export interface VolatilityShock {
   toMs: number;
   driftBps?: number;
   noiseMultiplier?: number;
+  /**
+   * M4: open-ended shocks from the event log (control.fx_shock.*). When set, the envelope ramps in over
+   * rampInMs from fromMs and then stays at 1 until toMs (which may be Infinity: the shock lasts until a
+   * control.fx_shock.ended removes it from the control state). No ramp-out: the end is a control event.
+   */
+  rampInMs?: number;
 }
 
 let shockRegistry: readonly VolatilityShock[] = [];
@@ -94,6 +100,11 @@ function octaveValue(key: number, periodMs: number, t: number): number {
 
 function shockEnvelope(s: VolatilityShock, t: number): number {
   if (!(t >= s.fromMs && t < s.toMs)) return 0;
+  if (s.rampInMs !== undefined) {
+    if (!(s.rampInMs > 0)) return 1;
+    const r = (t - s.fromMs) / s.rampInMs;
+    return r >= 1 ? 1 : smoothstep(r);
+  }
   const span = s.toMs - s.fromMs;
   const x = (t - s.fromMs) / span;
   if (x < 0.15) return smoothstep(x / 0.15);
@@ -172,4 +183,35 @@ export function rateSeries(
     out.push({ atMs: at, mid: rateAt(corridorId, at, seed, shocks).mid });
   }
   return out;
+}
+
+/** An active FX shock as held in the control state (ControlState.fxShocks values; M4). */
+export interface ControlFxShock {
+  shockId: string;
+  corridorId: string;
+  driftBps: number;
+  noiseMultiplier: number;
+  rampMs: number;
+  since: string; // ISO occurredAt of control.fx_shock.started
+}
+
+/**
+ * M4 shock hook: the VolatilityShocks for the FX shocks active in a control state (ControlState.fxShocks
+ * as of a log offset). Each ramps in over rampMs from its start event and stays until the matching
+ * control.fx_shock.ended (open-ended toMs). Pass the result as `shocks` to quote()/rateAt()/rateSeries()
+ * so every process prices from the same log position. Sorted by shockId for determinism.
+ */
+export function shocksFromControl(fxShocks: Readonly<Record<string, ControlFxShock>>): VolatilityShock[] {
+  return Object.values(fxShocks)
+    .filter((s) => Number.isFinite(Date.parse(s.since)))
+    .sort((a, b) => (a.shockId < b.shockId ? -1 : a.shockId > b.shockId ? 1 : 0))
+    .map((s) => ({
+      id: s.shockId,
+      corridorId: s.corridorId,
+      fromMs: Date.parse(s.since),
+      toMs: Number.POSITIVE_INFINITY,
+      driftBps: Number.isFinite(s.driftBps) ? s.driftBps : 0,
+      noiseMultiplier: Number.isFinite(s.noiseMultiplier) && s.noiseMultiplier > 0 ? s.noiseMultiplier : 1,
+      rampInMs: Number.isFinite(s.rampMs) && s.rampMs > 0 ? s.rampMs : 0,
+    }));
 }

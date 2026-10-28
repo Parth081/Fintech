@@ -9,6 +9,7 @@
 //  - log-normal amounts per corridor (median and spread differ by corridor), rounded the way people pay;
 //  - optional scenario mix (e.g. 2% provider-reject, 1% recon-break), drawn per payment.
 import { CORRIDORS, exponentOf, type Corridor, type Money, type Party } from '@ct/contracts';
+import { applyRisk, riskFor, type RiskMix } from './risk';
 
 /** mulberry32: tiny, fast, well-distributed 32-bit PRNG. Returns floats in [0, 1). */
 export function mulberry32(seed: number): () => number {
@@ -192,6 +193,8 @@ export interface GenerateOptions {
   scenario?: string;
   /** Scenario mix, drawn per payment. */
   mix?: ScenarioMix;
+  /** M4: share of risky payments (sanctions near-matches, fraud-like), drawn per payment. Off by default. */
+  riskMix?: RiskMix;
   corridors?: readonly Corridor[];
 }
 
@@ -212,6 +215,8 @@ export function generatePayment(seed: number, index: number, opts: GenerateOptio
   };
   const scenario = opts.scenario ?? scenarioFor(seed, index, opts.mix);
   if (scenario) body.scenario = scenario;
+  const risk = riskFor(seed, index, opts.riskMix);
+  if (risk) return { index, idempotencyKey: `${idempotencyKey(seed, index, scenario)}-risk-${risk}`, body: applyRisk(risk, seed, index, body) };
   return { index, idempotencyKey: idempotencyKey(seed, index, scenario), body };
 }
 

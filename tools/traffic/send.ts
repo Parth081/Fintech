@@ -1,6 +1,7 @@
 // Argument parsing and HTTP sending for `npm run traffic`. Kept separate from index.ts so it is testable.
 import { serviceConfig } from '@ct/contracts';
 import { parseScenarioMix, type GeneratedPayment, type ScenarioMix } from './generator';
+import { parseRiskMix, type RiskMix } from './risk';
 
 export interface TrafficArgs {
   help: boolean;
@@ -11,6 +12,8 @@ export interface TrafficArgs {
   scenario?: string;
   /** Scenario mix drawn per payment, e.g. { 'provider-reject': 0.02 }. */
   mix?: ScenarioMix;
+  /** M4: risky payments drawn per payment, e.g. { sanctions: 0.005, fraud: 0.01 }. */
+  riskMix?: RiskMix;
   url: string;
   start: number;
   /** Max requests in flight. */
@@ -31,6 +34,9 @@ Options:
   --rate <n>         Payments per second, 0 = no pacing (default 2)
   --scenario <name>  Scenario for every payment: force-hold, provider-reject, recon-break
   --mix <spec>       Scenario mix per payment, e.g. provider-reject=0.02,recon-break=1%
+  --risk-mix <spec>  Risky payments per payment (M4), e.g. sanctions=0.5%,fraud=1%: sanctions = a party
+                     close to a fictional sanctions-list name; fraud = a structured amount from a new
+                     account to a shared collector. Off by default.
   --start <n>        First index (default 0)
   --concurrency <n>  Max requests in flight (default 8); with --rate this bounds bursts
   --quiet            Progress every second instead of one line per payment (default above 200)
@@ -81,6 +87,12 @@ export function parseTrafficArgs(argv: readonly string[], defaultUrl = serviceCo
         const v = next();
         if (!v) throw new Error('--mix needs a value');
         args.mix = parseScenarioMix(v);
+        break;
+      }
+      case '--risk-mix': {
+        const v = next();
+        if (!v) throw new Error('--risk-mix needs a value');
+        args.riskMix = parseRiskMix(v);
         break;
       }
       case '--quiet':

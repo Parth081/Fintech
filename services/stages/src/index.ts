@@ -11,6 +11,7 @@ import { isStageName, STAGE_NAMES } from './steps';
 export { startStage, startAllStages, buildEvent, type StageOptions, type StageHandle } from './runner';
 export * from './steps';
 export * from './fx-math';
+export * from './risk';
 
 async function main(argv: string[]): Promise<void> {
   const all = argv.includes('--all');

@@ -16,10 +16,11 @@ export {
   type PostJournalInput,
   type PostResult,
   type SettlementInput,
+  type RefundInput,
   type InvariantReport,
 } from './store';
 export { startLedgerService, ledgerRequestHandler, type LedgerServiceOptions, type LedgerServiceHandle } from './service';
-export { settlementEntries, assertPostable, journalIdFor, LEDGER_RULE_VERSION } from './posting';
+export { settlementEntries, refundEntries, assertPostable, journalIdFor, LEDGER_RULE_VERSION } from './posting';
 export { CHART_OF_ACCOUNTS, classifyAccount, accountIds, type AccountRule, type AccountSpec } from './chart';
 export { MIGRATIONS, migrate, type Migration } from './migrations';
 export { openDriver, type SqlDriver, type Queryable, type DriverOptions } from './driver';

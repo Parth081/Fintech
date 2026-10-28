@@ -17,8 +17,9 @@ import {
 import type { EventBus, Subscription } from '@ct/event-bus';
 import { AmbientTraffic, ambientIndexOf, MAX_AMBIENT_RATE, type PaymentSender } from './ambient';
 import { systemClock, type Clock, type TimerHandle } from './clock';
-import { SCENARIOS, scenarioInfo, validateScript, type ScenarioAction, type ScenarioScript } from './scenarios';
+import { craftedKey, craftedRequest, SCENARIOS, scenarioInfo, validateScript, type CraftedPayment, type ScenarioAction, type ScenarioScript } from './scenarios';
 import { ATTRACT_LOOP, type AttractState, type OrchestratorStateWithAttract } from './attract';
+import { sendPayment } from '../../../tools/traffic/send';
 
 export const PACE_PRESETS: Record<PacePreset, { stageDelayMs: number | null; settlementDelayMs: number | null }> = {
   normal: { stageDelayMs: null, settlementDelayMs: null },
@@ -71,6 +72,13 @@ interface ActiveRun {
   stepId: string | null;
   timer: TimerHandle | undefined;
   openOutages: Set<string>;
+  /** FX shocks this run started and has not ended yet: script shockId -> published shockId. */
+  openShocks: Map<string, string>;
+  /** Crafted payments not sent yet, in scenario-time order (the queue stops while paused). */
+  sendQueue: { dueMs: number; key: string; payment: CraftedPayment }[];
+  sendTimer: TimerHandle | undefined;
+  /** Crafted payments sent so far (accepted or duplicate) and those that failed after retries. */
+  crafted: { sent: number; failed: number };
   ambientBefore: number;
   finishing: boolean;
   /** A cycle of the attract loop (not a presenter scenario). */
@@ -211,6 +219,12 @@ export async function startOrchestrator(options: OrchestratorOptions): Promise<O
       log(`[orchestrator] recovery: ending dangling ${outage.mode} outage of ${outage.providerId}`);
       await publishNow('control.provider_outage.ended', { providerId: outage.providerId, ...(outage.runId ? { runId: outage.runId } : {}) }, id);
     }
+    for (const shock of Object.values(s.fxShocks)) {
+      const runId = (shock as { runId?: string }).runId;
+      const id = runId ? deterministicId('orchestrator', runId, 'restore-fx', shock.shockId) : deterministicId('orchestrator', 'recover-fx', shock.shockId, shock.since);
+      log(`[orchestrator] recovery: ending dangling FX shock ${shock.shockId} on ${shock.corridorId}`);
+      await publishNow('control.fx_shock.ended', { shockId: shock.shockId, ...(runId ? { runId } : {}) }, id);
+    }
     if (s.scenario) {
       log(`[orchestrator] recovery: closing interrupted scenario run ${s.scenario.runId}`);
       await publishNow(
@@ -240,12 +254,66 @@ export async function startOrchestrator(options: OrchestratorOptions): Promise<O
     r.finishing = true;
     clock.clearTimeout(r.timer);
     r.timer = undefined;
+    cancelSends(r);
     ambient.setRate(r.ambientBefore);
     if (run === r) run = null;
     afterRunEnded(r, 'elsewhere');
   };
 
   const elapsed = (r: ActiveRun) => r.elapsedBase + (r.resumedAt === null ? 0 : clock.now() - r.resumedAt);
+
+  // ---- crafted payments (M4): sent through the Payment API on the scenario clock ----
+  const sender = options.send ?? sendPayment;
+  const sendsInFlight = new Set<Promise<void>>();
+  function cancelSends(r: ActiveRun): void {
+    clock.clearTimeout(r.sendTimer);
+    r.sendTimer = undefined;
+    if (r.sendQueue.length > 0) log(`[orchestrator] run ${r.runId}: ${r.sendQueue.length} crafted payment(s) not sent (run ended)`);
+    r.sendQueue.length = 0;
+  }
+  const sendCrafted = (r: ActiveRun, key: string, payment: CraftedPayment) => {
+    const p: Promise<void> = (async () => {
+      for (let attempt = 1; ; attempt++) {
+        const res = await sender(options.paymentApiUrl, { index: -1, idempotencyKey: key, body: payment });
+        if (res.outcome !== 'error') {
+          r.crafted.sent += 1;
+          return;
+        }
+        // Same Idempotency-Key on every attempt: a retry can never create a second payment.
+        const retryable = res.status === undefined || res.status >= 500 || res.status === 429;
+        if (!retryable || attempt >= 5 || closed) {
+          r.crafted.failed += 1;
+          log(`[orchestrator] crafted payment ${key} failed (${res.status ?? '-'} ${res.detail ?? ''})`);
+          return;
+        }
+        await realSleep(200 * attempt);
+      }
+    })()
+      .catch((err: unknown) => {
+        r.crafted.failed += 1;
+        log(`[orchestrator] crafted payment ${key} failed: ${(err as Error).message}`);
+      })
+      .finally(() => sendsInFlight.delete(p));
+    sendsInFlight.add(p);
+  };
+  const scheduleSends = (r: ActiveRun): void => {
+    clock.clearTimeout(r.sendTimer);
+    r.sendTimer = undefined;
+    if (r.finishing || r.resumedAt === null || r.sendQueue.length === 0) return;
+    const fire = () => {
+      r.sendTimer = undefined;
+      if (r.finishing || run !== r) return;
+      const now = elapsed(r);
+      while (r.sendQueue.length > 0 && r.sendQueue[0]!.dueMs <= now) {
+        const item = r.sendQueue.shift()!;
+        sendCrafted(r, item.key, item.payment);
+      }
+      scheduleSends(r);
+    };
+    const delay = r.sendQueue[0]!.dueMs - elapsed(r);
+    if (delay <= 0) fire();
+    else r.sendTimer = clock.setTimeout(fire, delay);
+  };
 
   const applyAction = async (r: ActiveRun, stepId: string, a: ScenarioAction, i: number) => {
     const id = deterministicId('orchestrator', r.runId, 'step', stepId, 'action', String(i));
@@ -265,6 +333,34 @@ export async function startOrchestrator(options: OrchestratorOptions): Promise<O
       case 'ambient.rate':
         ambient.setRate(a.rate);
         return;
+      case 'fx_shock.start': {
+        const shockId = `${a.shockId}@${r.runId}`;
+        r.openShocks.set(a.shockId, shockId);
+        await publishNow(
+          'control.fx_shock.started',
+          { shockId, corridorId: a.corridorId, driftBps: a.driftBps, noiseMultiplier: a.noiseMultiplier, rampMs: a.rampMs, reason: a.reason, runId: r.runId },
+          id,
+        );
+        return;
+      }
+      case 'fx_shock.end': {
+        const shockId = r.openShocks.get(a.shockId) ?? `${a.shockId}@${r.runId}`;
+        await publishNow('control.fx_shock.ended', { shockId, runId: r.runId }, id);
+        r.openShocks.delete(a.shockId);
+        return;
+      }
+      case 'payments.send': {
+        // Due times are on the scenario clock, counted from the step's scheduled time (not from when this
+        // action ran after earlier publishes), so the schedule is the same on every run.
+        const step = r.script.steps.find((x) => x.id === stepId);
+        const base = step ? step.atMs : elapsed(r);
+        a.payments.forEach((p, k) => {
+          r.sendQueue.push({ dueMs: base + k * (a.spacingMs ?? 0), key: craftedKey(r.runId, stepId, a.label, k), payment: craftedRequest(p, r.runId) });
+        });
+        r.sendQueue.sort((x, y) => x.dueMs - y.dueMs);
+        scheduleSends(r);
+        return;
+      }
     }
   };
 
@@ -273,10 +369,15 @@ export async function startOrchestrator(options: OrchestratorOptions): Promise<O
     r.finishing = true;
     clock.clearTimeout(r.timer);
     r.timer = undefined;
+    cancelSends(r);
     return enqueue(async () => {
       for (const providerId of [...r.openOutages]) {
         await publishNow('control.provider_outage.ended', { providerId, runId: r.runId }, deterministicId('orchestrator', r.runId, 'restore', providerId));
         r.openOutages.delete(providerId);
+      }
+      for (const [scriptShockId, shockId] of [...r.openShocks]) {
+        await publishNow('control.fx_shock.ended', { shockId, runId: r.runId }, deterministicId('orchestrator', r.runId, 'restore-fx', shockId));
+        r.openShocks.delete(scriptShockId);
       }
       await publishNow('control.scenario.ended', { runId: r.runId, scenarioId: r.script.id, outcome }, deterministicId('orchestrator', r.runId, 'ended'));
       ambient.setRate(r.ambientBefore);
@@ -344,6 +445,10 @@ export async function startOrchestrator(options: OrchestratorOptions): Promise<O
       stepId: null,
       timer: undefined,
       openOutages: new Set(),
+      openShocks: new Map(),
+      sendQueue: [],
+      sendTimer: undefined,
+      crafted: { sent: 0, failed: 0 },
       ambientBefore: ambient.rate,
       finishing: false,
       attract: isAttract,
@@ -374,9 +479,12 @@ export async function startOrchestrator(options: OrchestratorOptions): Promise<O
         r.resumedAt = null;
         clock.clearTimeout(r.timer);
         r.timer = undefined;
+        clock.clearTimeout(r.sendTimer);
+        r.sendTimer = undefined;
       } else if (!value && r.resumedAt === null) {
         r.resumedAt = clock.now();
         scheduleNext(r);
+        scheduleSends(r);
       }
     }
   };
@@ -658,9 +766,11 @@ export async function startOrchestrator(options: OrchestratorOptions): Promise<O
           if (!r.finishing) await finish(r, 'stopped').catch(() => {});
         } else if (r) {
           clock.clearTimeout(r.timer);
+          clock.clearTimeout(r.sendTimer);
           r.finishing = true;
         }
         await queue;
+        await Promise.allSettled([...sendsInFlight]);
         await ambient.stop();
         await sub.unsubscribe();
         await new Promise<void>((resolve) => {

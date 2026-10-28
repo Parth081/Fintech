@@ -4,7 +4,7 @@ import type { AccountBalance, AccountType, JournalView, LedgerEntry, PaymentStat
 import { classifyAccount, type AccountSpec } from './chart';
 import { openDriver, type DriverOptions, type Queryable, type SqlDriver } from './driver';
 import { migrate } from './migrations';
-import { assertPostable, journalIdFor, settlementEntries } from './posting';
+import { assertPostable, journalIdFor, refundEntries, settlementEntries } from './posting';
 
 export interface PostJournalInput {
   paymentId: string;
@@ -28,6 +28,13 @@ export interface SettlementInput {
   state: PaymentState;
 }
 
+export interface RefundInput {
+  paymentId: string;
+  /** eventId of the payment.refund_requested that causes the reversal. */
+  causationEventId: string;
+  state?: PaymentState;
+}
+
 export interface InvariantReport {
   ok: boolean;
   violations: string[];
@@ -39,6 +46,12 @@ export interface LedgerStore {
   postJournal(input: PostJournalInput): Promise<PostResult>;
   /** StageServices.ledger: post the settlement journal for a settled payment (idempotent). */
   postSettlement(input: SettlementInput): Promise<PostResult>;
+  /**
+   * StageServices.ledger (M4): post the refund journal, the reversal of the payment's settlement journal
+   * (kind 'refund'). Idempotent per payment: a second request returns the existing refund journal.
+   * Throws when the payment has no settlement journal.
+   */
+  postRefund(input: RefundInput): Promise<PostResult>;
   trialBalance(): Promise<TrialBalance>;
   accounts(): Promise<AccountBalance[]>;
   account(accountId: string, recentLimit?: number): Promise<(AccountBalance & { recent: JournalView[] }) | undefined>;
@@ -178,8 +191,8 @@ function createLedgerStore(driver: SqlDriver): LedgerStore {
       if (inserted.length !== 0) throw new Error(`ledger: partial insert of journal ${journalId}`); // unreachable; rolls back
       // Already posted: by this causation event, or (settlement) for this payment by another event.
       let existing = await loadJournals(q, 'WHERE causation_event_id = $1', [causationEventId]);
-      if (existing.length === 0 && kind === 'settlement') {
-        existing = await loadJournals(q, `WHERE payment_id = $1 AND kind = 'settlement'`, [paymentId]);
+      if (existing.length === 0 && (kind === 'settlement' || kind === 'refund')) {
+        existing = await loadJournals(q, 'WHERE payment_id = $1 AND kind = $2', [paymentId, kind]);
       }
       if (existing.length === 0) existing = await loadJournals(q, 'WHERE journal_id = $1', [journalId]);
       const found = existing[0];
@@ -257,6 +270,7 @@ function createLedgerStore(driver: SqlDriver): LedgerStore {
     const journalIds = new Set<string>();
     const causations = new Map<string, string>();
     const settlementByPayment = new Map<string, string>();
+    const refundByPayment = new Map<string, string>();
     for (const j of journals) {
       journalIds.add(j.journal_id);
       const prev = causations.get(j.causation_event_id);
@@ -267,6 +281,14 @@ function createLedgerStore(driver: SqlDriver): LedgerStore {
         if (other) violations.push(`payment ${j.payment_id} has two settlement journals: ${other}, ${j.journal_id}`);
         else settlementByPayment.set(j.payment_id, j.journal_id);
       }
+      if (j.kind === 'refund') {
+        const other = refundByPayment.get(j.payment_id);
+        if (other) violations.push(`payment ${j.payment_id} has two refund journals: ${other}, ${j.journal_id}`);
+        else refundByPayment.set(j.payment_id, j.journal_id);
+      }
+    }
+    for (const [paymentId, refundId] of refundByPayment) {
+      if (!settlementByPayment.has(paymentId)) violations.push(`refund journal ${refundId} for payment ${paymentId} has no settlement journal`);
     }
     const netByJournal = new Map<string, Map<string, bigint>>();
     const countByJournal = new Map<string, number>();
@@ -298,6 +320,27 @@ function createLedgerStore(driver: SqlDriver): LedgerStore {
         if (net !== 0n) violations.push(`journal ${id} unbalanced in ${ccy}: debits - credits = ${net}`);
       }
     }
+    // M4: a refund journal must exactly reverse its settlement journal (per account and currency).
+    if (refundByPayment.size) {
+      const netByAccount = new Map<string, Map<string, bigint>>(); // journal -> account|ccy -> signed sum
+      for (const e of raw) {
+        const m = netByAccount.get(e.journal_id) ?? new Map<string, bigint>();
+        const k = `${e.account_id}|${e.currency}`;
+        m.set(k, (m.get(k) ?? 0n) + (e.direction === 'debit' ? BigInt(e.amount) : -BigInt(e.amount)));
+        netByAccount.set(e.journal_id, m);
+      }
+      for (const [paymentId, refundId] of refundByPayment) {
+        const settlementId = settlementByPayment.get(paymentId);
+        if (!settlementId) continue;
+        const st = netByAccount.get(settlementId) ?? new Map<string, bigint>();
+        const rf = netByAccount.get(refundId) ?? new Map<string, bigint>();
+        for (const k of new Set([...st.keys(), ...rf.keys()])) {
+          if ((st.get(k) ?? 0n) + (rf.get(k) ?? 0n) !== 0n) {
+            violations.push(`refund journal ${refundId} does not reverse settlement ${settlementId} on ${k.replace('|', ' ')}`);
+          }
+        }
+      }
+    }
     for (const [ccy, net] of byCurrency) if (net !== 0n) violations.push(`trial balance unbalanced in ${ccy}: debits - credits = ${net}`);
     for (const a of accounts) {
       try {
@@ -322,6 +365,12 @@ function createLedgerStore(driver: SqlDriver): LedgerStore {
     async postSettlement({ paymentId, causationEventId, state }) {
       if (state.paymentId !== paymentId) throw new Error(`ledger: state is for ${state.paymentId}, not ${paymentId}`);
       return postJournal({ paymentId, kind: 'settlement', causationEventId, entries: settlementEntries(state) });
+    },
+    async postRefund({ paymentId, causationEventId, state }) {
+      if (state && state.paymentId !== paymentId) throw new Error(`ledger: state is for ${state.paymentId}, not ${paymentId}`);
+      const [settlement] = await loadJournals(driver, `WHERE payment_id = $1 AND kind = 'settlement'`, [paymentId]);
+      if (!settlement) throw new Error(`ledger: payment ${paymentId} has no settlement journal to refund`);
+      return postJournal({ paymentId, kind: 'refund', causationEventId, entries: refundEntries(toLedgerEntries(settlement)) });
     },
     trialBalance,
     accounts: () => accountRows(),

@@ -13,6 +13,8 @@ export interface LauncherArgs {
   gatewayPort: number;
   ledgerPort: number;
   orchestratorPort: number;
+  /** M4: operations service (back office API behind the console). */
+  opsPort: number;
   /** M5 AI explainer port (env ASSISTANT_PORT, default 7076). */
   assistantPort: number;
   /** M5 booth service port (env BOOTH_PORT, default 7077). */
@@ -32,7 +34,7 @@ export interface LauncherArgs {
 export const LAUNCHER_USAGE = `Usage: npm start [-- options]
 
 Starts the whole Control Tower on this machine (broker, payment-api, 6 stages, ledger, orchestrator,
-gateway + UI, AI explainer, booth) and the launcher control API (reset) on 127.0.0.1.
+ops, gateway + UI, AI explainer, booth) and the launcher control API (reset) on 127.0.0.1.
 A reset never deletes DATA_DIR/booth (visitor leads); clear them with npm run booth:clear-leads.
 
 Options:
@@ -45,6 +47,7 @@ Options:
   --gateway-port <n>         (env GATEWAY_PORT, default 7072)
   --ledger-port <n>          (env LEDGER_PORT, default 7073)
   --orchestrator-port <n>    (env ORCHESTRATOR_PORT, default 7074)
+  --ops-port <n>             Operations service behind the console (env OPS_PORT, default 7075)
   --assistant-port <n>       AI explainer (env ASSISTANT_PORT, default 7076)
   --booth-port <n>           Booth: leads + analytics (env BOOTH_PORT, default 7077)
   --llm <auto|off>           AI explainer mode (env ASSISTANT_LLM, default auto): auto = Claude phrases answers
@@ -86,6 +89,7 @@ export function parseLauncherArgs(argv: readonly string[], defaults = serviceCon
     gatewayPort: defaults.gatewayPort,
     ledgerPort: defaults.ledgerPort,
     orchestratorPort: defaults.orchestratorPort ?? 7074,
+    opsPort: defaults.opsPort ?? 7075,
     assistantPort: defaults.assistantPort ?? 7076,
     boothPort: defaults.boothPort ?? 7077,
     assistantLlm: defaults.assistantLlm === 'off' ? 'off' : 'auto',
@@ -146,6 +150,9 @@ export function parseLauncherArgs(argv: readonly string[], defaults = serviceCon
       case '--orchestrator-port':
         args.orchestratorPort = toPort(flag, next());
         break;
+      case '--ops-port':
+        args.opsPort = toPort(flag, next());
+        break;
       case '--assistant-port':
         args.assistantPort = toPort(flag, next());
         break;
@@ -192,6 +199,7 @@ export function parseLauncherArgs(argv: readonly string[], defaults = serviceCon
     ['gateway', args.gatewayPort],
     ['ledger', args.ledgerPort],
     ['orchestrator', args.orchestratorPort],
+    ['ops', args.opsPort],
     ['assistant', args.assistantPort],
     ['booth', args.boothPort],
     ...(args.controlPort !== null ? ([['control', args.controlPort]] as [string, number][]) : []),

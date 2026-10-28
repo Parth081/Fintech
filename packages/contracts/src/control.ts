@@ -7,7 +7,7 @@ import type { AnyEvent } from './events';
 /** Control events use this fixed id in the paymentId field (the broker and Kafka key by paymentId). */
 export const CONTROL_STREAM_ID = '__control__' as const;
 
-export type ControlProducer = 'orchestrator' | 'presenter';
+export type ControlProducer = 'orchestrator' | 'presenter' | 'ops'; // ops: approved config changes (M4)
 
 export interface ControlPayloadMap {
   /** A provider stops working. 'down' = rejects every instruction; 'degraded' = rejects with failureRate. */

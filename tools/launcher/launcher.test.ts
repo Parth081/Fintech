@@ -13,6 +13,7 @@ const defaults = {
   gatewayPort: 7072,
   ledgerPort: 7073,
   orchestratorPort: 7074,
+  opsPort: 7075,
   launcherControlPort: 7079,
   dataDir: '.data',
   stageDelayMs: 400,
@@ -23,7 +24,7 @@ describe('parseLauncherArgs', () => {
   it('uses defaults', () => {
     const a = parseLauncherArgs([], defaults);
     expect(a).toMatchObject({ reset: false, buildWeb: true, quiet: false, brokerPort: 7070, gatewayPort: 7072, dataDir: '.data' });
-    expect(a).toMatchObject({ orchestratorPort: 7074, controlPort: 7079 });
+    expect(a).toMatchObject({ orchestratorPort: 7074, opsPort: 7075, controlPort: 7079 });
     if (!process.env.AMBIENT_RATE) expect(a.ambientRate).toBe(3); // npm start shows a living system
     expect(parseLauncherArgs(['--no-control'], defaults).controlPort).toBeNull();
     expect(parseLauncherArgs(['--ambient', '0'], defaults).ambientRate).toBe(0);
@@ -33,12 +34,12 @@ describe('parseLauncherArgs', () => {
     const a = parseLauncherArgs(
       ['--reset', '--no-build', '--quiet', '--broker-port', '8070', '--api-port=8071', '--gateway-port', '8072', '--ledger-port=8073',
         '--data-dir', 'tmp/data', '--stage-delay', '0', '--settlement-delay=0', '--host', '0.0.0.0', '--timeout', '5000',
-        '--orchestrator-port', '8074', '--control-port=8079', '--ambient', '2.5'],
+        '--orchestrator-port', '8074', '--ops-port', '8075', '--control-port=8079', '--ambient', '2.5'],
       defaults,
     );
     expect(a).toEqual({
       help: false, reset: true, buildWeb: false, quiet: true, host: '0.0.0.0', brokerPort: 8070, paymentApiPort: 8071,
-      gatewayPort: 8072, ledgerPort: 8073, orchestratorPort: 8074, assistantPort: 7076, boothPort: 7077, assistantLlm: 'auto',
+      gatewayPort: 8072, ledgerPort: 8073, orchestratorPort: 8074, opsPort: 8075, assistantPort: 7076, boothPort: 7077, assistantLlm: 'auto',
       controlPort: 8079, ambientRate: 2.5,
       dataDir: 'tmp/data', stageDelayMs: 0, settlementDelayMs: 0, startupTimeoutMs: 5000,
     });
@@ -53,6 +54,7 @@ describe('parseLauncherArgs', () => {
     expect(() => parseLauncherArgs(['--gateway-port', '7070'], defaults)).toThrow(/different/);
     expect(() => parseLauncherArgs(['--ledger-port', '7072'], defaults)).toThrow(/different/);
     expect(() => parseLauncherArgs(['--orchestrator-port', '7079'], defaults)).toThrow(/different/);
+    expect(() => parseLauncherArgs(['--ops-port', '7074'], defaults)).toThrow(/different/);
     expect(() => parseLauncherArgs(['--ambient', '-1'], defaults)).toThrow(/ambient/);
     expect(() => parseLauncherArgs(['--ambient', '99'], defaults)).toThrow(/ambient/);
     expect(() => parseLauncherArgs(['--ambient'], defaults)).toThrow(/ambient/);
@@ -119,7 +121,7 @@ describe('service list (M2, M3, M5)', () => {
     expect(STAGES).not.toContain('ledger');
     expect(SERVICE_NAMES).toEqual([
       'broker', 'payment-api', 'screening', 'risk', 'fx', 'routing', 'settlement', 'reconciliation', 'ledger', 'orchestrator',
-      'assistant', 'booth', 'gateway',
+      'ops', 'assistant', 'booth', 'gateway',
     ]);
   });
 

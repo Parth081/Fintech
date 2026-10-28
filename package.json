@@ -23,6 +23,7 @@
     "verify:m5": "tsx tools/verify/m5.ts",
     "verify:m5:quick": "tsx tools/verify/m5.ts --scenario provider-degraded",
     "booth:clear-leads": "tsx tools/launcher/clear-leads.ts",
+    "verify:m4": "tsx tools/verify/m4.ts",
     "bench:broker": "tsx tools/bench/broker-bench.ts",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run --exclude \"tests/e2e/**\"",

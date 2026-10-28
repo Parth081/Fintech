@@ -17,11 +17,12 @@ async function main(): Promise<void> {
     return;
   }
   const quiet = args.quiet ?? args.count > 200;
+  const riskMix = args.riskMix ? Object.entries(args.riskMix).map(([k, v]) => `${k} ${((v ?? 0) * 100).toFixed(1)}%`).join(', ') : '';
   const mix = args.mix ? Object.entries(args.mix).map(([k, v]) => `${k} ${((v ?? 0) * 100).toFixed(1)}%`).join(', ') : '';
   console.log(
     `Sending ${args.count} synthetic payment(s) to ${args.url}/payments ` +
       `(seed ${args.seed}, rate ${args.rate || 'unlimited'}/s, concurrency ${args.concurrency}` +
-      `${args.scenario ? `, scenario ${args.scenario}` : ''}${mix ? `, mix ${mix}` : ''})`,
+      `${args.scenario ? `, scenario ${args.scenario}` : ''}${mix ? `, mix ${mix}` : ''}${riskMix ? `, risk mix ${riskMix}` : ''})`,
   );
 
   let refused = 0;
@@ -39,12 +40,13 @@ async function main(): Promise<void> {
     concurrency: args.concurrency,
     scenario: args.scenario,
     mix: args.mix,
+    riskMix: args.riskMix,
     shouldStop: () => unreachable,
     onResult: (p, r) => {
       done += 1;
       if (r.detail?.startsWith('connection refused') && ++refused >= 3 && done === refused) unreachable = true;
       if (quiet && r.outcome !== 'error') return;
-      const label = `${p.body.corridor} ${formatMoney(p.body.amount)} ${p.body.debtor.name} -> ${p.body.creditor.name}${p.body.scenario ? ` [${p.body.scenario}]` : ''}`;
+      const label = `${p.body.corridor} ${formatMoney(p.body.amount)} ${p.body.debtor.name} -> ${p.body.creditor.name}${p.body.scenario ? ` [${p.body.scenario}]` : ''}${p.idempotencyKey.includes('-risk-') ? ` [risk:${p.idempotencyKey.split('-risk-')[1]}]` : ''}`;
       const extra = r.outcome === 'error' ? ` ${r.status ?? ''} ${r.detail ?? ''}`.trimEnd() : r.paymentId ? ` ${r.paymentId}` : '';
       console.log(`  #${p.index} ${r.outcome.padEnd(9)} ${label}${extra}`);
     },

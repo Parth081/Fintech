@@ -159,7 +159,7 @@ export interface PayloadMap {
   'payment.failed': { reason: string; atStage: StageName; attempts?: number };
   'payment.held': { reason: string; atStage: StageName; alertIds?: string[] };
   /** System rejection (atStage = a pipeline stage) or an operator decision (atStage 'ops', actor set). */
-  'payment.rejected': { reason: string; atStage: StageName; actor?: Actor; caseId?: string };
+  'payment.rejected': { reason: string; atStage: StageName; actor?: Actor; caseId?: string; approvedBy?: Actor };
   /** A risk/compliance alert about a payment. Raised by screening or risk; worked as a case in the console. */
   'risk.alert_raised': {
     alertId: string;

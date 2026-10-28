@@ -98,19 +98,28 @@ describe('pipeline (API -> reconciled)', () => {
       expect(typeof e.trace!.decision).toBe('string');
     }
     const scored = events.find((e) => e.type === 'payment.scored');
-    expect(scored?.type === 'payment.scored' && scored.payload.fraudScore).toBeLessThanOrEqual(0.2);
+    // M4: real fraud model (a first payment to a new beneficiary scores mid-range) — approved below the hold threshold.
+    expect(scored).toMatchObject({ payload: { decision: 'approve', amlAlerts: [] } });
+    expect(scored?.type === 'payment.scored' && scored.payload.fraudScore).toBeLessThan(0.7);
     expectNoDuplicates();
   });
 
-  it('force-hold ends in held at risk with no later events', async () => {
+  it('force-hold raises a workable alert, ends in held at risk with no later events', async () => {
+    // M4: a hold always carries an alert (so the ops console can open a case); force-hold raises SCENARIO_FORCE_HOLD.
     await setup();
     const id = await send({ scenario: 'force-hold' });
     await waitForStatus(id, 'held');
     await new Promise((r) => setTimeout(r, 50));
     await bus.drain();
     const events = eventsOf(id);
-    expect(events.map((e) => e.type)).toEqual(['payment.initiated', 'payment.screened', 'payment.held']);
-    expect(events[2]).toMatchObject({ producer: 'risk', payload: { reason: 'Manual review (scenario)', atStage: 'risk' } });
+    // (a random sample amount may also raise a fraud-model alert after the scenario alert)
+    const types = events.map((e) => e.type);
+    expect(types.slice(0, 3)).toEqual(['payment.initiated', 'payment.screened', 'risk.alert_raised']);
+    expect(types.at(-1)).toBe('payment.held');
+    expect(types.slice(2, -1).every((t) => t === 'risk.alert_raised')).toBe(true);
+    expect(events[2]).toMatchObject({ producer: 'risk', payload: { kind: 'fraud', rule: 'SCENARIO_FORCE_HOLD' } });
+    const alertIds = events.flatMap((e) => (e.type === 'risk.alert_raised' ? [e.payload.alertId] : []));
+    expect(events.at(-1)).toMatchObject({ producer: 'risk', payload: { reason: 'Manual review (scenario)', atStage: 'risk', alertIds } });
     expectNoDuplicates();
   });
 
@@ -174,7 +183,7 @@ describe('pipeline (API -> reconciled)', () => {
   });
 
   it('completes payments after stages are stopped midway and restarted, with no duplicate events', async () => {
-    await setup({ settlementDelayMs: 40 });
+    await setup({ settlementDelayMs: 250 }); // M4: wide enough to observe 'sent' under full-suite CPU load
     const ids = await Promise.all(Array.from({ length: 5 }, () => send()));
     await waitForStatus(ids[0]!, 'sent'); // stop while settlement is waiting
     await stopStages();
@@ -236,7 +245,9 @@ describe('pipeline (API -> reconciled)', () => {
     await bus.publish({ ...screened, eventId: 'bogus-scored', type: 'payment.scored', producer: 'risk', payload: { fraudScore: 0, amlAlerts: [], decision: 'approve' } } as AnyEvent);
     await new Promise((r) => setTimeout(r, 30));
     await bus.drain();
-    expect(eventsOf(id).map((e) => e.type)).toEqual(['payment.initiated', 'payment.screened', 'payment.held', 'payment.scored']);
+    const types = eventsOf(id).map((e) => e.type);
+    expect(types.slice(-2)).toEqual(['payment.held', 'payment.scored']); // the bogus scored is on the log...
+    expect(types).not.toContain('payment.quoted'); // ...but fx never acted on it
   });
 
   it('runs 20 concurrent payments to reconciled', async () => {

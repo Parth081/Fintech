@@ -12,6 +12,16 @@ export interface PaymentFacts {
   routed: number;
   sendFailed: number;
   ledgerPosted: number;
+  /** M4: payment.refunded events (each posts a reversal journal). */
+  refunded: number;
+  /**
+   * Routing attempts / provider failures in the current attempt budget and the largest budget seen. An
+   * operator retry (payment.retry_requested, M4) starts a fresh budget of MAX_ATTEMPTS.
+   */
+  budgetRouted: number;
+  budgetSendFailed: number;
+  maxBudgetRouted: number;
+  maxBudgetSendFailed: number;
   firstAt: number;
   lastAt: number;
   terminalAt?: number;
@@ -60,14 +70,32 @@ export class LogAnalyzer {
       routed: 0,
       sendFailed: 0,
       ledgerPosted: 0,
+      refunded: 0,
+      budgetRouted: 0,
+      budgetSendFailed: 0,
+      maxBudgetRouted: 0,
+      maxBudgetSendFailed: 0,
       firstAt: at,
       lastAt: at,
     };
     facts.state = state;
     facts.lastAt = Math.max(facts.lastAt, at);
-    if (event.type === 'payment.routed') facts.routed += 1;
-    if (event.type === 'payment.send_failed') facts.sendFailed += 1;
+    if (event.type === 'payment.routed') {
+      facts.routed += 1;
+      facts.budgetRouted += 1;
+    }
+    if (event.type === 'payment.send_failed') {
+      facts.sendFailed += 1;
+      facts.budgetSendFailed += 1;
+    }
+    if (event.type === 'payment.retry_requested') {
+      facts.budgetRouted = 0;
+      facts.budgetSendFailed = 0;
+    }
+    facts.maxBudgetRouted = Math.max(facts.maxBudgetRouted, facts.budgetRouted);
+    facts.maxBudgetSendFailed = Math.max(facts.maxBudgetSendFailed, facts.budgetSendFailed);
     if (event.type === 'ledger.posted') facts.ledgerPosted += 1;
+    if (event.type === 'payment.refunded') facts.refunded += 1;
     if (isTerminal(state.status) && facts.terminalAt === undefined) facts.terminalAt = at;
     this.payments.set(event.paymentId, facts);
   }
@@ -136,28 +164,35 @@ export function evaluate(input: EvaluateInput): Check[] {
     examples: inv && !inv.ok ? sample(inv.violations) : undefined,
   });
 
-  // (b) exactly one journal per reconciled payment, none for the others
-  const journalProblems: { paymentId: string; status: string; journals: number | undefined; ledgerPostedEvents: number }[] = [];
+  // (b) exactly one journal per reconciled payment, none for the others (M4: a refunded payment has its
+  // original journal plus exactly one reversal journal)
+  const journalProblems: { paymentId: string; status: string; journals: number | undefined; ledgerPostedEvents: number; refundedEvents: number }[] = [];
   let reconciled = 0;
+  let refunded = 0;
   for (const id of sent) {
     const p = log.payments.get(id);
     if (!p) continue;
-    const want = p.state.status === 'reconciled' ? 1 : 0;
-    if (p.state.status === 'reconciled') reconciled += 1;
+    const status = p.state.status;
+    const wantPosted = status === 'reconciled' || status === 'refunded' ? 1 : 0;
+    const wantRefunded = status === 'refunded' ? 1 : 0;
+    const want = wantPosted + wantRefunded;
+    if (status === 'reconciled') reconciled += 1;
+    if (status === 'refunded') refunded += 1;
     const have = input.journals?.byPayment.get(id);
-    const terminal = isTerminal(p.state.status);
-    if (terminal && (have !== want || p.ledgerPosted !== want)) {
-      journalProblems.push({ paymentId: id, status: p.state.status, journals: have, ledgerPostedEvents: p.ledgerPosted });
+    const terminal = isTerminal(status);
+    if (terminal && (have !== want || p.ledgerPosted !== wantPosted || p.refunded !== wantRefunded)) {
+      journalProblems.push({ paymentId: id, status, journals: have, ledgerPostedEvents: p.ledgerPosted, refundedEvents: p.refunded });
     }
   }
+  const expectedJournals = reconciled + 2 * refunded;
   const total = input.journals?.totalJournals;
-  const totalOk = total === undefined || (input.ownSystem ? total === reconciled : total >= reconciled);
+  const totalOk = total === undefined || (input.ownSystem ? total === expectedJournals : total >= expectedJournals);
   checks.push({
     id: 'b.journals',
-    title: 'Exactly one ledger journal (and one ledger.posted) per reconciled payment; none for held/rejected/failed',
+    title: 'Exactly one ledger journal (and one ledger.posted) per reconciled payment, two (original + reversal) per refunded one; none for held/rejected/failed',
     ok: Boolean(input.journals) && journalProblems.length === 0 && totalOk,
     detail: input.journals
-      ? `${reconciled} reconciled; ${journalProblems.length} mismatch(es)` + (total !== undefined ? `; ledger holds ${total} journal(s)${totalOk ? '' : ' (MISMATCH)'}` : '')
+      ? `${reconciled} reconciled, ${refunded} refunded; ${journalProblems.length} mismatch(es)` + (total !== undefined ? `; ledger holds ${total} journal(s)${totalOk ? '' : ` (MISMATCH, expected ${expectedJournals})`}` : '')
       : 'journal lookup unavailable',
     examples: journalProblems.length ? sample(journalProblems) : undefined,
   });
@@ -177,10 +212,10 @@ export function evaluate(input: EvaluateInput): Check[] {
     detail: `${log.invalid.length} event(s) refused by the state machine`,
     examples: log.invalid.length ? sample(log.invalid) : undefined,
   });
-  const overAttempts = [...log.payments.values()].filter((p) => p.routed > MAX_ATTEMPTS || p.sendFailed > MAX_ATTEMPTS);
+  const overAttempts = [...log.payments.values()].filter((p) => p.maxBudgetRouted > MAX_ATTEMPTS || p.maxBudgetSendFailed > MAX_ATTEMPTS);
   checks.push({
     id: 'c.retry-bound',
-    title: `At most ${MAX_ATTEMPTS} routing attempts per payment`,
+    title: `At most ${MAX_ATTEMPTS} routing attempts per payment (per operator retry)`,
     ok: overAttempts.length === 0,
     detail: `${overAttempts.length} payment(s) over the limit`,
     examples: overAttempts.length ? sample(overAttempts.map((p) => ({ paymentId: p.paymentId, routed: p.routed, sendFailed: p.sendFailed }))) : undefined,
