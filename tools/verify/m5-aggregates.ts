@@ -229,6 +229,39 @@ const R: { re: RegExp; fn: Recogniser }[] = [
       return { known: true, value: n ? Math.round(sum / n) : undefined, how: 'mean end-to-end' };
     },
   },
+  // M4: risk story of a run (held payments, alerts by kind / rule, linked payments) and the FX shock.
+  {
+    re: /^payments in (.+) that were held at least once$/,
+    fn: (m, _c, log) => ({
+      known: true,
+      value: scopePayments(log, m[1]!).ids.filter((id) => log.paymentEvents(id).some((e) => e.type === 'payment.held')).length,
+      how: 'payments with a payment.held event',
+    }),
+  },
+  {
+    re: /^count of risk\.alert_raised with (kind|rule) ([\w]+) for payments in (.+)$/,
+    fn: (m, _c, log) => ({
+      known: true,
+      value: scopePayments(log, m[3]!).ids.flatMap((id) => log.paymentEvents(id)).filter((e) => e.type === 'risk.alert_raised' && (e.payload as Record<string, unknown>)[m[1]!] === m[2]).length,
+      how: 'alerts by kind/rule',
+    }),
+  },
+  {
+    re: /^count of payload\.evidence\.relatedPaymentIds on risk\.alert_raised \(([\w-]+)\)$/,
+    fn: (m, _c, log) => {
+      const a = log.byId.get(m[1]!);
+      const rel = a && a.type === 'risk.alert_raised' ? (a.payload as { evidence?: { relatedPaymentIds?: unknown } }).evidence?.relatedPaymentIds : undefined;
+      return { known: true, value: Array.isArray(rel) ? rel.length : undefined, how: 'linked payments on the alert' };
+    },
+  },
+  {
+    re: /^payment\.quoted events coded FX_SHOCK_ACTIVE on corridor ([\w-]+) for payments in (.+)$/,
+    fn: (m, _c, log) => ({
+      known: true,
+      value: scopePayments(log, m[2]!).ids.filter((id) => (log.paymentEvents(id).find((e) => e.type === 'payment.initiated')?.payload as { corridor?: string } | undefined)?.corridor === m[1]).flatMap((id) => log.paymentEvents(id)).filter((e) => e.type === 'payment.quoted' && codesOf(e).includes('FX_SHOCK_ACTIVE')).length,
+      how: 'quotes priced under the shock',
+    }),
+  },
   {
     re: /^payments first seen between control\.scenario\.started and \.ended \((.+)\)$/,
     fn: (m, _c, log) => ({ known: true, value: scopePayments(log, m[1]!).ids.length, how: 'payments in run' }),

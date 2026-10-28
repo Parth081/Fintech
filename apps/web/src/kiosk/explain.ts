@@ -59,7 +59,7 @@ export function explainEvent(e: AnyEvent): KioskStep | null {
       if (p.decision === 'approve') {
         return { ...base, title: 'Fraud check passed', body: `The risk model scored it ${score} out of 100: low risk, approved automatically.`, tone: 'ok', intent: 'why_approved' };
       }
-      return { ...base, title: p.decision === 'hold' ? 'Held for review' : 'Blocked by risk', body: `The risk model scored it ${score} out of 100, so a person must look at it.`, tone: 'warn', intent: 'why_held' };
+      return { ...base, title: p.decision === 'hold' ? 'Held for review' : 'Blocked by risk', body: `The risk model scored it ${score} out of 100, so a person must look at it.`, tone: 'warn', intent: p.decision === 'hold' ? 'why_held' : 'why_rejected' };
     }
     case 'payment.quoted': {
       const p = e.payload;
@@ -145,7 +145,7 @@ export function explainEvent(e: AnyEvent): KioskStep | null {
     case 'payment.held':
       return { ...base, title: 'Held for review', body: `${e.payload.reason}. A compliance analyst decides what happens next.`, tone: 'warn', intent: 'why_held' };
     case 'payment.rejected':
-      return { ...base, title: 'Rejected', body: `${e.payload.reason}.`, tone: 'bad', intent: 'why_held' };
+      return { ...base, title: 'Rejected', body: `${e.payload.reason}.`, tone: 'bad', intent: 'why_rejected' };
     default:
       return null;
   }

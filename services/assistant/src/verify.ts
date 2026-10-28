@@ -3,6 +3,7 @@
 //
 // MATCHING RULES
 //   "USD 1,250.00", "$1,250.00", "1,250.00 USD" -> a money fact in that currency with exactly that amount
+//                          (or, for USD, a 'usd' fact: a plain recorded number of dollars, to the cent)
 //   "97.5%"                -> ratio fact (value x 100) or score fact in 0..1 (x 100) or bps fact (/ 100)
 //   "35 bps"               -> bps fact
 //   "6.2 s", "850 ms", "2 minutes" -> ms fact, converted to the token's unit
@@ -174,6 +175,7 @@ export function tokenMatches(t: NumberToken, f: Fact): boolean {
   const v = f.value;
   switch (t.kind) {
     case 'money': {
+      if (f.kind === 'usd') return typeof v === 'number' && t.currency === 'USD' && t.decimals <= 2 && Math.abs(t.value - v) < 0.005 + 1e-9;
       if (f.kind !== 'money' || !isMoney(v) || v.currency !== t.currency) return false;
       const exp = exponentOf(v.currency);
       return t.decimals <= exp && Math.round(t.value * 10 ** exp) === v.amountMinor;
@@ -205,7 +207,7 @@ export function tokenMatches(t: NumberToken, f: Fact): boolean {
       return f.kind === 'count' && n === t.value;
     }
     case 'number': {
-      if (f.kind === 'money' || f.kind === 'time' || f.kind === 'text' || f.kind === 'ms') return false;
+      if (f.kind === 'money' || f.kind === 'usd' || f.kind === 'time' || f.kind === 'text' || f.kind === 'ms') return false;
       const n = numericValue(v);
       if (n === undefined) return false;
       if (!Number.isInteger(n) && t.decimals < Math.min(2, recordedDecimals(v))) return false;

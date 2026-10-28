@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { launch, type LaunchedSystem } from '../../tools/launcher/launch';
+import { launch, RESET_SURVIVORS, type LaunchedSystem } from '../../tools/launcher/launch';
 import { isPortFree } from '../../tools/launcher/ports';
 import type { LauncherStatus, ResetResult } from '../../tools/launcher/control';
 
@@ -87,7 +87,8 @@ describe('M3 launcher: orchestrator, control API, 10-second reset', () => {
     console.log(`reset took ${body.durationMs} ms (stop ${body.phases.stopMs}, wipe ${body.phases.wipeMs}, start ${body.phases.startMs})`);
     expect(body.durationMs).toBeLessThan(30_000);
     expect(elapsed).toBeGreaterThanOrEqual(body.durationMs);
-    expect(Object.keys(body.ready).sort()).toEqual([...system.services].sort());
+    // Everything is restarted except the services that survive a reset on purpose (the booth keeps visitor leads).
+    expect(Object.keys(body.ready).sort()).toEqual(system.services.filter((n) => !RESET_SURVIVORS.includes(n)).sort());
 
     // Fresh system: old payment gone, log (nearly) empty, ledger empty, every service healthy.
     expect((await fetch(`${system.urls.gateway}/health`)).status).toBe(200);

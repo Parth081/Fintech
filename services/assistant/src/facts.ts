@@ -3,6 +3,7 @@
 //
 // FORMATTING RULES (the verifier accepts exactly these renderings, plus correct roundings of them):
 //   money  -> "USD 1,250.00"  ISO code, space, grouped amount at the currency's minor-unit exponent (exact)
+//   usd    -> "USD 9,850.00"  a plain recorded number of US dollars (risk evidence amountUsd/totalUsd), 2 decimals
 //   ratio  -> "97.5%"         value 0..1 shown as a percentage with 1 decimal
 //   bps    -> "35 bps"        integer basis points
 //   rate   -> "83.2500"       decimal string verbatim as recorded
@@ -13,7 +14,7 @@
 //   text   -> verbatim (ids, codes, names; carries no number the verifier checks)
 import { formatMoney, type Citation, type Money } from '@ct/contracts';
 
-export type FactKind = 'money' | 'ratio' | 'bps' | 'rate' | 'score' | 'count' | 'ms' | 'time' | 'text';
+export type FactKind = 'money' | 'usd' | 'ratio' | 'bps' | 'rate' | 'score' | 'count' | 'ms' | 'time' | 'text';
 
 export interface Fact extends Citation {
   kind: FactKind;
@@ -71,6 +72,12 @@ export function groupInt(n: number): string {
   return neg ? `-${s}` : s;
 }
 
+export function formatUsdNumber(n: number): string {
+  const neg = n < 0;
+  const [i, d = ''] = Math.abs(n).toFixed(2).split('.');
+  return `${neg ? '-' : ''}${groupInt(Number(i))}.${d}`;
+}
+
 export function formatPct(ratio: number): string {
   return `${(Math.round(ratio * 1000) / 10).toFixed(1)}%`;
 }
@@ -96,6 +103,8 @@ export function fmt(f: Fact): string {
   switch (f.kind) {
     case 'money':
       return isMoney(v) ? formatMoneySafe(v) : String(v);
+    case 'usd':
+      return typeof v === 'number' ? `USD ${formatUsdNumber(v)}` : String(v);
     case 'ratio':
       return typeof v === 'number' ? formatPct(v) : String(v);
     case 'bps':
@@ -120,6 +129,14 @@ export function toCitation(f: Fact): Citation {
   if (f.eventType !== undefined) c.eventType = f.eventType;
   if (f.source !== undefined) c.source = f.source;
   return c;
+}
+
+/** A fact for a recorded plain number: an integer is a count, anything else a score (shown as recorded). */
+export function numberFact(event: EventLike, field: string, label: string): Fact | undefined {
+  const f = eventFact(event, field, label, 'count');
+  if (!f) return undefined;
+  if (typeof f.value === 'number' && !Number.isInteger(f.value)) f.kind = 'score';
+  return f;
 }
 
 /** De-duplicate facts by (eventId, field, label). */

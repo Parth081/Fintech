@@ -12,7 +12,9 @@ import {
   numberMatches,
   scanForOutbound,
   scanForRemoteUrls,
+  scrubVerbatim,
   sideEffectIssues,
+  verbatimStrings,
 } from './m5-analyze';
 import { parseVerifyM5Args } from './m5-args';
 import { fallbackBank, normaliseBank } from './m5-bank';
@@ -204,5 +206,134 @@ describe('verify:m5 args and bank', () => {
     const fb = fallbackBank(events, 'run-1', 10);
     expect(fb.length).toBeGreaterThanOrEqual(10);
     expect(fb.some((q) => q.context.kind === 'payment')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// M4: verbatim recorded text, risk / FX aggregates, and the whole assistant over M4-shaped logs
+
+describe('verify:m5 verbatim recorded text', () => {
+  const held = ev('payment.held', 'p-9', { reason: 'Held for review: FRAUD_MODEL_HIGH (risk score 78%)', atStage: 'risk' });
+  const log = new EventLog();
+  log.apply(0, ev('payment.initiated', 'p-9', { amount: { amountMinor: 985000, currency: 'USD' }, targetCurrency: 'INR', corridor: 'US-IN' }));
+  log.apply(1, held);
+  const cite = (value: unknown) => ({ eventId: held.eventId, field: 'payload.reason', value, label: 'hold reason', eventType: 'payment.held' });
+
+  it('verbatimStrings keeps sentences with letters and digits only', () => {
+    expect(verbatimStrings(['Held for review: AML_FAN_OUT (risk score 82%)', 'AC04', 'USD 10,000 reporting line', 12345678, 'no digits here at all'])).toEqual([
+      'Held for review: AML_FAN_OUT (risk score 82%)',
+      'USD 10,000 reporting line',
+    ]);
+    expect(scrubVerbatim('It said "abc 12 def" ok', ['abc 12 def'])).toBe('It said " ref " ok');
+  });
+
+  it('a quoted span equal to a cited, log-confirmed string carries no uncited number', () => {
+    const a = answer({
+      context: { kind: 'payment', paymentId: 'p-9' },
+      intent: 'why_held',
+      answer: 'This payment was held: "Held for review: FRAUD_MODEL_HIGH (risk score 78%)".',
+      citations: [cite('Held for review: FRAUD_MODEL_HIGH (risk score 78%)')],
+    });
+    expect(checkAnswer(a, log, { runId: null }).issues).toEqual([]);
+  });
+
+  it('the same digits outside a verbatim cited span are still flagged', () => {
+    const a = answer({
+      context: { kind: 'payment', paymentId: 'p-9' },
+      intent: 'why_held',
+      answer: 'This payment was held: "Held for review: FRAUD_MODEL_HIGH (risk score 78%)". The score was 93%.',
+      citations: [cite('Held for review: FRAUD_MODEL_HIGH (risk score 78%)')],
+    });
+    expect(checkAnswer(a, log, { runId: null }).issues.map((i) => i.detail)).toEqual(['"93%" in the answer matches no citation value']);
+  });
+
+  it('a wrong citation value does not exempt anything (the citation fails and the digits count)', () => {
+    const a = answer({
+      context: { kind: 'payment', paymentId: 'p-9' },
+      intent: 'why_held',
+      answer: 'This payment was held: "Held for review: FRAUD_MODEL_HIGH (risk score 99%)".',
+      citations: [cite('Held for review: FRAUD_MODEL_HIGH (risk score 99%)')],
+    });
+    const codes = checkAnswer(a, log, { runId: null }).issues.map((i) => i.code);
+    expect(codes).toEqual(expect.arrayContaining(['citation-value', 'number-uncited']));
+  });
+
+  it('a near-copy (one character off) is not exempt', () => {
+    const a = answer({
+      context: { kind: 'payment', paymentId: 'p-9' },
+      intent: 'why_held',
+      answer: 'This payment was held: "Held for review: FRAUD_MODEL_HIGH (risk score 79%)".',
+      citations: [cite('Held for review: FRAUD_MODEL_HIGH (risk score 78%)')],
+    });
+    expect(checkAnswer(a, log, { runId: null }).issues.map((i) => i.code)).toContain('number-uncited');
+  });
+});
+
+describe('verify:m5 M4 aggregates', () => {
+  it('re-derives held-at-least-once, alerts by kind / rule, linked payments and shock quotes', () => {
+    const log = new EventLog();
+    const flagged = { trace: { stage: 'fx', decision: 'quoted', reasonCodes: ['FX_SHOCK_ACTIVE'], inputs: {}, ruleVersion: '1', latencyMs: 1 } } as Partial<BusEvent>;
+    const alert = (id: string, kind: string, rule: string, related: string[] = []) =>
+      ev('risk.alert_raised', id, { alertId: `A-${id}-${rule}`, kind, severity: 'medium', rule, summary: 's', reasons: [], evidence: { relatedPaymentIds: related } });
+    const a1 = alert('p-1', 'aml', 'AML_FAN_IN', ['x', 'y']);
+    const events = [
+      ev('control.scenario.started', '_control', { runId: 'run-9', scenarioId: 'fraud-ring', title: 't', seed: 's' }),
+      ev('payment.initiated', 'p-1', { amount: { amountMinor: 1, currency: 'USD' }, corridor: 'GB-PH' }),
+      a1,
+      ev('payment.held', 'p-1', { reason: 'r', atStage: 'risk' }),
+      ev('payment.initiated', 'p-2', { amount: { amountMinor: 1, currency: 'USD' }, corridor: 'GB-PH' }),
+      alert('p-2', 'fraud', 'FRAUD_MODEL_HIGH'),
+      alert('p-2', 'aml', 'AML_STRUCTURING'),
+      ev('payment.held', 'p-2', { reason: 'r', atStage: 'risk' }),
+      ev('payment.released', 'p-2', { actor: { userId: 'u', name: 'n', role: 'r' }, reason: 'ok' }),
+      ev('payment.quoted', 'p-2', { rate: '1.0', spreadBps: 80 }, flagged),
+      ev('payment.initiated', 'p-3', { amount: { amountMinor: 1, currency: 'USD' }, corridor: 'US-IN' }),
+      ev('payment.quoted', 'p-3', { rate: '1.0', spreadBps: 35 }, flagged),
+      ev('control.scenario.ended', '_control', { runId: 'run-9', scenarioId: 'fraud-ring', outcome: 'completed' }),
+    ];
+    events.forEach((e, i) => log.apply(i, e));
+    const d = (source: string, value: unknown) => deriveAggregate({ field: 'aggregate', value, source }, log, { context: { kind: 'scenario' } });
+    expect(d('payments in run run-9 that were held at least once', 2)).toMatchObject({ known: true, value: 2 });
+    expect(d('count of risk.alert_raised with kind aml for payments in run run-9', 2)).toMatchObject({ known: true, value: 2 });
+    expect(d('count of risk.alert_raised with kind fraud for payments in run run-9', 1)).toMatchObject({ known: true, value: 1 });
+    expect(d('count of risk.alert_raised with rule AML_FAN_IN for payments in run run-9', 1)).toMatchObject({ known: true, value: 1 });
+    expect(d('count of risk.alert_raised (run run-9)', 3)).toMatchObject({ known: true, value: 3 });
+    expect(d('count of payment.released (run run-9)', 1)).toMatchObject({ known: true, value: 1 });
+    expect(d(`count of payload.evidence.relatedPaymentIds on risk.alert_raised (${a1.eventId})`, 2)).toMatchObject({ known: true, value: 2 });
+    // only quotes on the shocked corridor of payments in the run count
+    expect(d('payment.quoted events coded FX_SHOCK_ACTIVE on corridor GB-PH for payments in run run-9', 1)).toMatchObject({ known: true, value: 1 });
+    const wrong = answer({
+      context: { kind: 'scenario' },
+      intent: 'risk_story',
+      answer: 'The engine held 3 payment(s).',
+      citations: [{ eventId: null, field: 'aggregate', value: 3, label: 'x', source: 'payments in run run-9 that were held at least once' }],
+    });
+    expect(checkAnswer(wrong, log, { runId: 'run-9' }).issues.map((i) => i.code)).toContain('aggregate-mismatch');
+  });
+});
+
+describe('verify:m5 over the whole assistant (M4-shaped logs)', () => {
+  const scenarios = ['fraud-ring', 'sanctions-hit', 'fx-spike'] as const;
+  it.each(scenarios)('%s: >= 100 questions, every number / citation / aggregate / key fact checks out', async (id) => {
+    const { Assistant, FactStore, generateQuestionBank, syntheticM4Log } = await import('@ct/assistant');
+    const synth = syntheticM4Log(id);
+    const log = new EventLog();
+    synth.events.forEach((e, i) => log.apply(i, e));
+    const assistant = new Assistant({ store: FactStore.fromLog(synth.events), llmMode: 'off' });
+    const bank = generateQuestionBank(id, synth.events, { min: 110 });
+    expect(bank.length).toBeGreaterThanOrEqual(100);
+    const intents = new Set(bank.map((b) => b.intent));
+    expect(intents.has('risk_story')).toBe(true);
+    expect(intents.has('fx_shock')).toBe(id === 'fx-spike');
+    const failures: unknown[] = [];
+    let numbers = 0;
+    for (const q of bank) {
+      const a = await assistant.ask(q.question, q.context);
+      const r = checkAnswer(a, log, { runId: synth.runId, expectGrounded: true });
+      numbers += r.numbers;
+      if (!r.ok) failures.push({ q: q.question, ctx: q.context.kind, intent: a.intent, issues: r.issues, answer: a.answer });
+    }
+    expect(failures).toEqual([]);
+    expect(numbers).toBeGreaterThan(100);
   });
 });

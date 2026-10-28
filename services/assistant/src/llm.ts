@@ -7,11 +7,14 @@ import type { AskContext } from '@ct/contracts';
 import { fmt, uniqueFacts, type Fact } from './facts';
 import type { Intent } from './intents';
 import {
+  fxShockView,
   fxView,
   journalView,
   paymentOverview,
   providerHealthView,
+  refundView,
   retryView,
+  riskStoryView,
   routeView,
   scenarioView,
   holdView,
@@ -83,11 +86,11 @@ export const SYSTEM_PROMPT = [
 const EMPTY_SCHEMA = { type: 'object' as const, properties: {}, required: [] as string[], additionalProperties: false };
 
 const TOOL_DEFS: { name: ToolName; description: string }[] = [
-  { name: 'get_payment_trace', description: 'Status, amount, corridor, checks (screening, fraud score, holds, rejections, alerts), retries and timeline of the payment in the current context. Takes no arguments: the payment is fixed by the server.' },
+  { name: 'get_payment_trace', description: 'Status, amount, corridor, checks (screening, fraud score, holds with alert evidence, operator releases and rejections with who approved them, refunds), retries and timeline of the payment in the current context. Takes no arguments: the payment is fixed by the server.' },
   { name: 'get_route_comparison', description: 'The latest routing decision for the payment in context: every provider\'s score, fee, success rate, expected time, exclusions and the score weights.' },
   { name: 'get_fx_quote', description: 'The FX quote for the payment in context: market mid rate, spread in basis points, customer rate, amounts, provider fee, spread cost and total cost.' },
   { name: 'get_ledger_journal', description: 'For a payment context: its journal entries, per-currency totals and reconciliation. Otherwise: the trial balance across journals in scope.' },
-  { name: 'get_scenario_summary', description: 'The current or most recent scenario run: outages, circuit breaker open/close times, re-routed and refused counts, outcomes and payments lost.' },
+  { name: 'get_scenario_summary', description: 'The current or most recent scenario run: outages, circuit breaker open/close times, re-routed and refused counts, outcomes and payments lost; risk alerts by kind, held payments and matched sanctions entries; the FX shock with spreads before, during and after.' },
   { name: 'get_provider_health', description: 'Per-provider instructions sent, settled, refused, success rate and circuit breaker state, plus payment totals, for the context scope.' },
 ];
 
@@ -117,7 +120,7 @@ export function runTool(store: FactStore, name: string, context: AskContext): To
     case 'get_payment_trace': {
       if (!rec) return notInContext('payment');
       const t = timelineView(rec);
-      return { facts: uniqueFacts([...paymentOverview(rec).facts, ...holdView(rec).facts, ...retryView(rec).facts, ...t.facts]), notes: [`status: ${rec.state.status}`] };
+      return { facts: uniqueFacts([...paymentOverview(rec).facts, ...holdView(rec).facts, ...retryView(rec).facts, ...(refundView(rec)?.facts ?? []), ...t.facts]), notes: [`status: ${rec.state.status}`] };
     }
     case 'get_route_comparison': {
       const v = rec ? routeView(rec) : undefined;
@@ -136,7 +139,7 @@ export function runTool(store: FactStore, name: string, context: AskContext): To
     }
     case 'get_scenario_summary': {
       const latest = store.latestRun();
-      return latest ? { facts: scenarioView(store, latest).facts, notes: [] } : { facts: [], notes: ['no scenario has run yet'] };
+      return latest ? { facts: uniqueFacts([...scenarioView(store, latest).facts, ...riskStoryView(store, latest).facts, ...(fxShockView(store, latest)?.facts ?? [])]), notes: [] } : { facts: [], notes: ['no scenario has run yet'] };
     }
     case 'get_provider_health':
       return { facts: uniqueFacts([...providerHealthView(records, scope).facts, ...totalsView(records, scope).facts]), notes: [] };

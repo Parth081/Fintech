@@ -4,13 +4,14 @@
 import type { Answer, AskContext, SuggestedQuestion } from '@ct/contracts';
 import { toCitation, type Fact } from './facts';
 import { OFF_TOPIC_TEXT, groundedDraft } from './grounded';
-import { classify, normalizeQuestion, type Intent } from './intents';
+import { classify, isActionRequest, normalizeQuestion, type Intent } from './intents';
 import { LlmFailure, phraseWithLlm, type LlmClient, type LlmFailureKind } from './llm';
 import type { FactStore } from './store';
-import { SCENARIO_QUESTIONS, followUpsFor, suggestionsFor } from './suggestions';
+import { followUpsFor, scenarioQuestions, suggestionsFor } from './suggestions';
 import { verifyAnswer } from './verify';
 
 export const MAX_QUESTION_CHARS = 300;
+export const ACTION_NOTICE = 'I only explain what was recorded: I cannot release, reject, retry, refund or change anything, and nothing here was changed by this question. This is what the record shows.';
 export const MAX_ANSWER_WORDS = 150; // LLM answers above this are discarded (target ~120)
 
 export type LlmHealth = 'available' | 'unavailable' | 'disabled';
@@ -89,7 +90,7 @@ export class Assistant {
     if (!this.store.latestRun()) return 0;
     let n = 0;
     const context: AskContext = { kind: 'scenario' };
-    for (const s of SCENARIO_QUESTIONS) {
+    for (const s of scenarioQuestions(this.store)) {
       const key = `${contextKey(context)}|${normalizeQuestion(s.text)}`;
       if (this.cache.get(key)?.source === 'llm') continue;
       const g = this.grounded(s.text, context, s.intent as Intent);
@@ -129,7 +130,10 @@ export class Assistant {
 
     if (cls.offTopic) return finish({ answer: OFF_TOPIC_TEXT, citations: [], mode: 'grounded', intent: 'unknown' });
 
-    const g = this.grounded(question, context, cls.intent);
+    const action = isActionRequest(question);
+    const g0 = this.grounded(question, context, cls.intent);
+    // Read-only by design: an instruction to act is answered with what the record shows, after saying so.
+    const g = action ? { text: `${ACTION_NOTICE} ${g0.text}`, facts: g0.facts } : g0;
     const grounded = () => finish({ answer: g.text, citations: g.facts.map(toCitation), mode: 'grounded', intent: cls.intent });
     const key = `${contextKey(context)}|${normalizeQuestion(question)}`;
     const cached = () => {
@@ -138,7 +142,7 @@ export class Assistant {
       return finish({ answer: c.answer.answer, citations: c.answer.citations, mode: 'cached', intent: c.answer.intent });
     };
 
-    if (this.llmMode === 'off' || cls.intent === 'needs_payment' || cls.intent === 'unknown') return grounded();
+    if (this.llmMode === 'off' || action || cls.intent === 'needs_payment' || cls.intent === 'unknown') return grounded();
     if (!this.llm || this.now() < this.cooldownUntil) return cached() ?? grounded();
 
     try {

@@ -2,7 +2,7 @@
 // with an exact eventId + field path + recorded value, or a labelled aggregate). The grounded templates and
 // the LLM's read-only tools both read these views, so an answer can only contain what the log recorded.
 import { PROVIDERS, type AnyEvent, type LedgerEntry, type Money, type ProviderScore } from '@ct/contracts';
-import { aggFact, eventFact, mustFact, uniqueFacts, type Fact } from './facts';
+import { aggFact, eventFact, mustFact, numberFact, uniqueFacts, type Fact } from './facts';
 import { allOf, lastOf, type FactStore, type PaymentRecord, type ScenarioRun } from './store';
 
 const ms = (a: string, b: string) => Date.parse(b) - Date.parse(a);
@@ -49,15 +49,89 @@ export function paymentOverview(rec: PaymentRecord): PaymentOverview {
   return v;
 }
 
+export interface AlertView {
+  event: AnyEvent;
+  alertId: Fact;
+  kind: Fact;
+  rule: Fact;
+  severity: Fact;
+  score?: Fact;
+  summary: Fact;
+  /** Recorded reason texts (verbatim), most important first. */
+  reasons: Fact[];
+  /** Named evidence facts read from payload.evidence (only those present on the event). */
+  ev: Record<string, Fact>;
+  /** AML: payments the typology linked to this one. */
+  related?: { count: Fact; ids: Fact[] };
+  facts: Fact[];
+}
+
 export interface HoldView {
-  held?: { event: AnyEvent; reason: Fact; atStage: Fact; reasonCodes?: Fact };
-  rejected?: { event: AnyEvent; reason: Fact; atStage: Fact; actor?: Fact; reasonCodes?: Fact };
-  released?: { event: AnyEvent; actor: Fact; reason: Fact };
+  held?: { event: AnyEvent; reason: Fact; atStage: Fact; reasonCodes?: Fact; combinedScore?: Fact; fraudScore?: Fact; amountUsd?: Fact };
+  rejected?: { event: AnyEvent; reason: Fact; atStage: Fact; actor?: Fact; approvedBy?: Fact; reasonCodes?: Fact };
+  released?: { event: AnyEvent; actor: Fact; role?: Fact; approvedBy?: Fact; reason: Fact };
   fraudScore?: Fact;
   riskDecision?: Fact;
   screening?: Fact;
-  alerts: { rule: Fact; severity: Fact; score?: Fact; summary: Fact }[];
+  alerts: AlertView[];
   facts: Fact[];
+}
+
+type EvidenceHow = 'text' | 'usd' | 'num' | 'ratio';
+
+const EVIDENCE_FIELDS: Record<string, [string, string, EvidenceHow][]> = {
+  SANCTIONS_FUZZY_MATCH: [
+    ['entryName', 'evidence.entry.name', 'text'], ['entryId', 'evidence.entry.id', 'text'], ['program', 'evidence.entry.program', 'text'],
+    ['matchedName', 'evidence.matchedName', 'text'], ['field', 'evidence.field', 'text'], ['listName', 'evidence.listName', 'text'],
+    ['matchScore', 'evidence.score', 'ratio'], ['threshold', 'evidence.threshold', 'ratio'],
+  ],
+  AML_FAN_IN: [['name', 'evidence.beneficiaryName', 'text'], ['parties', 'evidence.distinctSenders', 'num'], ['totalUsd', 'evidence.totalUsd', 'usd'], ['window', 'evidence.windowMinutes', 'num']],
+  AML_FAN_OUT: [['name', 'evidence.senderName', 'text'], ['parties', 'evidence.distinctBeneficiaries', 'num'], ['totalUsd', 'evidence.totalUsd', 'usd'], ['window', 'evidence.windowMinutes', 'num']],
+  AML_STRUCTURING: [['threshold', 'evidence.threshold', 'text'], ['linkedBy', 'evidence.linkedBy', 'text']],
+  AML_RAPID_IN_OUT: [['receivedUsd', 'evidence.receivedUsd', 'usd'], ['sentUsd', 'evidence.sentUsd', 'usd'], ['shareOut', 'evidence.shareOut', 'ratio']],
+  AML_LARGE_VALUE_REVIEW: [['amountUsd', 'evidence.amountUsd', 'usd'], ['reviewUsd', 'evidence.manualReviewAboveUsd', 'usd']],
+  FRAUD_MODEL_HIGH: [['amountUsd', 'evidence.facts.amountUsd', 'usd']],
+  FRAUD_MODEL_REJECT: [['amountUsd', 'evidence.facts.amountUsd', 'usd']],
+};
+
+function alertView(a: Extract<AnyEvent, { type: 'risk.alert_raised' }>): AlertView {
+  const rule = String(a.payload.rule);
+  const v: AlertView = {
+    event: a,
+    alertId: mustFact(a, 'payload.alertId', 'alert id', 'text'),
+    kind: mustFact(a, 'payload.kind', 'alert kind', 'text'),
+    rule: mustFact(a, 'payload.rule', 'alert rule', 'text'),
+    severity: mustFact(a, 'payload.severity', 'alert severity', 'text'),
+    summary: mustFact(a, 'payload.summary', 'alert summary (as recorded)', 'text'),
+    reasons: [],
+    ev: {},
+    facts: [],
+  };
+  const score = eventFact(a, 'payload.score', 'alert score', 'ratio');
+  if (score) v.score = score;
+  (a.payload.reasons ?? []).slice(0, 3).forEach((r, i) => {
+    const f = r && typeof r.text === 'string' ? eventFact(a, `payload.reasons[${i}].text`, `alert reason ${i + 1} (as recorded)`, 'text') : undefined;
+    if (f) v.reasons.push(f);
+  });
+  for (const [key, field, how] of EVIDENCE_FIELDS[rule] ?? []) {
+    const label = `alert evidence: ${key}`;
+    const path = `payload.${field}`;
+    const f =
+      how === 'text' ? eventFact(a, path, label, 'text')
+        : how === 'ratio' ? eventFact(a, path, label, 'ratio')
+          : how === 'usd' ? eventFact(a, path, label, 'usd')
+            : numberFact(a, path, label);
+    if (f) v.ev[key] = f;
+  }
+  const rel = (a.payload.evidence as { relatedPaymentIds?: unknown } | undefined)?.relatedPaymentIds;
+  if (Array.isArray(rel) && rel.length) {
+    v.related = {
+      count: aggFact(rel.length, 'payments linked by this alert', 'count', `count of payload.evidence.relatedPaymentIds on risk.alert_raised (${a.eventId})`),
+      ids: rel.slice(0, 2).flatMap((_, i) => eventFact(a, `payload.evidence.relatedPaymentIds[${i}]`, 'linked payment', 'text') ?? []),
+    };
+  }
+  v.facts = uniqueFacts([v.alertId, v.kind, v.rule, v.severity, v.score, v.summary, ...v.reasons, ...Object.values(v.ev), v.related?.count, ...(v.related?.ids ?? [])]);
+  return v;
 }
 
 export function holdView(rec: PaymentRecord): HoldView {
@@ -71,6 +145,12 @@ export function holdView(rec: PaymentRecord): HoldView {
     };
     const rc = eventFact(held, 'trace.reasonCodes', 'decision reason codes', 'text');
     if (rc) v.held.reasonCodes = rc;
+    const comb = eventFact(held, 'trace.inputs.combinedScore', 'combined risk score at the hold decision', 'ratio');
+    if (comb) v.held.combinedScore = comb;
+    const fs = eventFact(held, 'trace.inputs.fraudScore', 'fraud model score at the hold decision', 'ratio');
+    if (fs) v.held.fraudScore = fs;
+    const am = eventFact(held, 'trace.inputs.amountUsd', 'payment amount in USD at the hold decision', 'usd');
+    if (am) v.held.amountUsd = am;
   }
   const rejected = lastOf(rec, 'payment.rejected');
   if (rejected) {
@@ -81,6 +161,8 @@ export function holdView(rec: PaymentRecord): HoldView {
     };
     const actor = eventFact(rejected, 'payload.actor.name', 'operator who rejected it', 'text');
     if (actor) v.rejected.actor = actor;
+    const ap = eventFact(rejected, 'payload.approvedBy.name', 'manager who approved the rejection', 'text');
+    if (ap) v.rejected.approvedBy = ap;
     const rc = eventFact(rejected, 'trace.reasonCodes', 'decision reason codes', 'text');
     if (rc) v.rejected.reasonCodes = rc;
   }
@@ -91,6 +173,10 @@ export function holdView(rec: PaymentRecord): HoldView {
       actor: mustFact(released, 'payload.actor.name', 'operator who released it', 'text'),
       reason: mustFact(released, 'payload.reason', 'release reason', 'text'),
     };
+    const role = eventFact(released, 'payload.actor.role', 'role of the operator who released it', 'text');
+    if (role) v.released.role = role;
+    const ap = eventFact(released, 'payload.approvedBy.name', 'manager who approved the release', 'text');
+    if (ap) v.released.approvedBy = ap;
   }
   const scored = lastOf(rec, 'payment.scored');
   if (scored) {
@@ -99,21 +185,12 @@ export function holdView(rec: PaymentRecord): HoldView {
   }
   const screened = lastOf(rec, 'payment.screened');
   if (screened) v.screening = mustFact(screened, 'payload.result', 'sanctions screening result', 'text');
-  for (const a of allOf(rec, 'risk.alert_raised')) {
-    const alert = {
-      rule: mustFact(a, 'payload.rule', 'alert rule', 'text'),
-      severity: mustFact(a, 'payload.severity', 'alert severity', 'text'),
-      summary: mustFact(a, 'payload.summary', 'alert summary', 'text'),
-    } as HoldView['alerts'][number];
-    const score = eventFact(a, 'payload.score', 'alert score', 'score');
-    if (score) alert.score = score;
-    v.alerts.push(alert);
-  }
+  for (const a of allOf(rec, 'risk.alert_raised')) v.alerts.push(alertView(a));
   v.facts = uniqueFacts([
-    v.held?.reason, v.held?.atStage, v.held?.reasonCodes,
-    v.rejected?.reason, v.rejected?.atStage, v.rejected?.actor, v.rejected?.reasonCodes,
-    v.released?.actor, v.released?.reason, v.fraudScore, v.riskDecision, v.screening,
-    ...v.alerts.flatMap((a) => [a.rule, a.severity, a.score, a.summary]),
+    v.held?.reason, v.held?.atStage, v.held?.reasonCodes, v.held?.combinedScore, v.held?.fraudScore, v.held?.amountUsd,
+    v.rejected?.reason, v.rejected?.atStage, v.rejected?.actor, v.rejected?.approvedBy, v.rejected?.reasonCodes,
+    v.released?.actor, v.released?.role, v.released?.approvedBy, v.released?.reason, v.fraudScore, v.riskDecision, v.screening,
+    ...v.alerts.flatMap((a) => a.facts),
   ]);
   return v;
 }
@@ -265,6 +342,8 @@ export interface FxView {
   spreadCost?: Fact;
   totalCost?: Fact;
   settledAmount?: Fact;
+  /** Present when the quote was priced while an FX shock was active on its corridor. */
+  shock?: { drift?: Fact; noise?: Fact; volatility?: Fact; codes: Fact };
   facts: Fact[];
 }
 
@@ -307,7 +386,17 @@ export function fxView(rec: PaymentRecord): FxView | undefined {
     const sa = eventFact(settled, 'payload.settledAmount', 'amount the provider delivered', 'money');
     if (sa) v.settledAmount = sa;
   }
-  v.facts = uniqueFacts([v.midRate, v.spreadBps, v.rate, v.source, v.target, v.fee, v.spreadCost, v.totalCost, v.settledAmount]);
+  if ((quoted.trace?.reasonCodes ?? []).includes('FX_SHOCK_ACTIVE')) {
+    const codes = mustFact(quoted, 'trace.reasonCodes', 'quote reason codes', 'text');
+    v.shock = { codes };
+    const drift = eventFact(quoted, 'trace.inputs.fxShocks[0].driftBps', 'shock drift applied to the mid rate', 'bps');
+    if (drift) v.shock.drift = drift;
+    const noise = numberFact(quoted, 'trace.inputs.fxShocks[0].noiseMultiplier', 'shock noise multiplier');
+    if (noise) v.shock.noise = noise;
+    const vol = eventFact(quoted, 'trace.inputs.spreadComponents.volatilityBps', 'volatility add-on in the spread', 'bps');
+    if (vol) v.shock.volatility = vol;
+  }
+  v.facts = uniqueFacts([v.midRate, v.spreadBps, v.rate, v.source, v.target, v.fee, v.spreadCost, v.totalCost, v.settledAmount, v.shock?.codes, v.shock?.drift, v.shock?.noise, v.shock?.volatility]);
   return v;
 }
 
@@ -521,12 +610,14 @@ export function totalsView(records: Iterable<PaymentRecord>, scope: string): Tot
     n += 1;
     byStatus.set(r.state.status, (byStatus.get(r.state.status) ?? 0) + 1);
     for (const x of r.events) if (x.event.type === 'payment.send_failed') retries += 1;
-    if (r.state.status === 'reconciled' || r.state.status === 'refund_requested' || r.state.status === 'refunded') {
+    if (r.state.status === 'reconciled') {
       const a = r.state.initiated.amount;
       value.set(a.currency, (value.get(a.currency) ?? 0) + a.amountMinor);
     }
-    if (r.state.status === 'reconciled') {
-      const d = ms(r.state.createdAt, r.state.updatedAt);
+    const recon = lastOf(r, 'payment.reconciled');
+    if (recon) {
+      // every payment that reached reconciliation, including ones refunded later
+      const d = ms(r.state.createdAt, recon.occurredAt);
       if (Number.isFinite(d)) {
         e2eSum += d;
         e2eCount += 1;
@@ -706,3 +797,225 @@ export function scenarioView(store: FactStore, run: ScenarioRun): ScenarioView {
 }
 
 export { shortId };
+
+// ---------------------------------------------------------------------------------------------
+// M4: refunds, risk story (alerts in a run) and the FX shock
+
+export interface RefundView {
+  requested?: { actor: Fact; approvedBy?: Fact; reason: Fact };
+  journalId: Fact;
+  entries: { account: Fact; direction: Fact; amount: Fact }[];
+  totals: { currency: string; debits: Fact; credits: Fact }[];
+  balanced: boolean;
+  facts: Fact[];
+}
+
+export function refundView(rec: PaymentRecord): RefundView | undefined {
+  const refunded = lastOf(rec, 'payment.refunded');
+  if (!refunded) return undefined;
+  const req = lastOf(rec, 'payment.refund_requested');
+  const entries = refunded.payload.entries.map((e, i) => ({
+    account: mustFact(refunded, `payload.entries[${i}].account`, 'account', 'text'),
+    direction: mustFact(refunded, `payload.entries[${i}].direction`, 'debit or credit', 'text'),
+    amount: mustFact(refunded, `payload.entries[${i}].amount`, `${e.direction} ${e.account}`, 'money'),
+  }));
+  const totals = totalsOf(refunded.payload.entries, `payment.refunded ${refunded.eventId}`);
+  const v: RefundView = {
+    journalId: mustFact(refunded, 'payload.journalId', 'refund (reversal) journal id', 'text'),
+    entries,
+    totals,
+    balanced: totals.every((t) => (t.debits.value as Money).amountMinor === (t.credits.value as Money).amountMinor),
+    facts: [],
+  };
+  if (req) {
+    v.requested = { actor: mustFact(req, 'payload.actor.name', 'operator who asked for the refund', 'text'), reason: mustFact(req, 'payload.reason', 'refund reason', 'text') };
+    const ap = eventFact(req, 'payload.approvedBy.name', 'manager who approved the refund', 'text');
+    if (ap) v.requested.approvedBy = ap;
+  }
+  v.facts = uniqueFacts([v.requested?.actor, v.requested?.approvedBy, v.requested?.reason, v.journalId, ...entries.flatMap((e) => [e.account, e.direction, e.amount]), ...totals.flatMap((t) => [t.debits, t.credits])]);
+  return v;
+}
+
+export interface RiskStoryView {
+  run: ScenarioRun;
+  title: Fact;
+  heldEver: Fact;
+  stillHeld: Fact;
+  rejected: Fact;
+  released: Fact;
+  alerts: Fact;
+  byKind: { kind: string; count: Fact }[];
+  byRule: { rule: string; count: Fact }[];
+  /** Sanctions list entries that matched (one row per distinct entry). */
+  entries: { name: Fact; id?: Fact; score?: Fact; payment: string }[];
+  /** The first alert of each kind, to cite as an example. */
+  examples: { kind: string; alert: AlertView }[];
+  hasRisk: boolean;
+  facts: Fact[];
+}
+
+export function riskStoryView(store: FactStore, run: ScenarioRun): RiskStoryView {
+  const payments = store.paymentsInRun(run);
+  const scope = `run ${run.runId}`;
+  const heldEver = payments.filter((p) => p.events.some((x) => x.event.type === 'payment.held'));
+  const alertEvents: { p: PaymentRecord; e: Extract<AnyEvent, { type: 'risk.alert_raised' }> }[] = [];
+  let released = 0;
+  for (const p of payments) {
+    for (const x of p.events) {
+      if (x.event.type === 'risk.alert_raised') alertEvents.push({ p, e: x.event });
+      if (x.event.type === 'payment.released') released += 1;
+    }
+  }
+  const kinds = ['sanctions', 'fraud', 'aml'] as const;
+  const byKind = kinds
+    .map((k) => ({ kind: k, n: alertEvents.filter((a) => a.e.payload.kind === k).length }))
+    .filter((x) => x.n > 0)
+    .map((x) => ({ kind: x.kind as string, count: aggFact(x.n, `${x.kind} alerts raised (${scope})`, 'count', `count of risk.alert_raised with kind ${x.kind} for payments in ${scope}`) }));
+  const ruleCounts = new Map<string, number>();
+  for (const a of alertEvents) ruleCounts.set(a.e.payload.rule, (ruleCounts.get(a.e.payload.rule) ?? 0) + 1);
+  const byRule = [...ruleCounts.entries()]
+    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
+    .slice(0, 4)
+    .map(([rule, n]) => ({ rule, count: aggFact(n, `${rule} alerts raised (${scope})`, 'count', `count of risk.alert_raised with rule ${rule} for payments in ${scope}`) }));
+  const entries: RiskStoryView['entries'] = [];
+  const seen = new Set<string>();
+  for (const a of alertEvents) {
+    if (a.e.payload.kind !== 'sanctions') continue;
+    const name = eventFact(a.e, 'payload.evidence.entry.name', 'sanctions list entry that matched', 'text');
+    if (!name || seen.has(String(name.value))) continue;
+    seen.add(String(name.value));
+    const row: RiskStoryView['entries'][number] = { name, payment: a.p.state.paymentId };
+    const id = eventFact(a.e, 'payload.evidence.entry.id', 'list entry id', 'text');
+    if (id) row.id = id;
+    const sc = eventFact(a.e, 'payload.evidence.score', 'match score', 'ratio');
+    if (sc) row.score = sc;
+    entries.push(row);
+  }
+  const examples: RiskStoryView['examples'] = [];
+  for (const k of kinds) {
+    const a = alertEvents.find((x) => x.e.payload.kind === k);
+    if (a) examples.push({ kind: k, alert: alertView(a.e) });
+  }
+  const v: RiskStoryView = {
+    run,
+    title: mustFact(run.started.event, 'payload.title', 'scenario', 'text'),
+    heldEver: aggFact(heldEver.length, `payments that were held (${scope})`, 'count', `payments in ${scope} that were held at least once`),
+    stillHeld: aggFact(payments.filter((p) => p.state.status === 'held').length, `payments still held (${scope})`, 'count', `payments in ${scope} with status held`),
+    rejected: aggFact(payments.filter((p) => p.state.status === 'rejected').length, `payments rejected (${scope})`, 'count', `payments in ${scope} with status rejected`),
+    released: aggFact(released, `operator releases (${scope})`, 'count', `count of payment.released (${scope})`),
+    alerts: aggFact(alertEvents.length, `risk alerts raised (${scope})`, 'count', `count of risk.alert_raised (${scope})`),
+    byKind,
+    byRule,
+    entries: entries.slice(0, 4),
+    examples,
+    hasRisk: alertEvents.length > 0 || heldEver.length > 0,
+    facts: [],
+  };
+  v.facts = uniqueFacts([
+    v.title, v.heldEver, v.stillHeld, v.rejected, v.released, v.alerts, ...byKind.map((b) => b.count), ...byRule.map((b) => b.count),
+    ...v.entries.flatMap((e) => [e.name, e.id, e.score]), ...examples.flatMap((x) => x.alert.facts),
+  ]);
+  return v;
+}
+
+export interface QuotePoint {
+  event: AnyEvent;
+  paymentId: string;
+  mid?: Fact;
+  rate: Fact;
+  spread: Fact;
+  volatility?: Fact;
+  reasonCodes?: Fact;
+  at: Fact;
+}
+
+export interface FxShockView {
+  run: ScenarioRun;
+  shockId: Fact;
+  corridor: Fact;
+  corridorId: string;
+  drift: Fact;
+  noise: Fact;
+  startedAt: Fact;
+  endedAt?: Fact;
+  duration?: Fact;
+  reason?: Fact;
+  before?: QuotePoint;
+  during?: QuotePoint;
+  after?: QuotePoint;
+  duringCount: Fact;
+  facts: Fact[];
+}
+
+function quotePoint(e: Extract<AnyEvent, { type: 'payment.quoted' }>): QuotePoint {
+  const q: QuotePoint = {
+    event: e,
+    paymentId: e.paymentId,
+    rate: mustFact(e, 'payload.rate', 'customer rate (spread applied)', 'rate'),
+    spread: mustFact(e, 'payload.spreadBps', 'FX spread', 'bps'),
+    at: mustFact(e, 'occurredAt', 'quoted at', 'time'),
+  };
+  const mid = eventFact(e, 'payload.midRate', 'market mid rate', 'rate');
+  if (mid) q.mid = mid;
+  const vol = eventFact(e, 'trace.inputs.spreadComponents.volatilityBps', 'volatility add-on in the spread', 'bps');
+  if (vol) q.volatility = vol;
+  const rc = eventFact(e, 'trace.reasonCodes', 'quote reason codes', 'text');
+  if (rc) q.reasonCodes = rc;
+  return q;
+}
+
+export const FX_SHOCK_FLAG = 'FX_SHOCK_ACTIVE';
+
+/** The latest-run FX shock: representative quotes before (last), during (widest spread) and after (first). */
+export function fxShockView(store: FactStore, run: ScenarioRun): FxShockView | undefined {
+  const control = store.controlInRun(run);
+  const startX = control.find((c) => c.event.type === 'control.fx_shock.started');
+  if (!startX || startX.event.type !== 'control.fx_shock.started') return undefined;
+  const start = startX.event;
+  const endX = control.find((c) => c.offset > startX.offset && c.event.type === 'control.fx_shock.ended' && c.event.payload.shockId === start.payload.shockId);
+  const corridorId = start.payload.corridorId;
+  const quotes: { offset: number; e: Extract<AnyEvent, { type: 'payment.quoted' }> }[] = [];
+  for (const p of store.paymentsInRun(run)) {
+    if (p.state.initiated.corridor !== corridorId) continue;
+    for (const x of p.events) if (x.event.type === 'payment.quoted') quotes.push({ offset: x.offset, e: x.event });
+  }
+  quotes.sort((a, b) => a.offset - b.offset);
+  const flagged = (q: (typeof quotes)[number]) => (q.e.trace?.reasonCodes ?? []).includes(FX_SHOCK_FLAG);
+  const before = quotes.filter((q) => q.offset < startX.offset && !flagged(q)).at(-1);
+  const duringAll = quotes.filter((q) => q.offset > startX.offset && flagged(q));
+  let during: (typeof quotes)[number] | undefined;
+  for (const q of duringAll) if (!during || q.e.payload.spreadBps > during.e.payload.spreadBps) during = q;
+  const after = endX ? quotes.find((q) => q.offset > endX.offset && !flagged(q)) : undefined;
+  const v: FxShockView = {
+    run,
+    shockId: mustFact(start, 'payload.shockId', 'shock id', 'text'),
+    corridor: mustFact(start, 'payload.corridorId', 'corridor hit by the FX shock', 'text'),
+    corridorId,
+    drift: mustFact(start, 'payload.driftBps', 'shock drift applied to the mid rate', 'bps'),
+    noise: numberFact(start, 'payload.noiseMultiplier', 'shock noise multiplier')!,
+    startedAt: mustFact(start, 'occurredAt', 'FX shock started at', 'time'),
+    duringCount: aggFact(duringAll.length, 'quotes priced under the shock', 'count', `payment.quoted events coded ${FX_SHOCK_FLAG} on corridor ${corridorId} for payments in run ${run.runId}`),
+    facts: [],
+  };
+  const reason = eventFact(start, 'payload.reason', 'shock reason (as recorded)', 'text');
+  if (reason) v.reason = reason;
+  if (endX) {
+    v.endedAt = mustFact(endX.event, 'occurredAt', 'FX shock ended at', 'time');
+    v.duration = aggFact(
+      Date.parse(endX.event.occurredAt) - Date.parse(start.occurredAt),
+      'FX shock duration',
+      'ms',
+      `control.fx_shock.ended.occurredAt (${endX.event.eventId}) - control.fx_shock.started.occurredAt (${start.eventId})`,
+      'occurredAt',
+    );
+  }
+  if (before) v.before = quotePoint(before.e);
+  if (during) v.during = quotePoint(during.e);
+  if (after) v.after = quotePoint(after.e);
+  const pts = [v.before, v.during, v.after];
+  v.facts = uniqueFacts([
+    v.shockId, v.corridor, v.drift, v.noise, v.startedAt, v.endedAt, v.duration, v.reason, v.duringCount,
+    ...pts.flatMap((p) => (p ? [p.mid, p.rate, p.spread, p.volatility, p.reasonCodes, p.at] : [])),
+  ]);
+  return v;
+}

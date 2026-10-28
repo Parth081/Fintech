@@ -173,6 +173,28 @@ export function numberMatches(n: NumberToken, candidates: readonly number[]): bo
   return false;
 }
 
+/** Strings worth treating as verbatim recorded text: long enough to be a sentence, with a letter and a digit. */
+export function verbatimStrings(values: readonly unknown[]): string[] {
+  const out = new Set<string>();
+  const add = (v: unknown) => {
+    if (typeof v === 'string' && v.length >= 8 && /[A-Za-z]/.test(v) && /\d/.test(v)) out.add(v);
+  };
+  for (const v of values) {
+    if (Array.isArray(v)) {
+      add(v.map(String).join(', '));
+      v.forEach(add);
+    } else add(v);
+  }
+  return [...out].sort((a, b) => b.length - a.length);
+}
+
+/** Replace every verbatim occurrence of a cited, log-confirmed string by a digit-free placeholder. */
+export function scrubVerbatim(text: string, strings: readonly string[]): string {
+  let out = text;
+  for (const s of strings) out = out.split(s).join(' ref ');
+  return out;
+}
+
 /** Clock times HH:MM or HH:MM:SS in an answer (not part of a full ISO timestamp). */
 export function extractClockTimes(text: string): string[] {
   const noIso = text.replace(/\b\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:?\d{2})?/g, ' ');
@@ -268,6 +290,8 @@ export function checkAnswer(
 
   // 1. Citations against the log.
   let aggregates = 0;
+  /** Citations whose value was confirmed equal to the log's value at eventId + field. */
+  const confirmed: unknown[] = [];
   for (const [i, c] of answer.citations.entries()) {
     const where = `citation[${i}] ${c.eventId ?? 'aggregate'} ${c.field}`;
     if (c.eventId === null || c.eventId === undefined) {
@@ -286,17 +310,22 @@ export function checkAnswer(
     const got = getField(ev, c.field);
     if (!got.found) add('citation-no-field', `${where}: field not present on ${ev.type}`);
     else if (!deepEqual(got.value, c.value)) add('citation-value', `${where}: cited ${JSON.stringify(c.value)}, log has ${JSON.stringify(got.value)}`);
+    else confirmed.push(got.value);
   }
 
   // 2. Every number in the text is a cited value.
   const candidates = answer.citations.flatMap((c) => numericCandidates(c.value));
-  const numbers = extractNumbers(answer.answer);
+  // Recorded text may contain digits of its own ("risk score 78%", "USD 10,000 reporting line"). Quoting it
+  // is not asserting a number, but ONLY when the span is a verbatim copy of a string the log holds at a
+  // cited eventId + field (checked above); anything else in the text is still held to the citations.
+  const text = scrubVerbatim(answer.answer, verbatimStrings(confirmed));
+  const numbers = extractNumbers(text);
   for (const n of numbers) {
     if (!numberMatches(n, candidates)) add('number-uncited', `"${n.raw}" in the answer matches no citation value`);
   }
   // Clock times ("10:00:05 UTC") must be the time of a cited timestamp.
   const stamps = answer.citations.flatMap((c) => (typeof c.value === 'string' && /T\d{2}:\d{2}/.test(c.value) ? [c.value] : []));
-  for (const t of extractClockTimes(answer.answer)) {
+  for (const t of extractClockTimes(text)) {
     if (!stamps.some((s) => s.includes(`T${t}`))) add('time-uncited', `time "${t}" in the answer matches no cited timestamp`);
   }
 

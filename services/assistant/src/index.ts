@@ -14,9 +14,10 @@ export { classify, type Intent } from './intents';
 export { verifyAnswer, extractNumbers, tokenMatches, type VerifyResult, type NumberToken } from './verify';
 export { fmt, type Fact, type FactKind } from './facts';
 export { groundedDraft } from './grounded';
-export { suggestionsFor, SCENARIO_QUESTIONS, SYSTEM_QUESTIONS } from './suggestions';
+export { suggestionsFor, scenarioQuestions, SCENARIO_QUESTIONS, RISK_SCENARIO_QUESTIONS, FX_SCENARIO_QUESTIONS, SYSTEM_QUESTIONS } from './suggestions';
 export { LLM_MODEL, LLM_TIMEOUT_MS, SYSTEM_PROMPT, TOOLS, phraseWithLlm, runTool, sdkClientFromEnv, LlmFailure, type LlmClient } from './llm';
 export { generateQuestionBank, evaluate, keyFactPresent, type BankQuestion, type EvalReport, type KeyFact, type QuestionResult, type AnswerFn } from './eval';
+export { syntheticM4Log, type SyntheticM4Log, type SyntheticM4ScenarioId, type M4PaymentKind } from './synthetic-m4';
 export { syntheticScenarioLog, type SyntheticLog, type SyntheticScenarioId, type PaymentKind } from './synthetic';
 
 async function main(): Promise<void> {
