@@ -9,6 +9,8 @@
 }
 .mode-ribbon span { color: var(--text-dim); font-size: 0.85em; letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; }
 .ms-root .mode-ribbon { font-size: 1.05em; }
+/* the ribbon hangs from the top edge: reserve its height so it never covers the scenario caption */
+.ms-root:has(.mode-ribbon) .ms-head { padding-top: 1em; }
 
 .pc-health { display: grid; grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr)); gap: 0.4rem 0.8rem; margin-top: 0.6rem; }
 .pc-health-row { display: flex; align-items: center; gap: 0.5rem; font-size: 0.95rem; min-width: 0; }
