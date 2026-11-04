@@ -11,6 +11,7 @@ import { DetailDrawer } from './components/DetailDrawer';
 import { LedgerView } from './components/LedgerView';
 import { FxView } from './components/FxView';
 import { ProvidersView } from './components/ProvidersView';
+import { ModeRibbon } from './components/ModeRibbon';
 import { PresenterConsole } from './components/PresenterConsole';
 import { ResetNotice, ScenarioBanner } from './components/ScenarioBanner';
 import { hashFor, NAV_VIEWS } from './lib/route';
@@ -118,6 +119,7 @@ function BoothApp() {
   if (view === 'presenter') {
     return (
       <>
+        <ModeRibbon source={control?.view} />
         <PresenterConsole live={live} onOpenPayment={setSelected} />
         {drawer}
       </>
@@ -138,6 +140,7 @@ function BoothApp() {
 
   return (
     <div className="app">
+      <ModeRibbon source={control?.view} />
       <Header connection={connection} view={view} />
       <ScenarioBanner view={control?.view ?? null} />
       <main className="main">

@@ -8,6 +8,7 @@ import type {
   PaymentStatus,
   StatementEntry,
   ControlView,
+  SystemMode,
 } from '@ct/contracts/browser';
 
 export interface PaymentSummary {
@@ -98,6 +99,10 @@ export interface Health {
   /** Changes every time the gateway process starts (the UI uses it to detect a completed reset). */
   instanceId: string;
   startedAt: string;
+  /** M6: 'safe' = the recorded backup run is playing (env SYSTEM_MODE). Always set by the gateway; optional for old clients/tests. */
+  mode?: SystemMode;
+  /** M6: name of the recording playing in safe mode (env RECORDING_NAME), else null. */
+  recording?: string | null;
 }
 
 /** GET /api/payments/:id/messages */
@@ -302,6 +307,10 @@ export interface GatewayControlView extends ControlView {
   traffic: TrafficView;
   /** Newest first. */
   reroutes: RerouteBrief[];
+  /** M6: live, or the recorded backup run (safe). Always set by the gateway. */
+  mode?: SystemMode;
+  /** M6: recording being played in safe mode, else null. */
+  recording?: string | null;
 }
 
 /** Control plane changed (control event, breaker change, orchestrator change; at least every 2 s while a scenario runs). */

@@ -8,6 +8,8 @@ import { ChooseScreen } from './ChooseScreen';
 import { flowReducer, initialFlow, visitActive, type KioskMode, type Outcome } from './flow';
 import { IdleTimer, type IdleStatus } from './idle';
 import { LeadScreen } from './LeadScreen';
+import { useSafeMode } from './mode';
+import { KIOSK_PAUSED_TEXT, KIOSK_PAUSED_TITLE } from '../lib/mode';
 import { buildPaymentRequest } from './payment';
 import { Tracker } from './Tracker';
 import type { KioskStep } from './explain';
@@ -37,6 +39,7 @@ export function Kiosk() {
   const [flow, dispatch] = useReducer(flowReducer, undefined, () => initialFlow());
   const assistantUp = useServiceHealth('/api/assistant');
   const boothUp = useServiceHealth('/api/booth');
+  const safeMode = useSafeMode();
   const analytics = useRef<AnalyticsBatcher | null>(null);
   analytics.current ??= new AnalyticsBatcher({ send: sendAnalytics });
   const idle = useRef(new IdleTimer(Date.now()));
@@ -191,6 +194,14 @@ export function Kiosk() {
           onClose={() => dispatch({ type: 'askClose' })}
           onAsked={(data) => analytics.current?.track('question.asked', data)}
         />
+      )}
+
+      {safeMode && (flow.screen === 'welcome' || flow.screen === 'choose') && (
+        <div className="kiosk-paused" role="status" aria-live="polite">
+          <h1>{KIOSK_PAUSED_TITLE}</h1>
+          <p>{KIOSK_PAUSED_TEXT}</p>
+          <small>SIMULATION · fictional data</small>
+        </div>
       )}
 
       {active && idleStatus.phase === 'warning' && (

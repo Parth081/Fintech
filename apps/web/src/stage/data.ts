@@ -1,6 +1,7 @@
 // HTTP / WS control data for the main stage. /api/control/state is new in M3: a 404 (older gateway)
 // means "no breaker info", never an error on screen. The same view also arrives on the WebSocket
 // ({kind:'control', view}); whichever copy is newer (gateway clock `atMs`) wins.
+import { modeInfo } from '../lib/mode';
 import { INITIAL_CONTROL_STATE, type BreakerView, type ControlState, type OrchestratorState } from '@ct/contracts/browser';
 
 export interface StageControl {
@@ -13,9 +14,12 @@ export interface StageControl {
   atMs: number;
   /** Routing decisions per provider over the gateway's traffic window (~60 s), null when not reported. */
   traffic: Record<string, number> | null;
+  /** M6: 'safe' while the recorded backup run plays. */
+  mode: 'live' | 'safe';
+  recording: string | null;
 }
 
-export const NO_CONTROL: StageControl = { available: false, breakers: [], control: INITIAL_CONTROL_STATE, orchestrator: null, atMs: 0, traffic: null };
+export const NO_CONTROL: StageControl = { available: false, breakers: [], control: INITIAL_CONTROL_STATE, orchestrator: null, atMs: 0, traffic: null, mode: 'live', recording: null };
 
 const STATES = new Set(['closed', 'open', 'half-open']);
 
@@ -67,7 +71,8 @@ export function parseControlView(raw: unknown): StageControl | null {
   };
   const orchestrator = typeof o.orchestrator === 'object' && o.orchestrator !== null ? (o.orchestrator as OrchestratorState) : null;
   const atMs = typeof o.atMs === 'number' && Number.isFinite(o.atMs) ? o.atMs : 0;
-  return { available: true, breakers, control, orchestrator, atMs, traffic: parseTraffic(o.traffic) };
+  const m = modeInfo(o);
+  return { available: true, breakers, control, orchestrator, atMs, traffic: parseTraffic(o.traffic), mode: m.mode, recording: m.recording };
 }
 
 /** The more recent of two control views (by gateway clock; ties and unknown clocks prefer `b`, the later arrival). */

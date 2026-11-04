@@ -166,6 +166,11 @@ export const setAmbient = (rate: number) => postJson<OrchestratorState>(orch('/a
 export const setPace = (preset: PacePreset) => postJson<OrchestratorState>(orch('/pace'), { preset });
 export const setPaused = (paused: boolean) => postJson<OrchestratorState>(orch('/pause'), { paused });
 /** Long timeout: the launcher stops, wipes and restarts everything (and usually kills this request). */
+/** GET /api/control/status: the launcher's service health, mode and recording (503 without a launcher). */
+export const fetchLauncherStatus = (signal?: AbortSignal) => getJson<unknown>('/api/control/status', signal);
+/** Switch to the recorded backup run (on=true, newest recording unless named) or back to live. The gateway restarts. */
+export const requestSafeMode = (on: boolean, name?: string) =>
+  postJson<{ ok: boolean; mode?: string; recording?: string | null }>('/api/control/safe-mode', name ? { on, name } : { on }, 25_000);
 export const requestReset = () => postJson<{ ok: boolean; durationMs?: number }>('/api/control/reset', {}, 25_000);
 /** Ask every screen to open (or close) a payment's drawer. */
 export const focusPayment = (paymentId: string | null) => postJson<{ ok: boolean; screens: number }>('/api/control/focus', { paymentId });

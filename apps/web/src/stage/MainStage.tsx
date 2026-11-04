@@ -23,6 +23,7 @@ import { KIOSK_AVAILABLE, KIOSK_HASH } from '../attract/kiosk';
 import { AskPanel } from '../assistant/AskPanel';
 import type { SuggestedQuestion } from '@ct/contracts/browser';
 import { StoryCaption, TouchCta } from './AttractStory';
+import { ModeRibbon } from '../components/ModeRibbon';
 import './stage.css';
 
 const PROVIDER_IDS = PROVIDERS.map((p) => p.id);
@@ -157,6 +158,7 @@ export function MainStage({ embedded = false }: MainStageProps = {}) {
       className={`ms-root${embedded ? ' ms-embedded' : ''}${reset.phase === 'resetting' ? ' ms-is-resetting' : ''}${story ? ' ms-attract' : ''}`}
       onPointerDown={story ? onTouch : undefined}
     >
+      <ModeRibbon source={ctlState} />
       <StageHeader connection={connection} control={ctlState} story={story} />
       <div className="ms-hero">
         <WorldMap hubStyles={hubStyles} shares={tick.map} ingest={ingest} config={config} alert={reset.phase === 'idle' ? alert : null} focusId={focusId} />

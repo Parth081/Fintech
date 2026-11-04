@@ -6,7 +6,7 @@ import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 import { randomUUID } from 'node:crypto';
-import { isControlEvent, type AnyEvent, type EventType, type OrchestratorState, type PaymentStatus } from '@ct/contracts';
+import { isControlEvent, type AnyEvent, type EventType, type OrchestratorState, type PaymentStatus, type SystemMode } from '@ct/contracts';
 import { breakerStates } from '@ct/market';
 import type { EventBus } from '@ct/event-bus';
 import { ALL_STATUSES, Projection, type PaymentFilter } from './projection';
@@ -73,6 +73,10 @@ export interface GatewayOptions {
   resetTimeoutMs?: number;
   /** M4 Operations service base URL (/api/ops/<rest> is proxied to {opsUrl}/<rest>). Default http://127.0.0.1:7075. */
   opsUrl?: string;
+  /** M6: 'safe' = the recorded backup run is playing (payment sending is disabled). Default env SYSTEM_MODE, else 'live'. */
+  mode?: SystemMode;
+  /** M6: name of the recording being played in safe mode. Default env RECORDING_NAME. */
+  recording?: string | null;
 }
 
 export interface GatewayHandle {
@@ -179,6 +183,8 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
   const assistantUrl = (options.assistantUrl ?? 'http://127.0.0.1:7076').replace(/\/$/, '');
   const boothUrl = (options.boothUrl ?? 'http://127.0.0.1:7077').replace(/\/$/, '');
   const assistantTimeoutMs = options.assistantTimeoutMs ?? 30_000;
+  const mode: SystemMode = (options.mode ?? process.env.SYSTEM_MODE) === 'safe' ? 'safe' : 'live';
+  const recording: string | null = mode === 'safe' ? (options.recording ?? (process.env.RECORDING_NAME || null)) || null : null;
   const instanceId = randomUUID();
   const startedAt = new Date(now()).toISOString();
 
@@ -367,6 +373,8 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
       atMs: t,
       traffic: control.traffic.view(t),
       reroutes: control.reroutes(),
+      mode,
+      recording,
     };
     if (b.error) view.breakerError = b.error;
     if (orch.error) view.orchestratorError = orch.error;
@@ -381,6 +389,8 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
       v.breakers.map((x) => [x.providerId, x.state, x.since, x.reason]),
       o && [o.ambient.rate, o.ambient.running, o.pace, o.paused, o.activeRun?.runId, o.activeRun?.stepId, o.scenarios.length],
       v.resetAvailable,
+      v.mode,
+      v.recording,
       v.breakerError,
       v.orchestratorError,
       v.reroutes[0]?.paymentId,
@@ -760,6 +770,58 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
     }
   };
 
+  /** GET /api/control/status -> {launcherControlUrl}/status (service health, mode, recording). 503 without a launcher. */
+  const launcherStatus = async (res: ServerResponse) => {
+    if (!launcherControlUrl) return sendJson(res, 503, { error: 'status unavailable', detail: 'this stack was not started by the launcher (LAUNCHER_CONTROL_URL is empty)' });
+    try {
+      const upstream = await fetch(`${launcherControlUrl}/status`, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(3000) });
+      const text = await upstream.text();
+      res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+      res.end(text);
+    } catch (err) {
+      sendJson(res, 502, { error: 'launcher unavailable', detail: (err as Error).message });
+    }
+  };
+
+  /**
+   * POST /api/control/safe-mode { on, name? } -> {launcherControlUrl}/safe-mode?wait=0. Like reset, the launcher
+   * restarts this process, so every screen is told first ({kind:'reset'}) and the UI waits for /health.
+   */
+  const safeMode = async (req: IncomingMessage, res: ServerResponse) => {
+    if (!launcherControlUrl) {
+      return sendJson(res, 503, { error: 'safe mode unavailable', detail: 'this stack was not started by the launcher (LAUNCHER_CONTROL_URL is empty), e.g. Docker' });
+    }
+    let parsed: { on?: unknown; name?: unknown };
+    try {
+      const raw = (await readBody(req)).toString('utf8');
+      parsed = raw ? (JSON.parse(raw) as typeof parsed) : {};
+    } catch {
+      return sendJson(res, 400, { error: 'body must be JSON { on: boolean, name?: string }' });
+    }
+    if (typeof parsed.on !== 'boolean' || (parsed.name !== undefined && (typeof parsed.name !== 'string' || !/^[A-Za-z0-9._-]{1,80}$/.test(parsed.name)))) {
+      return sendJson(res, 400, { error: 'body must be JSON { on: boolean, name?: string }' });
+    }
+    const rm: ResetMessage = { kind: 'reset', startedAt: new Date(now()).toISOString() };
+    broadcast(JSON.stringify(rm));
+    try {
+      const upstream = await fetch(`${launcherControlUrl}/safe-mode?wait=0`, {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        body: JSON.stringify(parsed.name === undefined ? { on: parsed.on } : { on: parsed.on, name: parsed.name }),
+        signal: AbortSignal.timeout(resetTimeoutMs),
+      });
+      const text = await upstream.text();
+      if (!upstream.ok) broadcast(JSON.stringify({ kind: 'reset', startedAt: rm.startedAt, failed: `HTTP ${upstream.status}` } satisfies ResetMessage));
+      if (res.writableEnded || res.destroyed) return;
+      res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+      res.end(text);
+    } catch (err) {
+      broadcast(JSON.stringify({ kind: 'reset', startedAt: rm.startedAt, failed: (err as Error).message } satisfies ResetMessage));
+      if (res.writableEnded || res.destroyed) return;
+      sendJson(res, 502, { error: 'launcher unavailable', detail: (err as Error).message });
+    }
+  };
+
   /** POST /api/control/focus { paymentId | null } -> every screen opens/closes that payment's drawer. */
   const focus = async (req: IncomingMessage, res: ServerResponse) => {
     let paymentId: unknown;
@@ -791,6 +853,14 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
     if (path === '/api/control/reset') {
       if (method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' });
       return reset(res);
+    }
+    if (path === '/api/control/status') {
+      if (method !== 'GET') return sendJson(res, 405, { error: 'method not allowed' });
+      return launcherStatus(res);
+    }
+    if (path === '/api/control/safe-mode') {
+      if (method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' });
+      return safeMode(req, res);
     }
     if (path === '/api/control/focus') {
       if (method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' });
@@ -893,6 +963,10 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
         return detail ? sendJson(res, 200, detail) : sendJson(res, 404, { error: 'payment not found', paymentId: id });
       }
     }
+    if (method === 'POST' && (path === '/api/payments' || path.startsWith('/api/payments/')) && mode === 'safe') {
+      // The recorded backup run plays on the big screen; there is no live pipeline behind the kiosk.
+      return sendJson(res, 503, { error: 'demo paused', mode: 'safe' });
+    }
     if (method === 'POST' && path === '/api/payments') return proxy(req, res, '/payments');
     if (method === 'POST' && path === '/api/payments/sample') return proxy(req, res, '/payments/sample');
     return sendJson(res, method === 'GET' || method === 'POST' ? 404 : 405, { error: 'not found' });
@@ -912,6 +986,8 @@ export async function startGateway(options: GatewayOptions): Promise<GatewayHand
         replayMs: replayDone?.ms ?? null,
         instanceId,
         startedAt,
+        mode,
+        recording,
       };
       return sendJson(res, 200, body);
     }

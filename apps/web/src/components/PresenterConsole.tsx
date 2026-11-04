@@ -10,9 +10,11 @@ import { usePoll } from '../hooks/usePoll';
 import {
   ApiError,
   fetchHealth,
+  fetchLauncherStatus,
   fetchTrialBalance,
   focusPayment,
   requestReset,
+  requestSafeMode,
   setAmbient,
   setPace,
   setPaused,
@@ -34,6 +36,19 @@ import {
   type ScenarioProgress,
 } from '../lib/control';
 import { formatCount, formatDuration, providerName, shortId } from '../lib/format';
+import {
+  healthRows,
+  healthSummary,
+  modeInfo,
+  modeSwitchReady,
+  parseLauncherStatus,
+  requiredAfterSwitch,
+  RIBBON_TEXT,
+  ribbonDetail,
+  SAFE_CONFIRM_OFF,
+  SAFE_CONFIRM_ON,
+} from '../lib/mode';
+import type { SystemMode } from '@ct/contracts/browser';
 import type { ConnectionStatus } from '../lib/types';
 
 interface Props {
@@ -167,6 +182,64 @@ export function PresenterConsole({ live, onOpenPayment }: Props) {
     return () => window.clearTimeout(t);
   }, [back, refreshControl, refreshLedger]);
 
+  // ---- M6: service health + safe mode (recorded backup run) ------------------------------------------
+  const launcherStatus = usePoll(async (signal: AbortSignal) => parseLauncherStatus(await fetchLauncherStatus(signal)), 3000);
+  const health = healthRows(launcherStatus.data ?? null);
+  const healthSum = healthSummary(health);
+  const modeNow = modeInfo(view);
+  const [swTarget, setSwTarget] = useState<SystemMode>('safe');
+  const [sw, dispatchSw] = useReducer(resetReducer, { phase: 'idle' });
+  const beginSwitch = useCallback(async () => {
+    let before: string | null = null;
+    try {
+      before = (await fetchHealth(AbortSignal.timeout(1500))).instanceId ?? null;
+    } catch {
+      /* unknown */
+    }
+    dispatchSw({ type: 'start', nowMs: Date.now(), beforeInstance: before });
+    requestSafeMode(swTarget === 'safe').then(
+      () => dispatchSw({ type: 'post', ok: true }),
+      (err: unknown) =>
+        dispatchSw({ type: 'post', ok: false, status: err instanceof ApiError ? err.status : 0, error: err instanceof Error ? err.message : String(err) }),
+    );
+  }, [swTarget]);
+  const switching = sw.phase === 'resetting';
+  useEffect(() => {
+    if (sw.phase !== 'resetting') return;
+    let disposed = false;
+    let timer: number | null = null;
+    const poll = async () => {
+      let h = null;
+      try {
+        h = await fetchHealth(AbortSignal.timeout(1500));
+        // The new system only counts once it reports the target mode (the old gateway may still answer).
+        if (!modeSwitchReady(h, swTarget)) h = { ...h, replayed: false };
+        else {
+          const checks = requiredAfterSwitch(swTarget).map((n) =>
+            fetch(n === 'ledger' ? '/api/ledger/health' : '/api/control/orchestrator/health', { signal: AbortSignal.timeout(1500) }).then((r) => r.ok, () => false),
+          );
+          if (!(await Promise.all(checks)).every(Boolean)) h = { ...h, replayed: false };
+        }
+      } catch {
+        h = null;
+      }
+      if (disposed) return;
+      dispatchSw({ type: 'health', health: h, nowMs: Date.now() });
+      timer = window.setTimeout(() => void poll(), 500);
+    };
+    timer = window.setTimeout(() => void poll(), 500);
+    return () => {
+      disposed = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [sw.phase, swTarget]);
+  useEffect(() => {
+    if (sw.phase !== 'back') return;
+    refreshControl(true);
+    const t = window.setTimeout(() => dispatchSw({ type: 'dismiss' }), 5000);
+    return () => window.clearTimeout(t);
+  }, [sw.phase, refreshControl]);
+
   // ---- render ---------------------------------------------------------------------------
   const target = explanationTarget(view);
   const ambientPreset = ambientPresetFor(orch?.ambient);
@@ -174,7 +247,7 @@ export function PresenterConsole({ live, onOpenPayment }: Props) {
   const stats = live.feed.stats;
   const rows = providerStatusRows(view);
   const outages = Object.values(view?.control.outages ?? {});
-  const orchDown = view !== null && orch === null;
+  const orchDown = view !== null && orch === null && !modeNow.safe;
   const attractInfo = attractStatus(attract, running, paused);
 
   // "Ask why": the payment the presenter last jumped to (else the newest re-route), the scenario, or the system.
@@ -201,6 +274,7 @@ export function PresenterConsole({ live, onOpenPayment }: Props) {
         <div>
           <h1 className="pc-title">Presenter</h1>
           <span className="pc-sub">Control Tower · simulation · synthetic data</span>
+          {modeNow.safe && <span className="pc-pill tone-warn" style={{ marginLeft: '0.6rem' }}>{RIBBON_TEXT}</span>}
         </div>
         <div className="pc-top-right">
           <a className="btn pc-link" href="#/stage" target="_blank" rel="noopener">
@@ -240,7 +314,7 @@ export function PresenterConsole({ live, onOpenPayment }: Props) {
           ) : null}
           <section className="pc-card">
             <h2 className="pc-h2">Scenarios</h2>
-            {!orch && <p className="empty">{orchDown ? 'Unavailable while the orchestrator is down.' : 'Loading…'}</p>}
+            {!orch && <p className="empty">{modeNow.safe ? 'Scenarios are unavailable while the recorded run plays. Switch back to live to run them.' : orchDown ? 'Unavailable while the orchestrator is down.' : 'Loading…'}</p>}
             {orch && orch.scenarios.length === 0 && <p className="empty">No scenarios defined.</p>}
             <div className="pc-scenarios">
               {orch?.scenarios.map((s) => (
@@ -305,6 +379,46 @@ export function PresenterConsole({ live, onOpenPayment }: Props) {
         </div>
 
         <div className="pc-col">
+          <section className="pc-card" aria-label="System health">
+            <h2 className="pc-h2">
+              System health <span className={`pc-pill tone-${healthSum.tone}`}>{launcherStatus.data ? healthSum.text : launcherStatus.error ? 'Unavailable' : '…'}</span>
+            </h2>
+            {launcherStatus.data ? (
+              <div className="pc-health">
+                {health.map((r) => (
+                  <div key={r.name} className={`pc-health-row tone-${r.tone}`}>
+                    <i className="pc-health-dot" aria-hidden="true" />
+                    <span className="pc-health-name">{r.name}</span>
+                    <span className="pc-health-label">{r.label}</span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="empty">{launcherStatus.error ? 'Service status is unavailable: this stack was not started with npm start.' : 'Loading…'}</p>
+            )}
+          </section>
+
+          <section className="pc-card" aria-label="Safe mode">
+            <h2 className="pc-h2">
+              Safe mode <span className={`pc-pill tone-${modeNow.safe ? 'warn' : 'ok'}`}>{modeNow.safe ? 'Recorded run' : 'Live'}</span>
+            </h2>
+            <div className="pc-safe-row">
+              <span className="pc-label">{modeNow.safe ? ribbonDetail(modeNow) : 'If something goes wrong, play the recorded backup run on the big screen'}</span>
+              <button
+                type="button"
+                className={`btn pc-big ${modeNow.safe ? 'pc-resume' : 'pc-reset'}`}
+                disabled={!view?.resetAvailable || switching}
+                onClick={() => {
+                  setSwTarget(modeNow.safe ? 'live' : 'safe');
+                  dispatchSw({ type: 'ask' });
+                }}
+              >
+                {modeNow.safe ? '▶ Back to live demo' : '⏺ Switch to recorded run'}
+              </button>
+              {view && !view.resetAvailable && <p className="pc-note">Unavailable: this stack was not started with <code>npm start</code>.</p>}
+            </div>
+          </section>
+
           <section className="pc-card" aria-label="Live status">
             <h2 className="pc-h2">Live status</h2>
             <div className="pc-providers">
@@ -406,7 +520,7 @@ export function PresenterConsole({ live, onOpenPayment }: Props) {
               <button
                 type="button"
                 className="btn pc-big pc-reset"
-                disabled={!view?.resetAvailable || reset.phase === 'resetting'}
+                disabled={!view?.resetAvailable || reset.phase === 'resetting' || modeNow.safe}
                 onClick={() => dispatchReset({ type: 'ask' })}
               >
                 ⟲ RESET DEMO
@@ -421,6 +535,58 @@ export function PresenterConsole({ live, onOpenPayment }: Props) {
         </div>
       </div>
 
+      {sw.phase === 'confirm' && (
+        <div className="reset-overlay" role="alertdialog" aria-modal="true" aria-labelledby="safe-q">
+          <div className="reset-box">
+            <h2 id="safe-q">{swTarget === 'safe' ? 'Switch to the recorded run?' : 'Back to the live demo?'}</h2>
+            <p>{swTarget === 'safe' ? SAFE_CONFIRM_ON : SAFE_CONFIRM_OFF}</p>
+            <div className="reset-buttons">
+              <button type="button" className="btn pc-big" onClick={() => dispatchSw({ type: 'cancel' })}>
+                Cancel
+              </button>
+              <button type="button" className="btn pc-big pc-reset" onClick={() => void beginSwitch()}>
+                {swTarget === 'safe' ? 'Switch now' : 'Go live'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {sw.phase === 'resetting' && (
+        <div className="reset-overlay" role="alertdialog" aria-live="assertive" aria-label="Switching">
+          <div className="reset-box">
+            <div className="reset-spinner" aria-hidden="true" />
+            <h2>{swTarget === 'safe' ? 'Starting the recorded run…' : 'Going back to live…'} ({Math.max(0, Math.floor((now - sw.startedAtMs) / 1000))}s)</h2>
+            <p>{sw.sawDown ? 'Services are restarting. Reconnecting automatically…' : 'Stopping services…'}</p>
+          </div>
+        </div>
+      )}
+      {sw.phase === 'back' && (
+        <div className="reset-overlay" role="alertdialog" aria-live="assertive" onClick={() => dispatchSw({ type: 'dismiss' })}>
+          <div className="reset-box reset-ok">
+            <h2>{swTarget === 'safe' ? '✓ Recorded run is playing' : '✓ Live demo is back'}</h2>
+            <p>Took {formatDuration(sw.tookMs)}. Visitor leads were kept.</p>
+            <button type="button" className="btn pc-big" onClick={() => dispatchSw({ type: 'dismiss' })}>
+              OK
+            </button>
+          </div>
+        </div>
+      )}
+      {sw.phase === 'failed' && (
+        <div className="reset-overlay" role="alertdialog" aria-live="assertive">
+          <div className="reset-box reset-bad">
+            <h2>Could not switch</h2>
+            <p>{sw.error}</p>
+            <div className="reset-buttons">
+              <button type="button" className="btn pc-big" onClick={() => dispatchSw({ type: 'dismiss' })}>
+                Close
+              </button>
+              <button type="button" className="btn pc-big pc-reset" onClick={() => void beginSwitch()}>
+                Try again
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {reset.phase === 'confirm' && (
         <div className="reset-overlay" role="alertdialog" aria-modal="true" aria-labelledby="reset-q">
           <div className="reset-box">
