@@ -6,3 +6,6 @@ coverage/
 
 # git worktrees for parallel milestones
 .worktrees/
+
+# exported visitor leads (personal data) must never be committed
+leads-*.csv

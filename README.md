@@ -487,7 +487,7 @@ BOOTH_STAFF_PIN=8131 npm start    # your own staff PIN for the event (default 24
 | --- | --- | --- |
 | Big screen | http://127.0.0.1:7072/#/stage | the live map; when nobody touches anything it runs the **attract loop** (orchestrator `POST /attract {enabled}`; a touch, `POST /attract/touch`, hands control back) |
 | Kiosk | http://127.0.0.1:7072/#/kiosk | visitor flow: pick a corridor, send a payment, watch it, ask the explainer, optional contact form with explicit consent; resets itself when idle |
-| Presenter | http://127.0.0.1:7072/#/presenter | scenarios, pace, ambient traffic, reset, and (with the staff PIN) leads, CSV export and booth summary |
+| Presenter | http://127.0.0.1:7072/#/presenter | scenarios, pace, ambient traffic, reset, attract loop, system health and the safe-mode switch. Leads are handled by staff with `npm run booth:export-leads` (needs the staff PIN), not from this screen. |
 
 A **reset never deletes visitor leads**: the booth keeps running through it and `DATA_DIR/booth` is left in
 place (also with `npm start -- --reset`). Export them from the presenter console (or
@@ -544,3 +544,20 @@ Per-scenario table, `<data dir>/reports/verify-m5-<time>.json` (`--report-dir`),
 | assistant | 7076 | AI explainer (`ASSISTANT_PORT`); browser via `/api/assistant/*` |
 | booth | 7077 | leads + analytics (`BOOTH_PORT`); browser via `/api/booth/*` |
 | verify:m5 | 37070-37074, 37076, 37077, 37079 | its own system (`--base-port`) |
+
+## M6 - Show-ready
+
+M6 makes a human team ready to run the booth. Gate 3: no hard failures in two full dress rehearsals.
+Everything for the team is in [`docs/booth/`](docs/booth/README.md): presenter runbook (3-, 10- and 20-minute
+scripts), setup checklist, dress-rehearsal script, failure playbook, FAQ, staff lead handling, a legal review
+pack (a checklist that needs a human reviewer, not an approval), a claims register and a training plan.
+Decision: [ADR 0018](docs/adr/0018-copy-and-claims-policy.md).
+
+| Command | What it does |
+| --- | --- |
+| `npm run booth:preflight` | Is this laptop ready? Node 22+, installed dependencies, built screens, free ports 7070-7079, disk and memory, clock, writable data folder, recorded backup run, staff PIN, AI mode. Each check is ok / warn / fail with a fix; exit 1 on any fail. `-- --hot-spare` prints the commands to prepare a second laptop; `--ports`, `--data-dir`, `--json` also exist. |
+| `npm run verify:copy` | Scans screens, scenario narration, assistant answers, README and `docs/booth` for banned claims (compliant, certified, guaranteed, ...), real brand names, a missing SIMULATION label, an out-of-sync consent sentence, hard-coded outside links and real contact details. Findings print `file:line`, the rule and a fix. Exit 1 on any finding. |
+| `npm run booth:export-leads -- [--out file] [--pin PIN] [--url http://127.0.0.1:7072] [--force] [--erase]` | End-of-day routine: saves the leads from the running booth as a CSV (PIN from `BOOTH_STAFF_PIN` or `--pin`), prints the count and the booth summary, never prints the PIN or personal data, refuses to write if the booth is unreachable or the PIN is wrong. `--erase` deletes exactly the exported leads after you type `DELETE`. |
+
+The pre-show routine: `npm run build:web`, `npm run verify:copy`, `npm run booth:preflight`, record the
+backup run, rehearse twice with Wi-Fi off. See [`docs/booth/booth-setup-checklist.md`](docs/booth/booth-setup-checklist.md).

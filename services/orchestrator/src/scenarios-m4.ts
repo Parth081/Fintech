@@ -86,7 +86,7 @@ export const FRAUD_RING: ScenarioScript = {
       atMs: 52_000,
       title: 'Customers protected, money untouched',
       narration:
-        'Held payments have not moved a cent: nothing is posted to the ledger until a human decides. Meanwhile normal customers kept flowing without delay. Every action the team takes is written to a tamper-proof audit trail.',
+        'Held payments have not moved a cent: nothing is posted to the ledger until a human decides. Meanwhile normal customers kept flowing without delay. Every action the team takes is written to an append-only audit trail.',
     },
   ],
 };
