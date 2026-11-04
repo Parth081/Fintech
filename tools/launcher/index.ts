@@ -59,6 +59,9 @@ async function main(): Promise<void> {
       quiet: args.quiet,
       buildWeb: args.buildWeb,
       startupTimeoutMs: args.startupTimeoutMs,
+      supervisor: { enabled: args.supervise },
+      mode: args.safe ? 'safe' : 'live',
+      recording: args.recording,
       onUnexpectedExit: () => process.exit(1),
     });
   } catch (e) {
@@ -71,7 +74,10 @@ async function main(): Promise<void> {
     await system.stop();
     process.exit(0);
   }
+  const st = system.status();
   const extra = [
+    `  Mode: ${st.mode === 'safe' ? `SAFE - recorded run "${st.recording}" (nothing live)` : 'live'} · self-healing supervisor: ${st.supervisor.enabled ? `on (max ${st.supervisor.maxRestarts} restarts / ${Math.round(st.supervisor.windowMs / 1000)} s)` : 'off'}`,
+    `  Control: ${system.urls.control ? `${system.urls.control} (GET /status, POST /reset, POST /safe-mode)` : 'disabled (--no-control)'}`,
     `  Ambient traffic ${args.ambientRate}/s` + (system.urls.control ? ` · reset: POST ${system.urls.control}/reset` : ''),
     `  Booth: big screen ${system.urls.gateway}/#/stage · kiosk ${system.urls.gateway}/#/kiosk`,
     `  AI explainer: ${args.assistantLlm === 'off' ? 'grounded answers only (--llm off, offline)' : 'Claude when credentials work, else grounded (--llm off for fully offline)'}`,

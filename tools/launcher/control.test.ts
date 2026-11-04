@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DEFAULT_SUPERVISOR_POLICY } from '@ct/contracts';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   ResetBusyError,
@@ -25,7 +26,10 @@ function fakeSystem(opts: { dataDir: string; rootDir: string; startMs?: number; 
   const log: string[] = [];
   const controller: ResetController = {
     status: () => ({
-      services: names.map((name) => ({ name, running: running.get(name)! })),
+      services: names.map((name) => ({ name, running: running.get(name)!, restarts: 0, lastRestartAt: null, lastExit: null })),
+      mode: 'live',
+      recording: null,
+      supervisor: DEFAULT_SUPERVISOR_POLICY,
       startedAt: '2026-10-23T00:00:00.000Z',
       resetting,
       resets,

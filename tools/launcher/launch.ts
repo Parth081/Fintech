@@ -10,16 +10,22 @@ import type { ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { serviceConfig, DEFAULT_SUPERVISOR_POLICY, type ServiceHealthView, type SupervisorPolicy, type SystemMode } from '@ct/contracts';
+import { createBus, type EventBus } from '@ct/event-bus';
 import {
   assertSafeToDelete,
+  ModeRequestError,
+  RecordingNotFoundError,
   ResetBusyError,
   startControlServer,
   wipeDataDir,
   PRESERVED_DATA_ENTRIES,
   type ControlServerHandle,
   type LauncherStatus,
+  type ModeResult,
   type ResetResult,
 } from './control';
+import { loadReplayApi, recordingFile, type ReplayApi, type ReplayPublisher } from './replay-api';
 import { busyPortsMessage, findBusyPorts } from './ports';
 import { isRunning, killTree, spawnShell, spawnTs, waitForExit } from './process';
 
@@ -109,6 +115,18 @@ export interface LaunchOptions {
   log?: (line: string) => void;
   /** Called once if a service dies after startup (or a reset fails); everything has already been stopped. */
   onUnexpectedExit?: (error: Error) => void;
+  /**
+   * M6 self-healing: restart a service that exits unexpectedly after startup, with exponential backoff
+   * (see SupervisorPolicy). Default for launch(): DISABLED (a crash stops everything, as before); the CLI
+   * (`npm start`) enables it unless --no-supervise.
+   */
+  supervisor?: Partial<SupervisorPolicy>;
+  /** M6: start directly in safe mode (recorded backup run) instead of live. */
+  mode?: SystemMode;
+  /** Recording for `mode: 'safe'` and the default of POST /safe-mode {on:true} (default: the newest). */
+  recording?: string;
+  /** M6 (tests): replace the record/replay library (default: tools/booth/replay.ts). */
+  replay?: ReplayApi;
 }
 
 export interface StartupTiming {
@@ -133,8 +151,8 @@ export interface LaunchedSystem {
     booth?: string;
     control?: string;
   };
-  /** Names of the processes this launch manages (broker omitted with BUS=kafka). */
-  services: readonly ServiceName[];
+  /** Names of the processes of the current mode (broker omitted with BUS=kafka; safe mode: broker, gateway, assistant, booth). */
+  readonly services: readonly ServiceName[];
   /** How long the initial start took and when each service became ready. */
   startup: StartupTiming;
   /**
@@ -153,6 +171,24 @@ export interface LaunchedSystem {
   reset(): Promise<ResetResult>;
   /** What GET /status of the control API returns. */
   status(): LauncherStatus;
+  /** M6: restart counters and last exit of every service (GET /status `services`). */
+  health(): ServiceHealthView[];
+  /** M6: 'live' or 'safe' (recorded backup run). */
+  mode(): SystemMode;
+  /** M6: the supervisor policy in force. */
+  supervisorPolicy(): SupervisorPolicy;
+  /**
+   * M6: switch to the recorded backup run (on=true, optional recording name, default the newest) or back to a
+   * fresh live system (on=false). Same as POST /safe-mode. Rejects with ResetBusyError while a reset or mode
+   * change runs and with RecordingNotFoundError for an unknown recording (nothing is stopped). Already in
+   * that mode (and no different recording asked for): resolves at once, nothing is touched.
+   */
+  setMode(options: { on: boolean; name?: string }): Promise<ModeResult>;
+  /**
+   * Chaos/test helper: kill one service's process tree WITHOUT marking it intentional - exactly what an OS
+   * crash looks like to the launcher (the supervisor restarts it; with the supervisor off everything stops).
+   */
+  crash(name: ServiceName): Promise<void>;
   /** True while the service's process is alive. */
   isRunning(name: ServiceName): boolean;
   stop(): Promise<void>;
@@ -204,6 +240,8 @@ interface ServiceSpec {
   /** Readiness: HTTP GET healthUrl returns 200 and/or a stdout line matches readyLine (both when both are set). */
   healthUrl?: string;
   readyLine?: RegExp;
+  /** Extra environment for this service (on top of the shared one), kept across supervised restarts. */
+  env?: Record<string, string>;
 }
 
 interface Running {
@@ -214,6 +252,8 @@ interface Running {
   readyWaiters: (() => void)[];
   /** Killed on purpose via kill()/restart()/reset()/stop(): its exit is not a crash. */
   intentional: boolean;
+  /** Being (re)started by the supervisor: its restart loop owns its fate, onExit must not react. */
+  inRestart: boolean;
 }
 
 const TAIL_LINES = 25;
@@ -261,6 +301,12 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
   const say = (msg: string): void => write(prefixLine('launcher', msg));
   const bus = options.env?.BUS ?? process.env.BUS ?? 'local';
   const ambientRate = options.ambientRate ?? (process.env.AMBIENT_RATE ? Number(process.env.AMBIENT_RATE) : 0);
+  const policy: SupervisorPolicy = { ...DEFAULT_SUPERVISOR_POLICY, enabled: false, ...options.supervisor };
+  let mode: SystemMode = options.mode ?? 'live';
+  let recording: string | null = null;
+  let replayApi: ReplayApi | undefined = options.replay;
+  const getReplayApi = async (): Promise<ReplayApi> => (replayApi ??= await loadReplayApi());
+  if (mode === 'safe' && bus === 'kafka') throw new StartupError('safe mode needs the local broker (BUS=local); it cannot run with BUS=kafka');
 
   // 1. Ports first: fail fast with a helpful message instead of a cryptic EADDRINUSE later.
   const wanted = [
@@ -290,16 +336,34 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
   // 3. Control server (before the services, so the gateway gets its URL).
   // The controller is wired to the real reset()/status() once they exist; until the first start is
   // complete a reset is refused with 409 (busy) and /status reports what has been started so far.
-  let controller: { status: () => LauncherStatus; reset: () => Promise<ResetResult> } = {
-    status: () => ({ services: [], startedAt: new Date().toISOString(), resetting: false, resets: 0, lastReset: null }),
+  let controller: {
+    status: () => LauncherStatus;
+    reset: () => Promise<ResetResult>;
+    beginMode: (on: boolean, name: string | undefined, delayMs: number) => Promise<{ done: Promise<ModeResult> }>;
+  } = {
+    status: () => ({
+      services: [],
+      startedAt: new Date().toISOString(),
+      resetting: false,
+      resets: 0,
+      lastReset: null,
+      mode,
+      recording,
+      supervisor: policy,
+    }),
     reset: () => Promise.reject(new ResetBusyError('the system is still starting')),
+    beginMode: () => Promise.reject(new ResetBusyError('the system is still starting')),
   };
   let control: ControlServerHandle | null = null;
   if (controlPort !== undefined) {
     control = await startControlServer({
       host: probeHost,
       port: controlPort,
-      controller: { status: () => controller.status(), reset: () => controller.reset() },
+      controller: {
+        status: () => controller.status(),
+        reset: () => controller.reset(),
+        beginMode: (on, name, delayMs) => controller.beginMode(on, name, delayMs),
+      },
       log: say,
     });
   }
@@ -346,6 +410,10 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     AMBIENT_RATE: String(ambientRate),
     DATA_DIR: dataDir,
     DATABASE_URL: options.databaseUrl ?? process.env.DATABASE_URL ?? '',
+    // M6: the gateway reads these (health + control state). Always explicit so a stray SYSTEM_MODE in the
+    // operator's shell can never turn a live system into a recorded run; safe mode overrides them per service.
+    SYSTEM_MODE: 'live',
+    RECORDING_NAME: '',
     SIM_SEED: options.simSeed ?? process.env.SIM_SEED ?? 'control-tower',
     PROVIDER_FAILURE_SCALE: String(options.providerFailureScale ?? process.env.PROVIDER_FAILURE_SCALE ?? 1),
     WEB_DIST: webDist,
@@ -366,6 +434,36 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
   let resets = 0;
   let lastReset: LauncherStatus['lastReset'] = null;
   let startedAt = new Date().toISOString();
+  /** M6 supervisor bookkeeping: per-service counters (survive resets), crash times, running restart loops. */
+  const health = new Map<ServiceName, { restarts: number; lastRestartAt: string | null; lastExit: ServiceHealthView['lastExit'] }>();
+  const healthOf = (name: ServiceName) => {
+    let h = health.get(name);
+    if (!h) health.set(name, (h = { restarts: 0, lastRestartAt: null, lastExit: null }));
+    return h;
+  };
+  const crashTimes = new Map<ServiceName, number[]>();
+  const supTasks = new Map<ServiceName, { cancelled: boolean; wake: () => void }>();
+  /** Bumped by reset / mode change / stop: restart loops of an older generation give up quietly. */
+  let supGen = 0;
+  /** Safe mode: the bus connection and publisher that play the recording into the broker. */
+  let replay: { bus: EventBus; publisher: ReplayPublisher } | null = null;
+
+  const cancelSupervision = (): void => {
+    supGen += 1;
+    for (const t of supTasks.values()) {
+      t.cancelled = true;
+      t.wake();
+    }
+  };
+
+  /** Stop the recording publisher and close its bus connection (never hangs on a dead broker). */
+  const stopReplay = async (): Promise<void> => {
+    const r = replay;
+    if (!r) return;
+    replay = null;
+    await Promise.race([r.publisher.stop().catch(() => undefined), sleep(3000)]);
+    await Promise.race([r.bus.close().catch(() => undefined), sleep(2000)]);
+  };
 
   /** Kill every given process tree in parallel; their exits are intentional. */
   const killAll = async (rs: Iterable<Running>): Promise<void> => {
@@ -382,7 +480,10 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
         // broker) so consumers do not log broker-disconnect noise. Each tier is killed in parallel.
         const tier = (r: Running): number =>
           r.spec.name === 'gateway' || r.spec.name === 'orchestrator' || r.spec.name === 'ops' || r.spec.name === 'assistant' ? 0 : r.spec.name === 'broker' ? 2 : 1;
+        cancelSupervision();
         await Promise.allSettled(restarting);
+        // Safe mode: the recording publisher talks to the broker, so it goes first.
+        await stopReplay();
         // The booth holds visitor leads: ask it to close its database cleanly first (closing stdin
         // triggers exitWithSupervisor), and only then kill whatever is left.
         await Promise.all([...alive].filter((r) => r.spec.name === 'booth').map((r) => gracefulStop(r, 4000)));
@@ -391,6 +492,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
         // it spawned meanwhile, then let it settle.
         await killAll(alive);
         if (resetPromise) await resetPromise.catch(() => undefined);
+        await stopReplay();
         await killAll(alive);
         await control?.close();
       })();
@@ -422,35 +524,129 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
   let crashWaiters: (() => void)[] = [];
   const onExit = (r: Running, code: number | null, signal: NodeJS.Signals | null): void => {
     alive.delete(r);
-    if (stopping || r.intentional) return;
+    if (stopping || r.intentional || r.inRestart) return;
     if (!started) {
       startupCrash ??= r;
       for (const w of crashWaiters.splice(0)) w();
       return;
     }
+    healthOf(r.spec.name).lastExit = { code, signal, at: new Date().toISOString() };
+    if (policy.enabled) {
+      // Windows delivers Ctrl+C to children too; give our own SIGINT handler a moment to set `stopping`.
+      setTimeout(() => superviseCrash(r, code, signal), 100);
+      return;
+    }
     // Windows delivers Ctrl+C to children too; give our own SIGINT handler a moment to set `stopping`.
     setTimeout(() => {
       if (stopping || reportedCrash || r.intentional) return;
-      reportedCrash = true;
-      const err = new Error(
-        describeFailure(r, `Service [${r.spec.name}] exited unexpectedly (code ${code}, signal ${signal}). Stopping everything.`),
-      );
-      write(prefixLine('launcher', err.message));
-      void stop().then(() => {
-        if (options.onUnexpectedExit) options.onUnexpectedExit(err);
-      });
+      giveUp(describeFailure(r, `Service [${r.spec.name}] exited unexpectedly (code ${code}, signal ${signal}). Stopping everything.`));
     }, 300);
+  };
+
+  /** Stop everything and tell the owner (npm start exits non-zero). Once only. */
+  const giveUp = (message: string): void => {
+    if (stopping || reportedCrash) return;
+    reportedCrash = true;
+    const err = new Error(message);
+    write(prefixLine('launcher', err.message));
+    void stop().then(() => {
+      if (options.onUnexpectedExit) options.onUnexpectedExit(err);
+    });
+  };
+
+  /**
+   * M6 self-healing. A service died after startup: restart it (same env, same ports) after an exponential
+   * backoff and wait until it is ready again. Crashes (and failed restart attempts) are counted inside
+   * policy.windowMs; more than policy.maxRestarts of them and the supervisor gives up: everything stops
+   * and onUnexpectedExit is called with the failing service named.
+   */
+  const superviseCrash = (first: Running, code: number | null, signal: NodeJS.Signals | null): void => {
+    const name = first.spec.name;
+    if (stopping || first.intentional || reportedCrash || resetPromise || !started) return;
+    if (supTasks.has(name)) return;
+    const task = { cancelled: false, wake: () => {} };
+    supTasks.set(name, task);
+    const gen = supGen;
+    const live = (): boolean => !stopping && !task.cancelled && gen === supGen && !resetPromise;
+    const p = (async () => {
+      let dead = first;
+      let why = `exited unexpectedly (code ${code}, signal ${signal})`;
+      while (live()) {
+        const now = Date.now();
+        const times = (crashTimes.get(name) ?? []).filter((t) => now - t < policy.windowMs);
+        times.push(now);
+        crashTimes.set(name, times);
+        if (times.length > policy.maxRestarts) {
+          giveUp(
+            describeFailure(
+              dead,
+              `Service [${name}] keeps failing: ${times.length} failures within ${Math.round(policy.windowMs / 1000)} s ` +
+                `(limit ${policy.maxRestarts} restarts); last: ${why}. Stopping everything.`,
+            ),
+          );
+          return;
+        }
+        const delay = Math.min(policy.maxBackoffMs, policy.backoffMs * 2 ** (times.length - 1));
+        write(
+          prefixLine(
+            'launcher',
+            describeFailure(dead, `Service [${name}] ${why}. Restart ${times.length}/${policy.maxRestarts} in ${delay} ms.`),
+          ),
+        );
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, delay);
+          task.wake = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+        });
+        if (!live()) return;
+        // Somebody (restart()) already brought it back.
+        const existing = current(name);
+        if (existing && isRunning(existing.child)) return;
+        const spec = specs.get(name);
+        if (!spec) return;
+        const t0 = Date.now();
+        const r = start(spec);
+        r.inRestart = true;
+        if (existing) running.splice(running.indexOf(existing), 1);
+        const h = healthOf(name);
+        h.restarts += 1;
+        h.lastRestartAt = new Date().toISOString();
+        dead = r;
+        try {
+          await waitReady(r);
+          if (!live()) return;
+          if (!isRunning(r.child)) throw new Error('exited right after becoming ready');
+          r.inRestart = false;
+          say(`[${name}] restarted and ready again after ${Date.now() - t0} ms (restart ${times.length}/${policy.maxRestarts} in the last ${Math.round(policy.windowMs / 1000)} s)`);
+          return;
+        } catch (e) {
+          if (!live()) return;
+          why = `failed to restart: ${(e as Error).message.split('\n')[0]}`;
+          await killAll([r]);
+        }
+      }
+    })();
+    restarting.add(p);
+    void p
+      .catch((e: unknown) => write(prefixLine('launcher', `supervisor error for [${name}]: ${(e as Error).message}`)))
+      .finally(() => {
+        restarting.delete(p);
+        if (supTasks.get(name) === task) supTasks.delete(name);
+      });
   };
 
   const start = (spec: ServiceSpec): Running => {
     if (stopping) throw new StartupError('the launcher is stopping');
     specs.set(spec.name, spec);
-    const r: Running = { spec, child: undefined as unknown as ChildProcess, tail: [], sawReadyLine: false, readyWaiters: [], intentional: false };
+    bootNames.add(spec.name);
+    const r: Running = { spec, child: undefined as unknown as ChildProcess, tail: [], sawReadyLine: false, readyWaiters: [], intentional: false, inRestart: false };
     r.child = spawnTs({
       rootDir,
       script: spec.script,
       args: spec.args,
-      env: childEnv,
+      env: spec.env ? { ...childEnv, ...spec.env } : childEnv,
       onLine: (line) => {
         r.tail.push(line);
         if (r.tail.length > TAIL_LINES) r.tail.shift();
@@ -538,6 +734,7 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
    */
   const bootAll = async (): Promise<StartupTiming> => {
     const t0 = Date.now();
+    bootNames.clear();
     const ready: Record<string, number> = {};
     const track = async (r: Running): Promise<void> => {
       await waitReady(r);
@@ -557,6 +754,16 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
       } else {
         add(track(start(SPEC.booth)));
       }
+    }
+    if (mode === 'safe') {
+      // M6 safe mode: only what a recorded run needs. Broker (fresh log), gateway (SYSTEM_MODE=safe), the
+      // assistant (reads the log) and the booth. No payment API, stages, ledger, orchestrator or ops: nothing
+      // live exists that could change what the screens show. The recording itself is played by startReplay().
+      await track(start(SPEC.broker));
+      add(track(start({ ...SPEC.gateway, env: { SYSTEM_MODE: 'safe', RECORDING_NAME: recording ?? '' } })));
+      if (withAssistant) add(track(start(SPEC.assistant)));
+      await Promise.all(waits);
+      return { totalMs: Date.now() - t0, ready };
     }
     if (bus !== 'kafka') {
       const broker = start(SPEC.broker);
@@ -583,8 +790,62 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     return { totalMs: Date.now() - t0, ready };
   };
 
+  /** Names started by the current boot; specs of other services (the other mode's) are dropped afterwards. */
+  const bootNames = new Set<ServiceName>();
+  const pruneSpecs = (): void => {
+    for (const name of [...specs.keys()]) if (!bootNames.has(name) && !RESET_SURVIVORS.includes(name)) specs.delete(name);
+  };
+
+  /** The recording to play: the named one or the newest. Throws before anything is touched when there is none. */
+  const resolveRecording = async (name: string | undefined): Promise<string> => {
+    let api: ReplayApi;
+    try {
+      api = await getReplayApi();
+    } catch (e) {
+      throw new ModeRequestError(`the record/replay library is not available: ${(e as Error).message}`);
+    }
+    const list = await api.listRecordings(dataDir);
+    if (name !== undefined) {
+      if (!list.some((m) => m.name === name)) {
+        throw new RecordingNotFoundError(
+          `recording "${name}" not found in ${path.join(dataDir, 'recordings')}` + (list.length ? ` (have: ${list.map((m) => m.name).join(', ')})` : ' (there are no recordings)'),
+        );
+      }
+      return name;
+    }
+    const newest = await api.newestRecording(dataDir);
+    if (!newest) {
+      throw new RecordingNotFoundError(`no recordings in ${path.join(dataDir, 'recordings')} - record one first (npm run booth:record)`);
+    }
+    return newest.name;
+  };
+
+  /** Safe mode: play the recording, looped, into the (fresh) broker. */
+  const startReplay = async (): Promise<void> => {
+    if (mode !== 'safe' || recording === null) return;
+    if (stopping) throw new StartupError('the launcher is stopping');
+    const api = await getReplayApi();
+    const config = { ...serviceConfig(), bus: 'local' as const, brokerUrl: urls.broker };
+    const replayBus = await createBus(config, 'launcher-replay');
+    try {
+      const publisher = await api.startReplayPublisher({
+        bus: replayBus,
+        file: recordingFile(dataDir, recording),
+        loop: true,
+        onLoop: () => say(`safe mode: recording "${recording}" looped`),
+      });
+      replay = { bus: replayBus, publisher };
+      publisher.done.catch((e: unknown) => say(`safe mode: the recording publisher stopped: ${(e as Error).message}`));
+    } catch (e) {
+      await replayBus.close().catch(() => undefined);
+      throw e;
+    }
+    say(`safe mode: playing recording "${recording}" (looped) - nothing live is running`);
+  };
+
   const startup: StartupTiming = { totalMs: 0, ready: {} };
   try {
+    if (mode === 'safe') recording = await resolveRecording(options.recording);
     // 4. UI build (only when missing; never on reset).
     if ((options.buildWeb ?? true) && !existsSync(path.join(webDist, 'index.html'))) {
       say('apps/web/dist is missing - building the UI (npm run build:web)...');
@@ -607,6 +868,8 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
 
     // 5. Every service.
     Object.assign(startup, await bootAll());
+    await startReplay();
+    pruneSpecs();
     started = true;
     startedAt = new Date().toISOString();
   } catch (e) {
@@ -628,10 +891,23 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     await killTree(r.child);
   };
 
+  const crash = async (name: ServiceName): Promise<void> => {
+    const r = current(name);
+    if (!r) throw new Error(`unknown service "${name}" (have: ${[...specs.keys()].join(', ')})`);
+    if (!isRunning(r.child)) return;
+    await killTree(r.child);
+  };
+
   const restart = (name: ServiceName): Promise<void> => {
     const spec = specs.get(name);
     if (!spec) return Promise.reject(new Error(`unknown service "${name}" (have: ${[...specs.keys()].join(', ')})`));
     if (resetPromise) return Promise.reject(new Error(`cannot restart ${name} while a reset is running`));
+    // An operator restart replaces whatever the supervisor was doing for this service.
+    const sup = supTasks.get(name);
+    if (sup) {
+      sup.cancelled = true;
+      sup.wake();
+    }
     const p = (async () => {
       await kill(name);
       if (stopping) return;
@@ -646,13 +922,22 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     return p;
   };
 
-  const reset = (): Promise<ResetResult> => {
+  /**
+   * Stop the current system, wipe the data dir and start the system of `target` (live, or the recorded safe
+   * run). kind 'reset' = the demo reset (same mode again); kind 'mode' = a switch between live and safe.
+   * Claims the busy slot synchronously; `delayMs` (the ?wait=0 grace) only delays the work.
+   */
+  const transition = (kind: 'reset' | 'mode', target: { mode: SystemMode; recording: string | null }, delayMs = 0): Promise<ResetResult> => {
     if (stopping) return Promise.reject(new Error('the launcher is stopping'));
     if (resetPromise || !started) return Promise.reject(new ResetBusyError());
+    const label = kind === 'reset' ? 'reset' : `switch to ${target.mode} mode`;
     const p = (async (): Promise<ResetResult> => {
+      if (delayMs > 0) await sleep(delayMs);
       const t0 = Date.now();
-      say('reset: stopping every service...');
+      say(`${label}: stopping every service...`);
+      cancelSupervision();
       await Promise.allSettled(restarting);
+      await stopReplay();
       // Everything at once: nothing needs a graceful goodbye, the data is deleted next. The booth
       // (visitor leads) keeps running and keeps its data.
       started = false;
@@ -663,16 +948,21 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
       const w0 = Date.now();
       wipeDataDir(dataDir, rootDir);
       const wipeMs = Date.now() - w0;
-      say(`reset: deleted ${dataDir} (kept ${PRESERVED_DATA_ENTRIES.join(', ')}); starting every service...`);
+      say(`${label}: deleted ${dataDir} (kept ${PRESERVED_DATA_ENTRIES.join(', ')}); starting every service...`);
 
       running = running.filter((r) => RESET_SURVIVORS.includes(r.spec.name) && isRunning(r.child));
       startupCrash = undefined;
       crashWaiters = [];
       reportedCrash = false;
+      crashTimes.clear();
+      mode = target.mode;
+      recording = target.recording;
       const timing = await bootAll();
+      await startReplay();
+      pruneSpecs();
       started = true;
       startedAt = new Date().toISOString();
-      resets += 1;
+      if (kind === 'reset') resets += 1;
       const result: ResetResult = {
         ok: true,
         durationMs: Date.now() - t0,
@@ -680,8 +970,8 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
         ready: timing.ready,
         resets,
       };
-      lastReset = { ...result, at: startedAt };
-      say(`reset: done in ${result.durationMs} ms (stop ${stopMs} ms, wipe ${wipeMs} ms, start ${timing.totalMs} ms)`);
+      if (kind === 'reset') lastReset = { ...result, at: startedAt };
+      say(`${label}: done in ${result.durationMs} ms (stop ${stopMs} ms, wipe ${wipeMs} ms, start ${timing.totalMs} ms)`);
       return result;
     })();
     resetPromise = p;
@@ -693,12 +983,12 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
         resetPromise = null;
         if (stopping) return;
         const error = err instanceof Error ? err : new Error(String(err));
-        lastReset = { ok: false, error: error.message, at: new Date().toISOString() };
+        if (kind === 'reset') lastReset = { ok: false, error: error.message, at: new Date().toISOString() };
         // Same as a crash after startup: stop everything, tell the owner (npm start exits non-zero).
         // The delay lets the HTTP caller get its 500 and lets a Ctrl+C in progress win.
         setTimeout(() => {
           if (stopping) return;
-          write(prefixLine('launcher', `reset failed, stopping everything:\n${error.message}`));
+          write(prefixLine('launcher', `${label} failed, stopping everything:\n${error.message}`));
           void stop().then(() => options.onUnexpectedExit?.(error));
         }, 300);
       },
@@ -706,27 +996,64 @@ export async function launch(options: LaunchOptions = {}): Promise<LaunchedSyste
     return p;
   };
 
-  const status = (): LauncherStatus => ({
-    services: [...specs.keys()].map((name) => {
+  const reset = (): Promise<ResetResult> => transition('reset', { mode, recording });
+
+  /** Validate a POST /safe-mode request, claim the busy slot, run the switch. See LaunchedSystem.setMode. */
+  const beginMode = async (on: boolean, name: string | undefined, delayMs: number): Promise<{ done: Promise<ModeResult> }> => {
+    if (stopping) throw new Error('the launcher is stopping');
+    if (resetPromise || !started) throw new ResetBusyError('a reset or mode change is already running (or the system is still starting)');
+    const already = (): { done: Promise<ModeResult> } => ({ done: Promise.resolve({ ok: true, mode, recording, durationMs: 0 }) });
+    let target: { mode: SystemMode; recording: string | null };
+    if (!on) {
+      if (mode === 'live') return already();
+      target = { mode: 'live', recording: null };
+    } else {
+      if (bus === 'kafka') throw new ModeRequestError('safe mode needs the local broker (BUS=local); it cannot run with BUS=kafka');
+      if (mode === 'safe' && (name === undefined || name === recording)) return already();
+      const picked = await resolveRecording(name ?? options.recording);
+      if (stopping) throw new Error('the launcher is stopping');
+      if (resetPromise || !started) throw new ResetBusyError('a reset or mode change is already running');
+      target = { mode: 'safe', recording: picked };
+    }
+    const p = transition('mode', target, delayMs);
+    return { done: p.then((r) => ({ ok: true as const, mode: target.mode, recording: target.recording, durationMs: r.durationMs })) };
+  };
+
+  const healthViews = (): ServiceHealthView[] =>
+    [...specs.keys()].map((name) => {
       const r = current(name);
-      return { name, running: r !== undefined && isRunning(r.child) };
-    }),
+      const h = healthOf(name);
+      return { name, running: r !== undefined && isRunning(r.child), restarts: h.restarts, lastRestartAt: h.lastRestartAt, lastExit: h.lastExit };
+    });
+
+  const status = (): LauncherStatus => ({
+    services: healthViews(),
     startedAt,
     resetting: resetPromise !== null,
     resets,
     lastReset,
+    mode,
+    recording,
+    supervisor: policy,
   });
 
-  controller = { status, reset };
+  controller = { status, reset, beginMode };
 
   return {
     urls,
-    services: [...specs.keys()],
+    get services(): readonly ServiceName[] {
+      return [...specs.keys()];
+    },
     startup,
     kill,
     restart,
     reset,
     status,
+    health: healthViews,
+    mode: () => mode,
+    supervisorPolicy: () => policy,
+    setMode: async ({ on, name }) => (await beginMode(on, name, 0)).done,
+    crash,
     isRunning: (name) => {
       const r = current(name);
       return r !== undefined && isRunning(r.child);

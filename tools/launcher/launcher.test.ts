@@ -41,7 +41,7 @@ describe('parseLauncherArgs', () => {
       help: false, reset: true, buildWeb: false, quiet: true, host: '0.0.0.0', brokerPort: 8070, paymentApiPort: 8071,
       gatewayPort: 8072, ledgerPort: 8073, orchestratorPort: 8074, opsPort: 8075, assistantPort: 7076, boothPort: 7077, assistantLlm: 'auto',
       controlPort: 8079, ambientRate: 2.5,
-      dataDir: 'tmp/data', stageDelayMs: 0, settlementDelayMs: 0, startupTimeoutMs: 5000,
+      dataDir: 'tmp/data', stageDelayMs: 0, settlementDelayMs: 0, startupTimeoutMs: 5000, supervise: true, safe: false, recording: undefined,
     });
     expect(parseLauncherArgs(['-h'], defaults).help).toBe(true);
   });

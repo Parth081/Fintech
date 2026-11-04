@@ -29,6 +29,12 @@ export interface LauncherArgs {
   stageDelayMs: number;
   settlementDelayMs: number;
   startupTimeoutMs: number;
+  /** M6: restart crashed services with backoff (default true; --no-supervise = a crash stops everything). */
+  supervise: boolean;
+  /** M6: start directly in safe mode (recorded backup run). */
+  safe: boolean;
+  /** Recording for --safe (default: the newest). */
+  recording: string | undefined;
 }
 
 export const LAUNCHER_USAGE = `Usage: npm start [-- options]
@@ -59,6 +65,10 @@ Options:
   --data-dir <dir>           (env DATA_DIR, default .data)
   --stage-delay <ms>         (env STAGE_DELAY_MS, default 400)
   --settlement-delay <ms>    (env SETTLEMENT_DELAY_MS, default 900)
+  --no-supervise             Do not restart crashed services; a crash stops everything (default: self-healing
+                             supervisor restarts them with exponential backoff)
+  --safe                     Start in safe mode: play a recorded run (the newest) instead of the live system
+  --recording <name>         Safe mode with this recording (implies --safe)
   --timeout <ms>             Startup timeout per service (default 30000)
   -h, --help                 Show this help
 `;
@@ -100,6 +110,9 @@ export function parseLauncherArgs(argv: readonly string[], defaults = serviceCon
     stageDelayMs: defaults.stageDelayMs,
     settlementDelayMs: defaults.settlementDelayMs,
     startupTimeoutMs: 30_000,
+    supervise: true,
+    safe: false,
+    recording: undefined,
   };
   for (let i = 0; i < argv.length; i++) {
     const raw = argv[i]!;
@@ -186,6 +199,19 @@ export function parseLauncherArgs(argv: readonly string[], defaults = serviceCon
       case '--settlement-delay':
         args.settlementDelayMs = toInt(flag, next());
         break;
+      case '--no-supervise':
+        args.supervise = false;
+        break;
+      case '--safe':
+        args.safe = true;
+        break;
+      case '--recording': {
+        const v = next();
+        if (!v || v.startsWith('--') || !/^[A-Za-z0-9._-]{1,80}$/.test(v)) throw new Error('--recording needs a recording name');
+        args.recording = v;
+        args.safe = true;
+        break;
+      }
       case '--timeout':
         args.startupTimeoutMs = toInt(flag, next());
         break;
