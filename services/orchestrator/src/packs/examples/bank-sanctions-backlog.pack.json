@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "name": "bank-sanctions-backlog",
+  "title": "Bank sanctions-hit backlog: a burst of listed names",
+  "audience": "bank",
+  "description": "A burst of payments names parties that closely resemble entries on a fictional sanctions list. Screening holds them, a review queue builds up in the operations console, and a manager's approval is needed before any of them can move.",
+  "durationMs": 60000,
+  "steps": [
+    {
+      "id": "baseline",
+      "atMs": 0,
+      "title": "An ordinary morning",
+      "narration": "Customers of a retail bank are sending money abroad as usual. Every payment is screened against the sanctions list before anything else happens, and almost all of them pass straight through.",
+      "events": [
+        { "type": "ambient", "rate": 3 },
+        { "type": "traffic", "label": "usual", "corridor": "GB-PH", "count": 5, "amountMajor": { "min": 120, "max": 800 }, "spacingMs": 1000 }
+      ]
+    },
+    {
+      "id": "burst-starts",
+      "atMs": 8000,
+      "title": "A burst of near-matches arrives",
+      "narration": "Now a burst of payments to companies whose names are spelled slightly differently from listed entities. Each one on its own is easy to miss. Together they start to form a queue.",
+      "events": [
+        { "type": "traffic", "label": "burst-us", "corridor": "US-IN", "count": 8, "amountMajor": { "min": 3000, "max": 21000 }, "spacingMs": 1000, "listedParty": { "side": "creditor", "count": 6 } }
+      ]
+    },
+    {
+      "id": "second-wave",
+      "atMs": 20000,
+      "title": "Senders with listed-looking names",
+      "narration": "A second wave: senders in the UK whose names resemble listed individuals. Screening holds these too, before any money moves.",
+      "events": [
+        { "type": "traffic", "label": "burst-uk", "corridor": "GB-PH", "count": 6, "amountMajor": { "min": 900, "max": 6000 }, "spacingMs": 1200, "listedParty": { "side": "debtor", "count": 4 } }
+      ]
+    },
+    {
+      "id": "queue-builds",
+      "atMs": 32000,
+      "title": "The review queue builds up",
+      "narration": "Open the operations console: held payments appear as sanctions cases, each showing the list entry, how close the match is and the deadline for a decision. This is the backlog an analyst team has to work through."
+    },
+    {
+      "id": "four-eyes",
+      "atMs": 44000,
+      "title": "Four eyes on every release",
+      "narration": "An analyst can only recommend a release or a rejection. A manager must approve it, and every step goes into the append-only audit trail. Nothing is posted to the ledger until that decision is made."
+    }
+  ],
+  "expected": [
+    { "id": "listed-volume", "text": "At least 10 payments name a party resembling a listed entry.", "check": { "kind": "listed-parties", "min": 10 } },
+    { "id": "corridor-us-in", "text": "At least 8 crafted payments flow on US-IN.", "check": { "kind": "payments", "min": 8, "corridor": "US-IN" } },
+    { "id": "cases-appear", "text": "Sanctions cases for the listed-name payments appear in the operations console review queue." },
+    { "id": "ledger-untouched", "text": "Held payments show no ledger posting until a manager approves a release." }
+  ]
+}

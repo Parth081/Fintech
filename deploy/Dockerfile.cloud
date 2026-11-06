@@ -1,0 +1,32 @@
+# Cloud image for the Control Tower (simulation, synthetic data only). Multi-stage:
+#   deps+build : full install (tsx is a dev dependency and is needed at run time), builds the web UI
+#   runtime    : only what the services load (no .git, tests' fixtures, docs, build caches), non-root user
+# Build from the repo root:  docker build -f deploy/Dockerfile.cloud -t fintech-control-tower:cloud .
+# One image for every service; the command picks the entrypoint (see deploy/docker-compose.cloud.yml).
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY . .
+RUN npm ci --no-audit --no-fund \
+ && npm run build:web
+
+FROM node:22-alpine AS runtime
+WORKDIR /app
+# HOST is deliberately NOT set here: services then bind 127.0.0.1. The compose file sets HOST=0.0.0.0
+# explicitly (inside the private compose network only); see docs/cloud/README.md.
+ENV NODE_ENV=production \
+    DATA_DIR=/data \
+    WEB_DIST=/app/apps/web/dist
+COPY --from=build --chown=root:root /app/package.json /app/tsconfig.json /app/tsconfig.base.json ./
+COPY --from=build --chown=root:root /app/node_modules ./node_modules
+COPY --from=build --chown=root:root /app/packages ./packages
+COPY --from=build --chown=root:root /app/services ./services
+COPY --from=build --chown=root:root /app/tools ./tools
+COPY --from=build --chown=root:root /app/apps/web/package.json ./apps/web/package.json
+COPY --from=build --chown=root:root /app/apps/web/dist ./apps/web/dist
+RUN mkdir -p /data && chown node:node /data
+# Application code is root-owned and read-only to the service user; only /data is writable.
+USER node
+VOLUME ["/data"]
+EXPOSE 7072
+ENTRYPOINT ["node", "--import", "tsx"]
+CMD ["services/gateway/src/index.ts"]

@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "name": "psp-acceptance-recovery",
+  "title": "PSP acceptance-rate recovery: a partner turns unreliable",
+  "audience": "psp",
+  "description": "A payment service provider watches its acceptance rate dip when one downstream partner starts refusing most instructions. Routing steps away from the weak partner, refused payments are retried elsewhere, and the partner is brought back carefully once it recovers.",
+  "durationMs": 66000,
+  "steps": [
+    {
+      "id": "baseline",
+      "atMs": 0,
+      "title": "Healthy acceptance rate",
+      "narration": "This is a normal trading window for a payment service provider. Merchant payouts flow between the US and India and between the UK and the Philippines, and nearly every instruction is accepted first time.",
+      "events": [
+        { "type": "ambient", "rate": 5 },
+        { "type": "traffic", "label": "steady-in", "corridor": "US-IN", "count": 6, "amountMajor": { "min": 400, "max": 2400 }, "spacingMs": 1000 }
+      ]
+    },
+    {
+      "id": "partner-slips",
+      "atMs": 10000,
+      "title": "One partner starts refusing payments",
+      "narration": "Provider Orion, the fastest partner, begins refusing about six in ten instructions. Some still succeed, so the dashboard does not go red straight away, but the acceptance rate starts to slip.",
+      "events": [
+        { "type": "provider_outage", "providerId": "orion", "mode": "degraded", "failureRate": 0.6, "reason": "Pack: Orion refusing about 60% of instructions" },
+        { "type": "traffic", "label": "dip-in", "corridor": "US-IN", "count": 10, "amountMajor": { "min": 500, "max": 3000 }, "spacingMs": 1200 },
+        { "type": "traffic", "label": "dip-ph", "corridor": "GB-PH", "count": 8, "amountMajor": { "min": 150, "max": 900 }, "spacingMs": 1500 }
+      ]
+    },
+    {
+      "id": "routing-adapts",
+      "atMs": 24000,
+      "title": "Routing steps away from the weak partner",
+      "narration": "The circuit breaker counts the refusals and opens. New instructions go to Lyra and Vega, and the ones Orion refused are retried with another partner. Watch the acceptance rate climb back on the live screen."
+    },
+    {
+      "id": "partner-recovers",
+      "atMs": 38000,
+      "title": "The partner recovers",
+      "narration": "Orion is accepting instructions again, but it does not get its full share straight away. A few test payments go first, and only if they succeed does traffic return.",
+      "events": [
+        { "type": "provider_recovery", "providerId": "orion" },
+        { "type": "traffic", "label": "recover-in", "corridor": "US-IN", "count": 6, "amountMajor": { "min": 500, "max": 2000 }, "spacingMs": 1500 }
+      ]
+    },
+    {
+      "id": "summary",
+      "atMs": 54000,
+      "title": "What the PSP takes away",
+      "narration": "In this simulation the acceptance rate dipped and recovered without anyone touching a setting, and every payment is accounted for in the ledger. The numbers on screen are synthetic; your own traffic and partners will behave differently."
+    }
+  ],
+  "expected": [
+    { "id": "outage-opens", "text": "Orion is degraded on the control timeline during the run.", "check": { "kind": "event", "type": "provider_outage.started" } },
+    { "id": "outage-closes", "text": "Orion is restored before the run ends.", "check": { "kind": "event", "type": "provider_outage.ended" } },
+    { "id": "volume-us-in", "text": "At least 20 crafted payments flow on US-IN.", "check": { "kind": "payments", "min": 20, "corridor": "US-IN" } },
+    { "id": "volume-gb-ph", "text": "At least 8 crafted payments flow on GB-PH.", "check": { "kind": "payments", "min": 8, "corridor": "GB-PH" } },
+    { "id": "breaker-visible", "text": "The Orion circuit breaker is seen opening and then closing on the providers screen." },
+    { "id": "ledger-balances", "text": "The ledger screen shows every currency balanced after the run." }
+  ]
+}

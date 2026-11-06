@@ -1,0 +1,311 @@
+# Global Fintech Control Tower - CLOUD profile (simulation, synthetic data only; not a production system).
+# Build + run (from the repo root):
+#   cp deploy/cloud.env.example deploy/.env      # then edit; see docs/cloud/README.md
+#   docker compose -f deploy/docker-compose.cloud.yml --env-file deploy/.env up -d --build --wait
+# Differences from deploy/docker-compose.yml (the local/laptop file, unchanged):
+#   - multi-stage image (deploy/Dockerfile.cloud), non-root, no secrets baked in
+#   - NOTHING is published except the Caddy proxy (one port: web app + gateway + /ws)
+#   - ledger/ops use embedded PGlite on volumes by default; add `--profile postgres` + DATABASE_URL for Postgres
+#   - `--profile redpanda` + BUS=kafka for Redpanda (the local broker is the default)
+#   - proxy basic auth for prospects: PROXY_MODE=auth (see deploy/caddy/Caddyfile.auth)
+# HOST=0.0.0.0 below is set explicitly on purpose: it only binds inside the private compose network.
+# The image itself defaults to 127.0.0.1.
+
+name: fintech-control-tower-cloud
+
+x-hardening: &hardening
+  init: true
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-health: &health
+  interval: 10s
+  timeout: 3s
+  retries: 20
+  start_period: 20s
+
+x-service: &service
+  <<: *hardening
+  image: fintech-control-tower:cloud
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile.cloud
+    target: runtime
+  environment: &env
+    HOST: 0.0.0.0
+    BROKER_PORT: "7070"
+    PAYMENT_API_PORT: "7071"
+    GATEWAY_PORT: "7072"
+    LEDGER_PORT: "7073"
+    ORCHESTRATOR_PORT: "7074"
+    OPS_PORT: "7075"
+    ASSISTANT_PORT: "7076"
+    BOOTH_PORT: "7077"
+    BUS: ${BUS:-local}
+    BROKER_URL: ws://broker:7070
+    KAFKA_BROKERS: redpanda:9092
+    PAYMENT_API_URL: http://payment-api:7071
+    GATEWAY_URL: http://gateway:7072
+    LEDGER_URL: http://ledger:7073
+    ORCHESTRATOR_URL: http://orchestrator:7074
+    OPS_URL: http://ops:7075
+    ASSISTANT_URL: http://assistant:7076
+    BOOTH_URL: http://booth:7077
+    # No launcher in containers: reset / safe-mode switch are unavailable (the gateway answers 503).
+    LAUNCHER_CONTROL_URL: ""
+    AMBIENT_RATE: ${AMBIENT_RATE:-3}
+    DATA_DIR: /data
+    STAGE_DELAY_MS: ${STAGE_DELAY_MS:-400}
+    SETTLEMENT_DELAY_MS: ${SETTLEMENT_DELAY_MS:-900}
+    SIM_SEED: ${SIM_SEED:-control-tower}
+    PROVIDER_FAILURE_SCALE: ${PROVIDER_FAILURE_SCALE:-1}
+
+x-after-bus: &after-bus
+  broker:
+    condition: service_healthy
+  redpanda:
+    condition: service_healthy
+    required: false
+
+x-stage: &stage
+  <<: *service
+  depends_on: *after-bus
+
+services:
+  # --- edge: the only published port -----------------------------------------------------------------
+  proxy:
+    <<: *hardening
+    image: caddy:2-alpine
+    # PROXY_MODE=open (default) or auth. `auth` requires BASIC_AUTH_USER and BASIC_AUTH_HASH.
+    volumes:
+      - ./caddy/Caddyfile.${PROXY_MODE:-open}:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+      BASIC_AUTH_USER: ${BASIC_AUTH_USER:-}
+      BASIC_AUTH_HASH: ${BASIC_AUTH_HASH:-}
+    ports:
+      # Default 127.0.0.1: reachable only from the host itself. Set PROXY_BIND=0.0.0.0 to expose it.
+      - "${PROXY_BIND:-127.0.0.1}:${PROXY_PORT:-8080}:80"
+      - "${PROXY_BIND:-127.0.0.1}:${PROXY_TLS_PORT:-8443}:443"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    depends_on:
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:80/healthz"]
+      <<: *health
+
+  # --- application ------------------------------------------------------------------------------------
+  broker:
+    <<: *service
+    command: ["services/broker/src/index.ts"]
+    volumes:
+      - broker-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7070/health"]
+      <<: *health
+
+  payment-api:
+    <<: *service
+    command: ["services/payment-api/src/index.ts"]
+    depends_on: *after-bus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7071/health"]
+      <<: *health
+
+  screening:
+    <<: *stage
+    command: ["services/stages/src/index.ts", "--stage", "screening"]
+  risk:
+    <<: *stage
+    command: ["services/stages/src/index.ts", "--stage", "risk"]
+  fx:
+    <<: *stage
+    command: ["services/stages/src/index.ts", "--stage", "fx"]
+  routing:
+    <<: *stage
+    command: ["services/stages/src/index.ts", "--stage", "routing"]
+  settlement:
+    <<: *stage
+    command: ["services/stages/src/index.ts", "--stage", "settlement"]
+  reconciliation:
+    <<: *stage
+    command: ["services/stages/src/index.ts", "--stage", "reconciliation"]
+
+  ledger:
+    <<: *service
+    command: ["services/ledger/src/index.ts"]
+    environment:
+      <<: *env
+      # Empty = embedded PGlite on the ledger-data volume. Set DATABASE_URL (and --profile postgres) for Postgres.
+      DATABASE_URL: ${DATABASE_URL:-}
+    volumes:
+      - ledger-data:/data
+    depends_on:
+      broker:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+        required: false
+      postgres:
+        condition: service_healthy
+        required: false
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7073/health"]
+      <<: *health
+
+  ops:
+    <<: *service
+    command: ["services/ops/src/index.ts"]
+    environment:
+      <<: *env
+      # Same database as the ledger (own schema "ops") when DATABASE_URL is set; else PGlite under /data/ops.
+      DATABASE_URL: ${DATABASE_URL:-}
+    volumes:
+      - ops-data:/data
+    depends_on:
+      broker:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+        required: false
+      postgres:
+        condition: service_healthy
+        required: false
+      ledger:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7075/health"]
+      <<: *health
+
+  orchestrator:
+    <<: *service
+    command: ["services/orchestrator/src/index.ts"]
+    depends_on:
+      broker:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+        required: false
+      payment-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7074/health"]
+      <<: *health
+
+  # AI explainer: offline/grounded by default. ASSISTANT_LLM=auto + ANTHROPIC_API_KEY lets Claude phrase
+  # answers (outbound internet needed; the key is given to this container only). Leave unset for the demo.
+  assistant:
+    <<: *service
+    command: ["services/assistant/src/index.ts"]
+    environment:
+      <<: *env
+      ASSISTANT_LLM: ${ASSISTANT_LLM:-off}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    depends_on: *after-bus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7076/health"]
+      <<: *health
+
+  # Booth back end: lead capture needs explicit consent. Prospects should not type real personal data
+  # into a cloud demo. CHANGE BOOTH_STAFF_PIN (the default is public in this repository).
+  booth:
+    <<: *service
+    command: ["services/booth/src/index.ts"]
+    environment:
+      <<: *env
+      BOOTH_STAFF_PIN: ${BOOTH_STAFF_PIN:?set BOOTH_STAFF_PIN in deploy/.env (change it from the public demo default)}
+    volumes:
+      - booth-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7077/health"]
+      <<: *health
+
+  gateway:
+    <<: *service
+    command: ["services/gateway/src/index.ts"]
+    depends_on:
+      ops:
+        condition: service_healthy
+      payment-api:
+        condition: service_healthy
+      ledger:
+        condition: service_healthy
+      orchestrator:
+        condition: service_healthy
+      assistant:
+        condition: service_healthy
+      booth:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:7072/health"]
+      <<: *health
+
+  # --- profile: postgres (optional ledger DB) ------------------------------------------------------------
+  # Needs POSTGRES_PASSWORD and DATABASE_URL=postgres://ct:<same password>@postgres:5432/ledger in the env file.
+  # Without a password the container refuses to start (fail closed).
+  postgres:
+    init: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    profiles: ["postgres"]
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ct
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_DB: ledger
+    volumes:
+      - ledger-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ct -d ledger"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  # --- profile: redpanda (single-node Kafka API; use with BUS=kafka) ------------------------------------
+  redpanda:
+    restart: unless-stopped
+    profiles: ["redpanda"]
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=512M
+      - --overprovisioned
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+volumes:
+  broker-data:
+  ledger-data:
+  ops-data:
+  booth-data:
+  ledger-pg:
+  redpanda-data:
+  caddy-data:
+  caddy-config:

@@ -1,0 +1,22 @@
+# Reverse proxy with HTTP basic auth for prospect access. Credentials come from the environment:
+#   BASIC_AUTH_USER  user name
+#   BASIC_AUTH_HASH  bcrypt hash from `docker run --rm caddy:2-alpine caddy hash-password` (never the password)
+# /healthz stays open so platform health probes work; everything else (UI, API, /ws) needs the login.
+# Basic auth is only safe over HTTPS: set SITE_ADDRESS to a domain, or terminate TLS in front of this.
+{$SITE_ADDRESS::80} {
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		-Server
+	}
+	handle /healthz {
+		respond 200
+	}
+	handle {
+		basic_auth {
+			{$BASIC_AUTH_USER} {$BASIC_AUTH_HASH}
+		}
+		reverse_proxy gateway:7072
+	}
+}

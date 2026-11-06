@@ -150,3 +150,21 @@ jobs:
       - run: docker compose -f deploy/docker-compose.yml --profile redpanda config --quiet
         env:
           BUS: kafka
+
+  compose-cloud:
+    name: Validate cloud compose file and Caddyfiles
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      BOOTH_STAFF_PIN: ci-not-a-secret
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose -f deploy/docker-compose.cloud.yml config --quiet
+      - run: docker compose -f deploy/docker-compose.cloud.yml --profile postgres --profile redpanda config --quiet
+      - name: Validate Caddyfiles
+        run: |
+          for f in open auth; do
+            docker run --rm -e BASIC_AUTH_USER=ci -e BASIC_AUTH_HASH='$2a$14$Zkx19XLiW6VYouLHR5NmfOFU0z2GTNmpkT/5qqR7hx4IjWJPDhjvG' \
+              -v "$PWD/deploy/caddy/Caddyfile.$f:/etc/caddy/Caddyfile:ro" caddy:2-alpine \
+              caddy validate --config /etc/caddy/Caddyfile
+          done

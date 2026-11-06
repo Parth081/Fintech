@@ -17,6 +17,7 @@ import {
 import type { EventBus, Subscription } from '@ct/event-bus';
 import { AmbientTraffic, ambientIndexOf, MAX_AMBIENT_RATE, type PaymentSender } from './ambient';
 import { systemClock, type Clock, type TimerHandle } from './clock';
+import { loadActivePackScripts } from './packs/load';
 import { craftedKey, craftedRequest, SCENARIOS, scenarioInfo, validateScript, type CraftedPayment, type ScenarioAction, type ScenarioScript } from './scenarios';
 import { ATTRACT_LOOP, type AttractState, type OrchestratorStateWithAttract } from './attract';
 import { sendPayment } from '../../../tools/traffic/send';
@@ -136,7 +137,7 @@ export async function startOrchestrator(options: OrchestratorOptions): Promise<O
   const { bus, seed } = options;
   const clock = options.clock ?? systemClock;
   const log = options.log ?? (() => {});
-  const scripts = options.scenarios ?? SCENARIOS;
+  const scripts = options.scenarios ?? [...SCENARIOS, ...loadActivePackScripts(SCENARIOS.map((s) => s.id), log)]; // + prospect packs (ADR 0022)
   for (const s of scripts) validateScript(s);
   const scriptById = new Map(scripts.map((s) => [s.id, s]));
   const infos = scripts.map(scenarioInfo);

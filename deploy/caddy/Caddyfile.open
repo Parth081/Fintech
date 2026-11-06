@@ -1,0 +1,18 @@
+# Reverse proxy, no authentication (private networks, or when the platform provides access control).
+# SITE_ADDRESS defaults to ":80" (plain HTTP). Set it to a domain (e.g. demo.example.com) and publish
+# ports 80 and 443 to let Caddy obtain a TLS certificate automatically.
+{$SITE_ADDRESS::80} {
+	encode zstd gzip
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		-Server
+	}
+	handle /healthz {
+		respond 200
+	}
+	# UI, REST and the /ws WebSocket are all served by the gateway.
+	handle {
+		reverse_proxy gateway:7072
+	}
+}
