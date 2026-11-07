@@ -42,7 +42,7 @@ deploy as a trial and run the smoke test below.
 - There is no launcher in containers, so reset, safe mode and the presenter's system-health card are unavailable.
   The presenter console says so.
 - Without reset, the counters only clear by deleting the data: `down -v`. That includes the big screen's
-  "Payments lost" tile, which counts failed payments (stopped with nothing posted to the ledger), so it can show
+  "Payments failed" tile, which counts payments stopped with nothing posted to the ledger, so it can show
   a non-zero value after an outage scenario.
 - The event log and the data volumes keep growing while the stack runs. Plan to recreate them between prospects.
 

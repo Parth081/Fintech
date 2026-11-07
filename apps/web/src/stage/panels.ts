@@ -10,7 +10,7 @@ export interface KpiTile {
   tone?: 'info' | 'ok' | 'warn' | 'bad';
 }
 
-/** Payments/min, reconciled, re-routes (provider rejects that were retried elsewhere), lost. */
+/** Payments/min, reconciled, re-routes (provider rejects that were retried elsewhere), failed (stopped with nothing posted to the ledger). */
 export function kpiTiles(stats: Stats | null): KpiTile[] {
   const v = (n: number | undefined) => (stats ? formatCount(n ?? 0) : '—');
   const retries = stats?.retriesTotal ?? 0;
@@ -19,7 +19,7 @@ export function kpiTiles(stats: Stats | null): KpiTile[] {
     { key: 'ppm', label: 'Payments / min', value: v(stats?.throughput?.paymentsPerMin), tone: 'info' },
     { key: 'reconciled', label: 'Reconciled', value: v(stats?.reconciled), tone: 'ok' },
     { key: 'retries', label: 'Retries · re-routed', value: v(retries), tone: retries > 0 ? 'warn' : undefined },
-    { key: 'lost', label: 'Payments lost', value: v(failed), tone: !stats ? undefined : failed > 0 ? 'bad' : 'ok' },
+    { key: 'failed', label: 'Payments failed', value: v(failed), tone: !stats ? undefined : failed > 0 ? 'bad' : 'ok' },
   ];
 }
 

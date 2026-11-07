@@ -182,12 +182,12 @@ describe('reset notice', () => {
 });
 
 describe('side panel', () => {
-  it('KPI tiles show dashes without stats and highlight retries / losses', () => {
+  it('KPI tiles show dashes without stats and highlight retries / failures', () => {
     expect(kpiTiles(null).map((t) => t.value)).toEqual(['—', '—', '—', '—']);
     const stats = { reconciled: 1234, retriesTotal: 7, failed: 0, throughput: { paymentsPerMin: 240 } } as unknown as Stats;
     const tiles = Object.fromEntries(kpiTiles(stats).map((t) => [t.key, t]));
     expect(tiles.retries).toMatchObject({ value: '7', tone: 'warn' });
-    expect(tiles.lost).toMatchObject({ value: '0', tone: 'ok' });
+    expect(tiles.failed).toMatchObject({ label: 'Payments failed', value: '0', tone: 'ok' });
     expect(tiles.ppm?.value).toBe('240');
   });
 
