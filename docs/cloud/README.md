@@ -19,13 +19,32 @@ app lives on one origin and one port. The other services talk to each other on t
 
 ## Verification status (read this first)
 
-Verified: `docker compose config` passes for the default, `--profile postgres --profile redpanda`, and
-`PROXY_MODE=auth` (and fails closed when `BOOTH_STAFF_PIN` is missing).
+Tested on 2026-11-07 on one Windows laptop with Docker Desktop (engine 29.9.2), through the proxy:
 
-**Not verified:** the image build, bringing the stack up, `/health`, Caddy behaviour (basic auth, WebSocket
-through the proxy, automatic HTTPS), Postgres/Redpanda profiles in this cloud file, and any real cloud host.
-The Docker daemon was not running where this was written. Do the smoke test below on your first deploy and
-treat the first run as a trial.
+- The image builds and the stack starts. Containers run as non-root, `/app` is read-only to the service user,
+  and only the proxy publishes a port. Compose fails closed when `BOOTH_STAFF_PIN` is missing.
+- UI, API and WebSocket work on one origin. A payment reaches reconciled, the provider-outage scenario runs, and
+  ops sign-in, the explainer and lead capture work. Leads need consent and the set PIN; the public default PIN
+  is refused.
+- `kill -9` of routing, ledger, broker and gateway: each restarted by itself and the ledger invariants still held.
+- `down` then `up` without `-v`: journals and leads survived.
+- `PROXY_MODE=auth`: 401 without or with wrong credentials, and no WebSocket messages without credentials;
+  `/healthz` stays open. Both Caddyfiles pass `caddy validate`.
+- `--profile postgres --profile redpanda` with `BUS=kafka`: the same smoke test passed, with tables in Postgres
+  and a `payments` topic in Redpanda.
+
+**Not tested:** any real cloud host or Linux VM, automatic HTTPS with a real domain, long runs, a real external
+load through the proxy, or `deploy/.env` auto-discovery (the test passed `--env-file`). Treat the first cloud
+deploy as a trial and run the smoke test below.
+
+**Known limits of this profile:**
+
+- There is no launcher in containers, so reset, safe mode and the presenter's system-health card are unavailable.
+  The presenter console says so.
+- Without reset, the counters only clear by deleting the data: `down -v`. That includes the big screen's
+  "Payments lost" tile, which counts failed payments (stopped with nothing posted to the ledger), so it can show
+  a non-zero value after an outage scenario.
+- The event log and the data volumes keep growing while the stack runs. Plan to recreate them between prospects.
 
 ## 1. Single VM (Linux, Docker Engine with the compose plugin)
 
@@ -64,7 +83,7 @@ treat the first run as a trial.
    ```bash
    curl -fsS http://127.0.0.1:8080/healthz                       # proxy
    curl -fsS -u prospect http://127.0.0.1:8080/api/stats          # through the gateway (-u only if PROXY_MODE=auth)
-   docker compose -f deploy/docker-compose.cloud.yml ps           # every service should be healthy
+   docker compose -f deploy/docker-compose.cloud.yml ps           # services with a health check show healthy; the pipeline stages show Up
    ```
    Then open the UI, send a test payment and watch it reach reconciled.
 6. Operate: `docker compose -f deploy/docker-compose.cloud.yml logs -f gateway`, update with `git pull` and
